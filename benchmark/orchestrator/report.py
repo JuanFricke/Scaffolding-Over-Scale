@@ -72,7 +72,11 @@ def rows(include_validation: bool = False, tag: str | None = None) -> list[dict]
 
 def build(include_validation: bool = False, tag: str | None = None) -> str:
     data = rows(include_validation, tag)
-    with CSV_OUT.open("w", newline="") as f:
+    csv_out, md_out = CSV_OUT, MD_OUT
+    if tag:
+        csv_out = mf.path_for(tag).with_name(f"report-{tag}.csv")
+        md_out = csv_out.with_suffix(".md")
+    with csv_out.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=COLUMNS)
         w.writeheader()
         w.writerows(data)
@@ -95,6 +99,6 @@ def build(include_validation: bool = False, tag: str | None = None) -> str:
             lines.append(f"| {model} | " + " | ".join(cells) + " |")
         lines.append("")
     excluded = sum(1 for r in data if r["contamination_suspected"])
-    lines.append(f"{len(data)} graded runs; {excluded} excluded as contamination suspects. CSV: {CSV_OUT.name}")
-    MD_OUT.write_text("\n".join(lines) + "\n")
+    lines.append(f"{len(data)} graded runs; {excluded} excluded as contamination suspects. CSV: {csv_out.relative_to(BENCH_DIR)}")
+    md_out.write_text("\n".join(lines) + "\n")
     return "\n".join(lines)

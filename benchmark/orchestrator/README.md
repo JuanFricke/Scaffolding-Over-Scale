@@ -88,8 +88,10 @@ report's pass@1 (they are kept on disk).
 ```bash
 python -m orchestrator run --models oracle,null --levels none --reps 1 --concurrency 1 --tag eqv-c1
 python -m orchestrator run --models oracle,null --levels none --reps 1 --concurrency 4 --tag eqv-c4
-python -m orchestrator report --tag eqv-c1 --include-validation
+python -m orchestrator report --tag eqv-c1 --include-validation   # -> runs/_tagged/report-eqv-c1.*
 python -m unittest discover -s orchestrator/tests -t .   # 429 pause, resume, level isolation
 ```
 
-`--tag` keeps validation runs in `runs/manifest-<tag>.jsonl` and suffixes their run ids.
+`--tag` keeps validation runs out of the thesis artifacts: manifest, env and report go to
+`runs/_tagged/` (git-ignored) and run ids get a `__<tag>` suffix. `evaluate.sh` still appends
+their lines to `results.jsonl`; drop lines whose `run_id` ends in a tag before committing it.

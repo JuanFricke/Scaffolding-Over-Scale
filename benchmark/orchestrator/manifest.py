@@ -17,8 +17,10 @@ MANIFEST = BENCH_DIR / "runs" / "manifest.jsonl"
 
 
 def path_for(tag: str | None) -> Path:
-    """Main manifest, or runs/manifest-<tag>.jsonl for tagged (validation) runs."""
-    return MANIFEST if not tag else MANIFEST.with_name(f"manifest-{tag}.jsonl")
+    """Main manifest, or runs/_tagged/manifest-<tag>.jsonl for tagged (validation) runs.
+
+    runs/_tagged/ is git-ignored (runs/*/): validation runs never enter the thesis artifacts."""
+    return MANIFEST if not tag else MANIFEST.parent / "_tagged" / f"manifest-{tag}.jsonl"
 
 # Lifecycle. Terminal: done, failed_infra. Everything else is resumable.
 PREPARED = "prepared"

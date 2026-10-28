@@ -66,7 +66,7 @@ def cmd_run(args, mx):
     cells = _selection(args, mx)
     if not args.dry_run:
         _guard_training(cells, args.allow_training_models)
-        write_env(mx)
+        write_env(mx, args.tag)
     print(json.dumps(asyncio.run(_scheduler(args, mx).run(cells))))
 
 
@@ -150,7 +150,7 @@ def _cmd(argv: list[str]) -> str:
         return f"unavailable ({e})"
 
 
-def write_env(mx) -> Path:
+def write_env(mx, tag: str | None = None) -> Path:
     pf = Path(os.environ.get("PF_REPO", BENCH.parent.parent / "PegaFilaWeb"))
     sb = mx.run.get("sandbox_image", "")
     env = {
@@ -168,7 +168,8 @@ def write_env(mx) -> Path:
         "seed": mx.seed,
         "python": sys.version.split()[0],
     }
-    path = BENCH / "runs" / f"env-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}.json"
+    path = mf.path_for(tag).parent / f"env-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(env, indent=2) + "\n")
     return path
 
