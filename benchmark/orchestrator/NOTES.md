@@ -173,3 +173,28 @@ enunciado, em **todos** os runs (todos os modelos e níveis; aplicar só a algun
 criaria diferença de condição entre eles). O texto não fala de testes, harness nem
 ferramentas. Cada run grava `prompt_version` (hash do preâmbulo) e `runs/<run_id>/prompt.sent.md`.
 Runs anteriores aparecem como `v0-statement-only`; `retry --stale-prompt` os refaz.
+
+## Estado em 2026-10-28 (fim da sessão)
+
+**Pronto e validado**
+- Orquestrador (`plan`/`run`/`pilot`/`status`/`retry`/`report`/`env`/`reparse`), sandbox do
+  agente (só a árvore montada, `bin/pf` via shim, intelephense + laravel-lsp), adaptadores
+  OpenCode e Claude Code, 429 sem gastar tentativas, preâmbulo não interativo.
+- Aceites: oráculo 14/14, nulo 0/14, sequencial = paralelo, retomada sem duplicar, 429 pausa
+  o pool, `plan`/`--dry-run` sem Docker/rede; 8 testes em `orchestrator/tests/`.
+- Matriz: 9 modelos, 1428 células (5 OpenCode Go incl. beam-free; Claude Code: haiku-5-5 e
+  sonnet-5-5 em effort high, haiku-4-5, opus-5-5 medium só none/full).
+
+**Dados (rep 1, prompt `v0-statement-only`, sem preâmbulo)**
+- Muse Spark 1.3: 12/12 (teto). GLM 5.3 flash: 11/12. Haiku 4.5: 6/12 (o único abaixo do
+  teto; falha em T06 skills/full e T10 em todos os níveis). Tarefas: T02, T06, T10.
+- n = 1 por célula: nenhuma conclusão sobre o efeito do harness ainda.
+
+**Próximos passos**
+1. `retry --stale-prompt` nas 36 células dos pilotos (refazer com o preâmbulo).
+2. Antes de rodar a matriz, conferir no painel do opencode.ai o consumo da cota do Go
+   (estimativa: matriz ≈ 50% da cota mensal; GLM ≈ 2/3 disso) e considerar
+   `CLAUDE_CODE_OAUTH_TOKEN` dedicado (`claude setup-token`) para runs longos.
+3. 1ª passada: `run --reps 1`, depois reps 2 e 3.
+4. `benchmark/work/` guarda todas as árvores (≈20 GB após ~300 runs; ignorado pelo git):
+   limpar árvores de células `done` ou mover `work_dir` para um disco maior antes da matriz.
