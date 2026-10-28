@@ -155,6 +155,33 @@ def cmd_report(args, mx):
     print(out)
 
 
+def cmd_reparse(args, mx):
+    """Recompute Claude Code metrics from the raw logs kept in runs/<run_id>/ (no rerun).
+
+    Appends an annotation record (same state, `annotation: metrics_reparsed`) per changed cell;
+    report reads metrics from the manifest, so results.jsonl keeps its original copy."""
+    man = mf.Manifest(mf.path_for(args.tag))
+    latest = man.latest()
+    parser = adapters.ClaudeCodeAdapter()
+    changed = 0
+    for cid, rec in sorted(latest.items()):
+        if rec.get("runner") != "claude-code" or rec.get("state") != mf.DONE:
+            continue
+        log = BENCH / "runs" / rec["run_id"] / "agent.stdout.log"
+        if not log.exists():
+            continue
+        res = adapters.AgentResult("ok")
+        parser.parse(None, res, None, log.read_text(errors="replace"), "")
+        new = {**(rec.get("metrics") or {}), **res.metrics}
+        if new != rec.get("metrics"):
+            man.append(cid, rec["state"], annotation="metrics_reparsed", run_id=rec["run_id"], metrics=new)
+            changed += 1
+            old = rec.get("metrics") or {}
+            print(f"{cid}: turns {old.get('turns')} -> {new.get('turns')}, "
+                  f"tokens_out {old.get('tokens_out')} -> {new.get('tokens_out')}")
+    print(f"{changed} cells re-parsed")
+
+
 def _cmd(argv: list[str]) -> str:
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
@@ -224,6 +251,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--tag")
     p.set_defaults(fn=cmd_report)
     p = sub.add_parser("env"); p.set_defaults(fn=cmd_env)
+    p = sub.add_parser("reparse", help="recompute Claude Code metrics from stored logs")
+    p.add_argument("--tag"); p.set_defaults(fn=cmd_reparse)
 
     args = ap.parse_args(argv)
     mx = matrix.load(args.matrix)

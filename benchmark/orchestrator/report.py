@@ -49,7 +49,9 @@ def rows(include_validation: bool = False, tag: str | None = None) -> list[dict]
         if m.get("runner") in VALIDATION_RUNNERS and not include_validation:
             continue
         r = results[m["run_id"]]
-        met = r.get("agent_metrics") or {}
+        # the manifest holds the latest metrics (`reparse` corrects them there); results.jsonl
+        # keeps the copy made at grading time
+        met = {**(r.get("agent_metrics") or {}), **(m.get("metrics") or {})}
         v = r["violations"]
         out.append({
             "runner": m.get("runner"), "model": r["model"], "level": r["level"], "task": r["task"],
