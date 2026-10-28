@@ -23,6 +23,7 @@ class Model:
     trains_on_data: bool = False
     training_ok: bool = False
     validation: bool = False
+    effort: str | None = None      # Claude Code --effort; None = the CLI's default
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,7 @@ def load(path: Path = DEFAULT_MATRIX) -> Matrix:
             trains_on_data=bool(m.get("trains_on_data", False)),
             training_ok=bool(m.get("training_ok", False)),
             validation=bool(m.get("validation", False)),
+            effort=m.get("effort"),
         ))
     pools = {name: int(p.get("max_concurrency", 1)) for name, p in data.get("pool", {}).items()}
     for m in models:

@@ -384,7 +384,8 @@ class ClaudeCodeAdapter(CLIAdapter):
     def agent_argv(self, ctx: AgentContext) -> list[str]:
         # --setting-sources project: only the tree's .claude/settings.json (present at `full`),
         # never the experimenter's user settings; no MCP servers.
-        return ["claude", "-p", "--model", ctx.cell.model.id, "--output-format", "stream-json",
+        effort = ["--effort", ctx.cell.model.effort] if ctx.cell.model.effort else []
+        return ["claude", "-p", "--model", ctx.cell.model.id, *effort, "--output-format", "stream-json",
                 "--verbose", "--setting-sources", "project", "--strict-mcp-config",
                 "--no-session-persistence", "--dangerously-skip-permissions", ctx.prompt]
 

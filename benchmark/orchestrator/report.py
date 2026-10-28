@@ -22,7 +22,7 @@ COLUMNS = ["runner", "model", "level", "task", "rep", "cell_id", "run_id", "atte
            "full_failed", "regressions", "pint_ok", "diff_files", "diff_insertions", "diff_deletions",
            "tests_touched", "harness_touched", "unescaped_output_added", "composer_mode", "turns",
            "tokens_in", "tokens_out", "tokens_reasoning", "tokens_cache_read", "cost_usd", "agent_s",
-           "grade_s", "cli_version", "sandbox"]
+           "grade_s", "cli_version", "effort", "sandbox"]
 
 
 def load_results() -> dict[str, dict]:
@@ -64,7 +64,7 @@ def rows(include_validation: bool = False, tag: str | None = None) -> list[dict]
             "tests_touched": len(v["tests_touched"]), "harness_touched": len(v["harness_touched"]),
             "unescaped_output_added": v["unescaped_output_added"], "composer_mode": r["composer"]["mode"],
             **{k: met.get(k) for k in ("turns", "tokens_in", "tokens_out", "tokens_reasoning",
-                                       "tokens_cache_read", "cost_usd", "cli_version", "sandbox")},
+                                       "tokens_cache_read", "cost_usd", "cli_version", "effort", "sandbox")},
             "agent_s": m.get("agent_s"), "grade_s": m.get("grade_s"),
         })
     return out

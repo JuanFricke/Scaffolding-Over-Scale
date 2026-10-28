@@ -273,6 +273,7 @@ class Scheduler:
                         contamination_suspected=bool(hits), contamination_hits=hits[:20])
         metrics = {**res.metrics, "cell_id": cell.cell_id, "rep": cell.rep, "attempt": attempt,
                    "runner": cell.model.runner, "cli_version": self.versions.get(cell.model.runner),
+                   "effort": cell.model.effort or "cli-default",
                    "sandbox": self.sandbox, "sandbox_image_id": self.sandbox_image_id,
                    "agent_outcome": res.outcome,
                    "contamination_suspected": bool(hits), "matrix_sha256": self.mx.sha256, "seed": self.mx.seed}
