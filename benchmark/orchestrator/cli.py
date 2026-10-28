@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 from . import adapters, manifest as mf, matrix, report
-from .scheduler import POOL_STATE, Options, Scheduler
+from .scheduler import POOL_STATE, PROMPT_V0, Options, Scheduler, load_preamble
 
 BENCH = matrix.BENCH_DIR
 
@@ -102,6 +102,11 @@ def cmd_status(args, mx):
     latest = mf.Manifest(mf.path_for(args.tag)).latest()
     states = collections.Counter(latest.get(c.cell_id, {}).get("state", "new") for c in cells)
     print("by state: " + ", ".join(f"{k}={v}" for k, v in sorted(states.items())))
+    _, current = load_preamble(mx.run)
+    stale = [c for c in cells if latest.get(c.cell_id, {}).get("state") == mf.DONE
+             and latest[c.cell_id].get("prompt_version", PROMPT_V0) != current]
+    if stale:
+        print(f"{len(stale)} done cells used another prompt version (retry --stale-prompt to rerun)")
     for key, name in ((lambda c: c.model.id, "model"), (lambda c: c.level, "level")):
         print(f"\nby {name}:")
         groups = collections.defaultdict(list)
@@ -123,8 +128,8 @@ def cmd_status(args, mx):
 
 
 def cmd_retry(args, mx):
-    if not args.failed_infra and not args.cells:
-        sys.exit("give --failed-infra or --cells <cell_id,...> --reason <why>")
+    if not (args.failed_infra or args.cells or args.stale_prompt):
+        sys.exit("give --failed-infra, --stale-prompt or --cells <cell_id,...> --reason <why>")
     if args.cells and not args.reason:
         sys.exit("--cells needs --reason (it is recorded in the manifest)")
     cells = _selection(args, mx)
@@ -136,8 +141,19 @@ def cmd_retry(args, mx):
         if unknown:
             sys.exit(f"cells not in the selection: {sorted(unknown)}")
         failed = [c for c in cells if c.cell_id in wanted]
+    elif args.stale_prompt:
+        # done under another prompt version (e.g. before the preamble): same cell, new condition
+        _, current = load_preamble(mx.run)
+        failed = [c for c in cells if latest.get(c.cell_id, {}).get("state") == mf.DONE
+                  and latest[c.cell_id].get("prompt_version", PROMPT_V0) != current]
+        args.reason = args.reason or f"prompt changed to {current}"
     else:
         failed = [c for c in cells if latest.get(c.cell_id, {}).get("state") == mf.FAILED_INFRA]
+    if args.dry_run:
+        for c in failed:
+            print(f"  would requeue {c.cell_id}")
+        print(f"{len(failed)} cells would be requeued (dry run)")
+        return
     for c in failed:
         # the previous run stays on disk and in results.jsonl; `superseded_run_id` points at it
         man.append(c.cell_id, "requeued", reason=args.reason or "retry --failed-infra",
@@ -246,6 +262,8 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("retry"); selection(p); execution(p)
     p.add_argument("--failed-infra", action="store_true")
     p.add_argument("--cells", help="requeue these cells whatever their state (needs --reason)")
+    p.add_argument("--stale-prompt", action="store_true",
+                   help="requeue done cells run with a different prompt version")
     p.add_argument("--reason"); p.set_defaults(fn=cmd_retry)
     p = sub.add_parser("report"); p.add_argument("--include-validation", action="store_true")
     p.add_argument("--tag")

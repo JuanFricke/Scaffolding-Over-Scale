@@ -163,3 +163,13 @@ wrapper original usava o contêiner `php:8.4-cli`). Responde a `initialize` por 
 Os runs do piloto `T02 full` e `T06 full` começaram antes do rebuild (sem laravel-lsp) e
 foram reenfileirados com `retry --cells`; o run antigo fica referenciado como
 `superseded_run_id`. Desde então cada run grava `sandbox_image_id`.
+
+## Preâmbulo "trabalhe sem perguntar" (decisão 8, 2026-10-28)
+
+No mini piloto, o Haiku 4.5 respondeu ao T10 `agents` pedindo esclarecimento e parou
+(1 turno): no modo headless ninguém responde. O enunciado (`tasks/*.yaml`) não pode mudar,
+então o orquestrador põe o texto fixo de `orchestrator/prompt-preamble.md` antes de todo
+enunciado, em **todos** os runs (todos os modelos e níveis; aplicar só a alguns modelos
+criaria diferença de condição entre eles). O texto não fala de testes, harness nem
+ferramentas. Cada run grava `prompt_version` (hash do preâmbulo) e `runs/<run_id>/prompt.sent.md`.
+Runs anteriores aparecem como `v0-statement-only`; `retry --stale-prompt` os refaz.
