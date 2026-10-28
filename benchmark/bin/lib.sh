@@ -10,7 +10,7 @@ BENCH_HARNESS="$BENCH_DIR/harness"
 BENCH_TASKS="$BENCH_DIR/tasks"
 BENCH_WORK="$BENCH_DIR/work"
 BENCH_RUNS="$BENCH_DIR/runs"
-BENCH_CACHE="$BENCH_DIR/.cache"
+BENCH_CACHE="${BENCH_CACHE:-$BENCH_DIR/.cache}"   # overridable: one cache per parallel grader
 BENCH_DEFAULT_TAG="tcc-baseline-v1"
 BENCH_DEFAULT_HARNESS="v1"
 

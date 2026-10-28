@@ -139,7 +139,8 @@ run_in "$IMAGE" "
 
 exit_of() { [[ -f "$RUN_DIR/$1.exit" ]] && cat "$RUN_DIR/$1.exit" || echo ""; }
 # Pest summary: "Tests:    3 failed, 299 passed (1500 assertions)" / "Tests:    302 passed (...)"
-count_in() { grep -E '^\s*Tests:' "$RUN_DIR/$1.log" 2>/dev/null | tail -n1 | grep -oE "[0-9]+ $2" | awk '{print $1}'; }
+# (|| true: a summary without "failed" or "passed" is normal; under pipefail it used to abort the script)
+count_in() { { grep -E '^\s*Tests:' "$RUN_DIR/$1.log" 2>/dev/null | tail -n1 | grep -oE "[0-9]+ $2" | awk '{print $1}'; } || true; }
 FULL_PASSED="$(count_in tests-full passed)"; FULL_FAILED="$(count_in tests-full failed)"
 HID_PASSED="$(count_in tests-hidden passed)"; HID_FAILED="$(count_in tests-hidden failed)"
 [[ -n "$FULL_PASSED" && -z "$FULL_FAILED" ]] && FULL_FAILED=0
@@ -172,7 +173,8 @@ LINE+=",\"regressions\":$(json_num_or_null "$REGRESSIONS")"
 LINE+=",\"agent_metrics\":$AGENT_METRICS}"
 
 printf '%s\n' "$LINE" > "$RUN_DIR/result.json"
-printf '%s\n' "$LINE" >> "$BENCH_RUNS/results.jsonl"
+# one locked append: parallel graders must not interleave lines
+{ flock 9; printf '%s\n' "$LINE" >&9; } 9>> "$BENCH_RUNS/results.jsonl"
 
 cat <<EOF
 run       $RUN_ID
