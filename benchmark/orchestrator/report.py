@@ -36,9 +36,9 @@ def load_results() -> dict[str, dict]:
     return out
 
 
-def rows(include_validation: bool = False) -> list[dict]:
+def rows(include_validation: bool = False, tag: str | None = None) -> list[dict]:
     results = load_results()
-    man = mf.Manifest()
+    man = mf.Manifest(mf.path_for(tag))
     merged: dict[str, dict] = {}
     for rec in man.records():
         merged.setdefault(rec["cell_id"], {}).update(rec)
@@ -70,8 +70,8 @@ def rows(include_validation: bool = False) -> list[dict]:
     return out
 
 
-def build(include_validation: bool = False) -> str:
-    data = rows(include_validation)
+def build(include_validation: bool = False, tag: str | None = None) -> str:
+    data = rows(include_validation, tag)
     with CSV_OUT.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=COLUMNS)
         w.writeheader()

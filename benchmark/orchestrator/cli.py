@@ -138,7 +138,7 @@ def cmd_retry(args, mx):
 
 
 def cmd_report(args, mx):
-    out = report.build(include_validation=args.include_validation)
+    out = report.build(include_validation=args.include_validation, tag=args.tag)
     print(out)
 
 
@@ -205,6 +205,7 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("retry"); selection(p); execution(p)
     p.add_argument("--failed-infra", action="store_true"); p.set_defaults(fn=cmd_retry)
     p = sub.add_parser("report"); p.add_argument("--include-validation", action="store_true")
+    p.add_argument("--tag")
     p.set_defaults(fn=cmd_report)
     p = sub.add_parser("env"); p.set_defaults(fn=cmd_env)
 
