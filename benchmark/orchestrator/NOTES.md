@@ -174,6 +174,33 @@ criaria diferença de condição entre eles). O texto não fala de testes, harne
 ferramentas. Cada run grava `prompt_version` (hash do preâmbulo) e `runs/<run_id>/prompt.sent.md`.
 Runs anteriores aparecem como `v0-statement-only`; `retry --stale-prompt` os refaz.
 
+## Modelos locais (decisão 9, 2026-10-28)
+
+`llama/gpt-oss-20b` (MXFP4) e `llama/qwen3.6-35b-a3b` (UD-IQ3_S) rodam pelo runner OpenCode
+contra um `llama-server` (llama.cpp, Vulkan, RX 9070 16 GB) em modo router
+(`llama/serve.sh` + `llama/models.ini`).
+- Comum aos dois: 1 slot, KV f16 (q8_0 reduzia pela metade a velocidade do Qwen no Vulkan),
+  `--spec-type ngram-mod`. Contexto: o maior que cabe na VRAM junto com os pesos de cada um
+  (decisão do Juan): 128k no gpt-oss, 64k no Qwen. É uma diferença entre os dois modelos,
+  registrada; o OpenCode compacta a sessão contra esse limite. A decodificação especulativa
+  verifica cada token no modelo alvo, então só muda a velocidade, não a saída.
+- Amostragem: a recomendada por cada fabricante (gpt-oss: temp 1.0, top-p 1.0, reasoning
+  effort medium; Qwen: temp 0.6, top-p 0.95, top-k 20). Fica no preset; o hash do preset vai
+  em cada run (`llama_preset_sha256`) e a versão do llama-server no `env-*.json`.
+- Só cabe um modelo na VRAM: pool `llama` com concorrência 1, e o router troca de modelo
+  sob demanda (~5 s), sem depender da ordem das células.
+- O provider OpenCode (`@ai-sdk/openai-compatible`) é escrito na config global do home
+  temporário de cada run; o `opencode.json` da árvore (nível `full`) se sobrepõe como para
+  qualquer modelo. No sandbox o servidor é alcançado como `host.docker.internal`
+  (`--add-host host-gateway`); ele escuta só em 127.0.0.1 e na bridge docker0, nunca na LAN.
+- Sem servidor no ar, o run é `infra` (retentado, depois `failed_infra`), nunca dado.
+- O tempo de parede depende do hardware local e não é comparável com os modelos por API;
+  turnos e tokens são.
+- O `ufw` do host bloqueia a bridge docker0: é preciso liberar a porta uma vez
+  (`sudo ufw allow in on docker0 to 172.17.0.1 port 8089 proto tcp`).
+- Smoke (tag, fora dos dados), T02 `full` no sandbox: gpt-oss 73 s / 20 turnos, Qwen 194 s /
+  21 turnos; ambos `hidden_ok`, modelo correto, sem contaminação.
+
 ## Estado em 2026-10-28 (fim da sessão)
 
 **Pronto e validado**
@@ -182,8 +209,8 @@ Runs anteriores aparecem como `v0-statement-only`; `retry --stale-prompt` os ref
   OpenCode e Claude Code, 429 sem gastar tentativas, preâmbulo não interativo.
 - Aceites: oráculo 14/14, nulo 0/14, sequencial = paralelo, retomada sem duplicar, 429 pausa
   o pool, `plan`/`--dry-run` sem Docker/rede; 8 testes em `orchestrator/tests/`.
-- Matriz: 9 modelos, 1428 células (5 OpenCode Go incl. beam-free; Claude Code: haiku-5-5 e
-  sonnet-5-5 em effort high, haiku-4-5, opus-5-5 medium só none/full).
+- Matriz: 11 modelos, 1764 células (5 OpenCode Go incl. beam-free; 2 locais via llama.cpp;
+  Claude Code: haiku-5-5 e sonnet-5-5 em effort high, haiku-4-5, opus-5-5 medium só none/full).
 
 **Dados (rep 1, prompt `v0-statement-only`, sem preâmbulo)**
 - Muse Spark 1.3: 12/12 (teto). GLM 5.3 flash: 11/12. Haiku 4.5: 6/12 (o único abaixo do

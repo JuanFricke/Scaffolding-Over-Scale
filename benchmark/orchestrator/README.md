@@ -16,7 +16,13 @@ benchmark/bin/build-image.sh                    # grading image pf-bench:tcc-bas
 benchmark/orchestrator/sandbox/build.sh         # agent sandbox pf-bench-agent:tcc-baseline-v1
 opencode auth login                             # OpenCode Go
 claude setup-token && export CLAUDE_CODE_OAUTH_TOKEN=...   # or `claude` login / ANTHROPIC_API_KEY
+benchmark/orchestrator/llama/serve.sh           # local models (llama/*): llama-server router, keep it running
 ```
+
+Local models (`llama/<name>`) run through OpenCode against `llama-server` in router mode:
+`llama/models.ini` holds the runner parameters (context per model, one slot, `ngram-mod`
+speculative decoding, sampling), one model in VRAM at a time (pool `llama`, concurrency 1).
+`serve.sh` takes `LLAMA_SERVER`, `MODELS_DIR` (default `~/Modelos`) and `LLAMA_PORT` (8089).
 
 Credentials are never written in the repository: OpenCode's are exported into a
 temporary per-run home (outside the repo, deleted after the run); Claude Code
@@ -53,7 +59,7 @@ recorded per run as `prompt_version`, and the exact text sent goes to `runs/<run
 `[run]`: `seed` (shuffles cell order, recorded), `reps`, `agent_timeout_s`,
 `grade_slots`, `levels`, `sandbox` (`docker` | `none`), `sandbox_image`,
 `max_attempts`, `backoff_base_s`, `work_dir`. `[[model]]`: `id`, `runner`
-(`opencode`, `claude-code`, `oracle`, `null`), `pool`, optional `levels`,
+(`opencode`, `claude-code`, `oracle`, `null`; OpenCode ids `llama/*` use the local server), `pool`, optional `levels`,
 `trains_on_data`/`training_ok`, `validation`. `[pool.<name>] max_concurrency`.
 
 Validation runners (`oracle`, `null`) only run when named in `--models`.
