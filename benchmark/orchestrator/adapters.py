@@ -9,6 +9,7 @@ Every adapter returns an AgentResult whose `outcome` drives the scheduler:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import signal
 import subprocess
 import tempfile
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,6 +26,9 @@ from .matrix import BENCH_DIR, Cell
 
 SANDBOX_DIR = Path(__file__).resolve().parent / "sandbox"
 WORKSPACE = "/workspace"
+# local models: llama-server router started by llama/serve.sh (models.ini)
+LLAMA_PRESET = Path(__file__).resolve().parent / "llama" / "models.ini"
+LLAMA_PROVIDER = "llama"   # OpenCode provider id: model ids are "llama/<preset section>"
 
 INFRA_PATTERNS = re.compile(
     r"\b(429|500|502|503|504|529)\b|rate.?limit|too many requests|quota|overloaded|"
@@ -154,7 +159,7 @@ class CLIAdapter(Adapter):
             return f"unknown ({e})"
 
     # subclasses fill these
-    def setup_home(self, home: Path) -> list[str]:
+    def setup_home(self, home: Path, ctx: AgentContext) -> list[str]:
         """Seed credentials into the per-run home; return shell lines to run before the agent."""
         return []
 
@@ -176,7 +181,7 @@ class CLIAdapter(Adapter):
     async def run(self, ctx: AgentContext) -> AgentResult:
         home = Path(tempfile.mkdtemp(prefix=f"bench-home-{ctx.run_id[:40]}-"))
         try:
-            pre = self.setup_home(home)
+            pre = self.setup_home(home, ctx)
             argv = self.agent_argv(ctx)
             env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_CODE_")}
             env.update(self.agent_env())
@@ -256,7 +261,9 @@ class CLIAdapter(Adapter):
         for k, v in self.agent_env().items():
             envs += ["-e", f"{k}={v}"]
         script = "\n".join([*pre, 'exec "$@"'])
+        # host.docker.internal: the local llama-server (bound to the docker0 bridge, not the LAN)
         return ["docker", "run", "--rm", "--name", name, "--init", "--user", f"{uid}:{gid}",
+                "--add-host", "host.docker.internal:host-gateway",
                 "--label", "bench.role=agent", "--label", f"bench.run_id={ctx.run_id}",
                 "-e", "HOME=/home/agent", "-e", "CI=1", *envs, *mounts, "-w", WORKSPACE,
                 ctx.sandbox_image, "bash", "-c", script, "agent", *argv]
@@ -266,7 +273,9 @@ class OpenCodeAdapter(CLIAdapter):
     runner = "opencode"
     binary = "opencode"
 
-    def setup_home(self, home: Path) -> list[str]:
+    def setup_home(self, home: Path, ctx: AgentContext) -> list[str]:
+        if ctx.cell.model.id.startswith(LLAMA_PROVIDER + "/"):
+            self.write_llama_provider(home, ctx)
         # Credentials travel as an `auth export` file inside the per-run home (outside the repo,
         # deleted afterwards); the per-run data dir also keeps sessions of parallel runs apart.
         creds = subprocess.run([str(self.host_binary()), "auth", "export"], capture_output=True, timeout=60)
@@ -276,6 +285,29 @@ class OpenCodeAdapter(CLIAdapter):
         f.write_bytes(creds.stdout)
         f.chmod(0o600)
         return ['opencode auth import --standalone "$HOME/auth.json" >/dev/null', 'rm -f "$HOME/auth.json"']
+
+    @staticmethod
+    def write_llama_provider(home: Path, ctx: AgentContext) -> None:
+        """Global (per-run home) config declaring the local llama-server as an OpenAI-compatible
+        provider; the tree's own opencode.json (level `full`) is merged on top, as for any model."""
+        port = os.environ.get("LLAMA_PORT", "8089")
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=10).read()
+        except OSError as e:
+            raise RuntimeError(f"llama-server not reachable on :{port} ({e}); start orchestrator/llama/serve.sh")
+        host = "host.docker.internal" if ctx.sandbox == "docker" else "127.0.0.1"
+        # OpenCode compacts against the context each preset gives the server (`c`)
+        models = {m: {"name": m, "tool_call": True, "reasoning": True,
+                      "limit": {"context": int(re.search(r"^c\s*=\s*(\d+)", body, re.M).group(1)),
+                                "output": 16384}}
+                  for m, body in re.findall(r"^\[([^*\]]+)\]\n(.*?)(?=^\[|\Z)",
+                                            LLAMA_PRESET.read_text(), re.M | re.S)}
+        cfg = home / ".config" / "opencode" / "opencode.json"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(json.dumps({"$schema": "https://opencode.ai/config.json", "provider": {
+            LLAMA_PROVIDER: {"npm": "@ai-sdk/openai-compatible", "name": "llama.cpp (local)",
+                             "options": {"baseURL": f"http://{host}:{port}/v1"}, "models": models}}},
+            indent=2))
 
     def agent_argv(self, ctx: AgentContext) -> list[str]:
         return ["opencode", "run", "--standalone", "--auto", "--format", "json",
@@ -327,6 +359,8 @@ class OpenCodeAdapter(CLIAdapter):
             "outcome": info.get("outcome"),
             "models_seen": models,
         })
+        if ctx.cell.model.id.startswith(LLAMA_PROVIDER + "/"):
+            res.metrics["llama_preset_sha256"] = hashlib.sha256(LLAMA_PRESET.read_bytes()).hexdigest()
         if info.get("outcome") not in (None, "succeeded") and res.outcome == "ok":
             res.reason = res.reason or f"session outcome {info.get('outcome')}"
             self._classify_error(res, stderr[-20000:] + "\n" + res.reason)
@@ -342,7 +376,7 @@ class ClaudeCodeAdapter(CLIAdapter):
     def marketplace_dir(self) -> Path:
         return Path.home() / ".claude" / "plugins" / "marketplaces" / self.MARKETPLACE
 
-    def setup_home(self, home: Path) -> list[str]:
+    def setup_home(self, home: Path, ctx: AgentContext) -> list[str]:
         (home / ".claude" / "plugins").mkdir(parents=True)
         # Prefer a long-lived token (`claude setup-token`) or an API key from the environment;
         # fall back to a copy of the CLI login.
