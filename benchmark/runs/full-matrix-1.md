@@ -92,6 +92,21 @@ em ordem embaralhada com seed 20261028.
   - A regra foi corrigida e a célula foi reavaliada na mesma árvore com `regrade` (`hidden_ok=False`).
   - O processo em andamento ainda usa a regra antiga: rodar `regrade --models $M` ao final.
 
+## Cancelamento (2026-10-28, 19:40)
+
+Rodada cancelada por tempo: a estimativa com dados reais passava de 30 h, e o pool opencode-go
+(GLM e mimo, os modelos mais lentos do Go) era o gargalo. Substituída pela rodada reduzida 1
+(`reduced-1.md`): 1 rep, e no Go os 3 modelos com mais tokens por segundo.
+
+- **Parada:** SIGTERM no processo e `docker kill` nos containers. Os 7 agentes em andamento
+  foram perdidos.
+- **Estado final:** 41 células `done`.
+  - Sonnet 9, Haiku 5.5 12, gpt-oss 14, GLM 3, mimo 3.
+  - Os 3 `failed_infra` do gpt-oss vinham da regra antiga do composer e foram reavaliados com
+    `regrade` (todos `hidden_ok=False`).
+- **Dados:** ficam no manifesto. As células de rep 1 de Sonnet, Haiku 5.5 e gpt-oss são
+  reaproveitadas pela rodada reduzida.
+
 ## Ao terminar
 
 1. `python -m orchestrator regrade --models $M` (falhas de avaliação da regra antiga), depois

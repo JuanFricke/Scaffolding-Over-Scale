@@ -241,6 +241,14 @@ avaliação (o agente não roda de novo), com cache próprio (`.cache/slot-regra
 rodar ao lado de um `run` em andamento. O processo da rodada 1 iniciado às 19:01 ainda usa a
 regra antiga: rodar `regrade --models $M` ao final dele (ou após reiniciar) recupera os casos.
 
+## Rodada reduzida (decisão 11, 2026-10-28)
+
+A rodada completa (5 modelos × 3 reps, 840 células) foi cancelada às 19:40: com tempos reais,
+a estimativa passava de 30 h. O limite agora é ≤ 12 h, então ficou 1 rep e os 4 níveis.
+O GLM e o mimo saíram (eram os mais lentos do Go: ~75 e ~45 tok/s nas sessões agentic) e
+entraram os 3 mais rápidos: Muse, beam-free e deepseek. Entraram também os dois modelos locais.
+Detalhes e medições de tok/s em `runs/reduced-1.md`; para disparar, `runs/reduced-1.sh`.
+
 ## Estado em 2026-10-28 (fim da sessão)
 
 **Pronto e validado**
