@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 
 from orchestrator import adapters, manifest as mf, matrix
-from orchestrator.scheduler import Options, Scheduler, check_level
+from orchestrator.scheduler import Options, Pool, Scheduler, check_level
 
 TASK = "T07-call-next-ticket"
 
@@ -37,7 +37,8 @@ class SlowAgent(adapters.Adapter):
 
 def _mx(tmp: Path) -> matrix.Matrix:
     mx = matrix.load()
-    mx.run = {**mx.run, "backoff_base_s": 0.2, "work_dir": str(tmp / "work"), "max_attempts": 3}
+    mx.run = {**mx.run, "backoff_base_s": 0.2, "rate_limit_base_s": 0.2, "rate_limit_max_s": 1,
+              "work_dir": str(tmp / "work"), "max_attempts": 3}
     return mx
 
 
@@ -72,10 +73,31 @@ class SchedulerTests(unittest.TestCase):
     def test_gives_up_after_max_attempts(self):
         mx = _mx(self.tmp)
         cells = _cells(mx)
-        sch = StubGrade(mx, Options(tag="unittest", concurrency=1, adapter_override={"null": adapters.FlakyAdapter(99)}),
-                        self.man)
+        flaky = adapters.FlakyAdapter(99, rate_limited=False)
+        sch = StubGrade(mx, Options(tag="unittest", concurrency=1, adapter_override={"null": flaky}), self.man)
         asyncio.run(sch.run(cells))
         self.assertEqual(self.man.latest()[cells[0].cell_id]["state"], mf.FAILED_INFRA)
+
+    def test_rate_limits_do_not_spend_attempts(self):
+        mx = _mx(self.tmp)
+        cells = _cells(mx)
+        flaky = adapters.FlakyAdapter(fail_times=5)        # more 429s than max_attempts
+        sch = StubGrade(mx, Options(tag="unittest", concurrency=1, adapter_override={"null": flaky}), self.man)
+        asyncio.run(sch.run(cells))
+        self.assertEqual(self.man.latest()[cells[0].cell_id]["state"], mf.DONE)
+        self.assertEqual(sch.pools["local"].strikes, 0)   # reset by the successful run
+
+    def test_concurrent_429s_escalate_once(self):
+        pool = Pool("p", 3, base_pause=10, max_pause=100)
+        t0 = time.time()
+        pool.rate_limited(t0)
+        first = pool.resume_at
+        pool.rate_limited(t0)            # same event, seen by another run in flight
+        self.assertEqual(pool.strikes, 1)
+        self.assertEqual(pool.resume_at, first)
+        pool.rate_limited(time.time() + 1)   # a later run hits it again
+        self.assertEqual(pool.strikes, 2)
+        self.assertGreater(pool.resume_at, first)
 
     def test_resume_after_kill_does_not_duplicate(self):
         mx = _mx(self.tmp)

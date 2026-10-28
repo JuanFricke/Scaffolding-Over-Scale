@@ -117,17 +117,20 @@ class NullAdapter(Adapter):
 
 
 class FlakyAdapter(Adapter):
-    """Test double: answers 429 for the first `fail_times` calls per cell, then behaves like null."""
+    """Test double: fails (429, or a network error) the first `fail_times` calls per cell, then
+    behaves like null."""
     runner = "flaky"
 
-    def __init__(self, fail_times: int = 1):
-        self.fail_times = fail_times
+    def __init__(self, fail_times: int = 1, rate_limited: bool = True):
+        self.fail_times, self.rate_limited = fail_times, rate_limited
         self.calls: dict[str, int] = {}
 
     async def run(self, ctx: AgentContext) -> AgentResult:
         n = self.calls[ctx.cell.cell_id] = self.calls.get(ctx.cell.cell_id, 0) + 1
         if n <= self.fail_times:
-            return AgentResult("infra", "simulated HTTP 429 Too Many Requests", 1, rate_limited=True)
+            if self.rate_limited:
+                return AgentResult("infra", "simulated HTTP 429 Too Many Requests", 1, rate_limited=True)
+            return AgentResult("infra", "simulated ECONNRESET", 1)
         return AgentResult("ok", exit_code=0, metrics={"turns": 0, "tokens_in": 0, "tokens_out": 0})
 
 

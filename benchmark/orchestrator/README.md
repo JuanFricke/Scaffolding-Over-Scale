@@ -68,7 +68,8 @@ result line. A regrade appends a second line with the same `run_id`; the last on
 
 | kind | handling |
 |---|---|
-| `infra` (429, network, 5xx, CLI crash, wrong model used) | not data; backoff with jitter, a 429 pauses the whole pool; `max_attempts`, then `failed_infra` |
+| `infra`, rate limit (429, quota, usage window) | not data and **no attempt spent**: the whole pool pauses (60 s, doubling per consecutive 429 up to 30 min, reset by a successful run) and the cell retries until the window reopens |
+| `infra`, other (network, 5xx, CLI crash, wrong model used) | not data; backoff with jitter; `max_attempts`, then `failed_infra` |
 | `timeout` | data: the tree is graded as it is (`agent_outcome = timeout`) |
 | `fail` (context overflow etc.) / normal end | data, graded normally |
 | `grade_error` (evaluate.sh / Docker / network failed) | regrade the same tree; the agent is not rerun |

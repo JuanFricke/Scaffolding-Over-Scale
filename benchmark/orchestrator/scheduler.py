@@ -33,12 +33,19 @@ def log(msg: str) -> None:
 
 
 class Pool:
-    """Provider pool: a semaphore that can be paused as a whole (e.g. after a 429)."""
+    """Provider pool: a semaphore that can be paused as a whole (e.g. after a 429).
 
-    def __init__(self, name: str, size: int):
+    Usage windows (OpenCode Go: 5 h / week / month) make 429s last for hours, so consecutive
+    rate limits double the pause up to `max_pause`, and a successful run resets it. 429s that
+    started before the current pause began are the same event and do not escalate it again."""
+
+    def __init__(self, name: str, size: int, base_pause: float = 60, max_pause: float = 1800):
         self.name, self.size = name, size
         self.sem = asyncio.Semaphore(size)
         self.resume_at = 0.0
+        self.base_pause, self.max_pause = base_pause, max_pause
+        self.strikes = 0
+        self.paused_at = 0.0
 
     async def acquire(self) -> None:
         while True:
@@ -59,6 +66,17 @@ class Pool:
         self.resume_at = max(self.resume_at, time.time() + seconds)
         log(f"pool {self.name}: paused for {seconds:.0f}s")
         _write_pool_state(self)
+
+    def rate_limited(self, run_started_at: float) -> None:
+        if run_started_at < self.paused_at:
+            return
+        self.strikes += 1
+        self.paused_at = time.time()
+        delay = min(self.base_pause * 2 ** (self.strikes - 1), self.max_pause)
+        self.pause(delay + random.uniform(0, delay * 0.2))
+
+    def succeeded(self) -> None:
+        self.strikes = 0
 
 
 def _write_pool_state(pool: Pool) -> None:
@@ -94,7 +112,9 @@ class Scheduler:
         self.sandbox_image = run.get("sandbox_image", "pf-bench-agent:tcc-baseline-v1")
         self.work_dir = (BENCH_DIR / run.get("work_dir", "work")).resolve()
         n = opts.concurrency
-        self.pools = {name: Pool(name, n or size) for name, size in mx.pools.items()}
+        self.pools = {name: Pool(name, n or size, float(run.get("rate_limit_base_s", 60)),
+                                 float(run.get("rate_limit_max_s", 1800)))
+                      for name, size in mx.pools.items()}
         slots = n or int(run.get("grade_slots", 3))
         self.grade_slots: asyncio.Queue[int] = asyncio.Queue()
         for i in range(slots):
@@ -148,7 +168,8 @@ class Scheduler:
         for r in recs:   # `retry --failed-infra` writes "requeued", which resets the budget
             if r["state"] == "requeued":
                 infra = 0
-            elif r["state"] == mf.INFRA_ERROR and r.get("stage") in ("agent", "prepare"):
+            elif (r["state"] == mf.INFRA_ERROR and r.get("stage") in ("agent", "prepare")
+                  and not r.get("rate_limited")):
                 infra += 1
         return latest, attempt, infra
 
@@ -176,12 +197,12 @@ class Scheduler:
                 continue
             res = await self.agent(cell, run_id, tree, attempt)
             if res.outcome == "infra":
-                infra_fails += 1
-                delay = self._backoff(infra_fails)
                 if res.rate_limited:
-                    self.pools[cell.model.pool].pause(delay)
-                else:
-                    await asyncio.sleep(delay)
+                    # quota, not a fault: the pool is paused (agent()), the cell waits in it and
+                    # is retried without spending one of its max_attempts
+                    continue
+                infra_fails += 1
+                await asyncio.sleep(self._backoff(infra_fails))
                 continue
             await self.grade(cell, run_id, tree, attempt)
             return
@@ -225,6 +246,7 @@ class Scheduler:
             ctx = adapters.AgentContext(cell=cell, run_id=run_id, tree=tree, prompt=prompt, run_dir=run_dir,
                                         timeout_s=self.timeout_s, sandbox=self.sandbox,
                                         sandbox_image=self.sandbox_image, pf_repo=self.opts.pf_repo)
+            started = time.time()
             try:
                 res = await adapter.run(ctx)
             except Exception as e:  # noqa: BLE001 - adapter crash = infra
@@ -236,6 +258,10 @@ class Scheduler:
         if wrong and res.outcome != "infra":
             res.outcome, res.reason = "infra", f"model mismatch: saw {wrong}"
         hits = adapters.contamination(res.tool_inputs, sandbox=self.sandbox)
+        if res.rate_limited:
+            pool.rate_limited(started)
+        elif res.outcome != "infra":
+            pool.succeeded()
         if res.outcome == "infra":
             self.man.append(cell.cell_id, mf.INFRA_ERROR, stage="agent", run_id=run_id, attempt=attempt,
                             reason=res.reason, rate_limited=res.rate_limited, agent_s=round(res.wall_s, 1))
