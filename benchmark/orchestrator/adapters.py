@@ -38,6 +38,9 @@ INFRA_PATTERNS = re.compile(
     re.I,
 )
 RATE_LIMIT_PATTERNS = re.compile(r"\b429\b|rate.?limit|too many requests|quota|usage limit", re.I)
+# The model's own output broke the protocol (llama-server could not parse it as a tool call /
+# reply in the model's format; it answers HTTP 500): the model's failure, a data point, not infra.
+MODEL_OUTPUT_PATTERNS = re.compile(r"does not match the expected [\w-]+ format", re.I)
 AGENT_LIMIT_PATTERNS = re.compile(
     r"context.{0,20}(length|window|limit)|prompt is too long|maximum context|max.?turns", re.I)
 
@@ -235,6 +238,10 @@ class CLIAdapter(Adapter):
 
     @staticmethod
     def _classify_error(res: AgentResult, text: str) -> None:
+        m = MODEL_OUTPUT_PATTERNS.search(text)
+        if m:
+            res.outcome, res.reason = "fail", (res.reason or f"exit {res.exit_code}") + f" [{m.group(0)}]"
+            return
         res.rate_limited = res.rate_limited or bool(RATE_LIMIT_PATTERNS.search(text))
         if res.rate_limited or INFRA_PATTERNS.search(text):
             res.outcome = "infra"

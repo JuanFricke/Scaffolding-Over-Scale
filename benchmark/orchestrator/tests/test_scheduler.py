@@ -149,6 +149,18 @@ class SchedulerTests(unittest.TestCase):
             self.assertFalse((none_tree / p).exists(), p)
 
 
+class ClassificationTests(unittest.TestCase):
+    def test_malformed_model_output_is_a_model_failure(self):
+        res = adapters.AgentResult("ok", exit_code=1)
+        adapters.CLIAdapter._classify_error(res, '{"error":{"code":500,"message":"The model produced '
+                                                 'output that does not match the expected peg-native format"}}')
+        self.assertEqual(res.outcome, "fail")
+        self.assertFalse(res.rate_limited)
+        res = adapters.AgentResult("ok", exit_code=1)
+        adapters.CLIAdapter._classify_error(res, "HTTP 500 internal server error")
+        self.assertEqual(res.outcome, "infra")
+
+
 class ContaminationTests(unittest.TestCase):
     def test_flags_paths_outside_tree(self):
         hits = adapters.contamination([

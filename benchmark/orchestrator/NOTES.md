@@ -211,6 +211,22 @@ hits gravados (`adapters.suspected`) em `status` e `report`: a correção vale p
 gravados (o processo em andamento ainda grava com o detector antigo) e os hits continuam no
 manifesto para auditoria.
 
+## Saída malformada do modelo local = `fail` (decisão 10, 2026-10-28)
+
+O llama-server responde HTTP 500 *"The model produced output that does not match the expected
+peg-native format"* quando a saída do gpt-oss não segue o formato de tool call/resposta do
+modelo. Isso é comportamento do modelo; tratá-lo como `infra` (refazer até 3×) só deixaria
+virar dado as tentativas em que ele acertou o formato, enviesando o gpt-oss para cima. Decisão
+do Juan: `fail` do agente (dado válido; a árvore é avaliada como ficou). `MODEL_OUTPUT_PATTERNS`
+é checado antes dos padrões de infra.
+
+Antes da correção, 2 tentativas da rodada completa 1 tinham virado `infra_error`
+(`llama-gpt-oss-20b__T01-discord-ops-alert__none__r3__a1`, `...T04b-tenant-onboarding__none__r3__a1`).
+O processo foi parado (SIGTERM + `docker kill` dos agentes em curso; essas células recomeçam
+como nova tentativa) e as duas a1 receberam um registro `agent_done` com `agent_outcome=fail`,
+métricas da sessão salva e o campo `reclassified` explicando o motivo; a retomada avaliou essas
+árvores, e as a2 já preparadas ficaram órfãs no `work/`.
+
 ## Estado em 2026-10-28 (fim da sessão)
 
 **Pronto e validado**
