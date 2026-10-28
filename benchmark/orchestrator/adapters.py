@@ -158,6 +158,12 @@ class CLIAdapter(Adapter):
     def agent_argv(self, ctx: AgentContext) -> list[str]:
         raise NotImplementedError
 
+    def extra_mounts(self, home: Path) -> list[str]:
+        return []
+
+    def host_prepare(self, home: Path) -> None:
+        """Sandbox-less run: last touches to the per-run home."""
+
     def agent_env(self) -> dict[str, str]:
         return {}
 
@@ -179,6 +185,7 @@ class CLIAdapter(Adapter):
                 env.update({"HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
                             "XDG_DATA_HOME": str(home / ".local/share"),
                             "XDG_STATE_HOME": str(home / ".local/state")})
+                self.host_prepare(home)
                 cmd = ["bash", "-c", "\n".join([*pre, 'exec "$@"']), "agent", *argv]
                 kill = None
             out_path, err_path = ctx.run_dir / "agent.stdout.log", ctx.run_dir / "agent.stderr.log"
@@ -240,6 +247,7 @@ class CLIAdapter(Adapter):
             "-v", f"{ctx.tree}:{WORKSPACE}",
             "-v", f"{home}:/home/agent",
             "-v", f"{self.host_binary()}:/usr/local/bin/{self.binary}:ro",
+            *self.extra_mounts(home),
         ]
         envs = []
         for k, v in self.agent_env().items():
@@ -325,17 +333,43 @@ class ClaudeCodeAdapter(CLIAdapter):
     runner = "claude-code"
     binary = "claude"
 
+    MARKETPLACE = "claude-plugins-official"
+    PLUGINS = ["php-lsp"]   # what harness/v1/.claude/settings.json enables at `full`
+
+    def marketplace_dir(self) -> Path:
+        return Path.home() / ".claude" / "plugins" / "marketplaces" / self.MARKETPLACE
+
     def setup_home(self, home: Path) -> list[str]:
+        (home / ".claude" / "plugins").mkdir(parents=True)
         # Prefer a long-lived token (`claude setup-token`) or an API key from the environment;
         # fall back to a copy of the CLI login.
-        if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY"):
-            return []
-        src = Path.home() / ".claude" / ".credentials.json"
-        if not src.exists():
-            raise RuntimeError("no Claude credentials: set CLAUDE_CODE_OAUTH_TOKEN or log in with `claude`")
-        (home / ".claude").mkdir()
-        shutil.copy2(src, home / ".claude" / ".credentials.json")
-        return []
+        if not (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")):
+            src = Path.home() / ".claude" / ".credentials.json"
+            if not src.exists():
+                raise RuntimeError("no Claude credentials: set CLAUDE_CODE_OAUTH_TOKEN or log in with `claude`")
+            shutil.copy2(src, home / ".claude" / ".credentials.json")
+        if not self.marketplace_dir().is_dir():
+            raise RuntimeError(f"marketplace {self.MARKETPLACE} missing on the host; run `claude plugin "
+                               f"marketplace add anthropics/{self.MARKETPLACE}` once")
+        # The plugins the `full` harness enables are installed at every level, so the environment is
+        # identical across levels; they only load where the tree's .claude/settings.json enables them
+        # (--setting-sources project ignores the user settings `plugin install` writes, removed anyway).
+        self._home = home
+        return [f"claude plugin install {p}@{self.MARKETPLACE} >/dev/null 2>&1 || echo 'plugin {p} not installed' >&2"
+                for p in self.PLUGINS] + ['rm -f "$HOME/.claude/settings.json"']
+
+    def write_marketplaces(self, home: Path, location: str) -> None:
+        (home / ".claude" / "plugins" / "known_marketplaces.json").write_text(json.dumps({
+            self.MARKETPLACE: {"source": {"source": "github", "repo": f"anthropics/{self.MARKETPLACE}"},
+                               "installLocation": location, "lastUpdated": "2026-10-28T00:00:00.000Z"}}))
+
+    def extra_mounts(self, home: Path) -> list[str]:
+        target = f"/home/agent/.claude/plugins/marketplaces/{self.MARKETPLACE}"
+        self.write_marketplaces(home, target)
+        return ["-v", f"{self.marketplace_dir()}:{target}:ro"]
+
+    def host_prepare(self, home: Path) -> None:
+        self.write_marketplaces(home, str(self.marketplace_dir()))
 
     def agent_env(self) -> dict[str, str]:
         env = {"DISABLE_AUTOUPDATER": "1", "DISABLE_TELEMETRY": "1"}
@@ -359,6 +393,12 @@ class ClaudeCodeAdapter(CLIAdapter):
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if ev.get("type") == "system" and ev.get("subtype") == "init":
+                # record what the harness actually switched on (plugins / LSP at `full`)
+                res.metrics["plugins"] = sorted(p.get("name") for p in ev.get("plugins") or []
+                                                if p.get("path") != "builtin")
+                res.metrics["lsp_tool"] = "LSP" in (ev.get("tools") or [])
+                res.metrics["init_model"] = ev.get("model")
             if ev.get("type") == "assistant":
                 msg = ev.get("message") or {}
                 if msg.get("model"):

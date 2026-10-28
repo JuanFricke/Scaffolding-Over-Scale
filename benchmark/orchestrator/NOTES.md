@@ -121,3 +121,41 @@ procurando `PegaFilaWeb`, `benchmark/tasks`, `benchmark/runs`, `.meta`, `..`.
    ele). `trains_on_data` fica no `matrix.toml` como informação, e o Muse é
    liberado sem `--allow-training-models`. A checagem de "modelo usado == modelo
    pedido" continua, mas por **validade** do dado, não por privacidade.
+
+## Achados durante a implementação
+
+- **Bug em `evaluate.sh` (corrigido):** `count_in` roda sob `set -euo pipefail`; quando o
+  resumo do Pest não tinha "N failed" (tudo verde) ou "N passed" (tudo vermelho), o `grep`
+  sem match abortava o script sem mensagem, antes de gravar a linha. Isso acontecia em
+  **todo** run do oráculo e do agente nulo. Patch: `|| true` na função.
+- **Linha de base da suíte completa:** em todas as tarefas testadas, `PfControllerTest`
+  falha 2 testes porque `.github/` é `export-ignore` e não vai para a árvore. Logo
+  `regressions` tem piso 2 (não é culpa do agente). Para a análise, usar
+  `regressions - regressions(null)` por tarefa, ou olhar só `tests_hidden`.
+  Quando nada passa, `tests_hidden.passed` vem `null` (não 0); o CSV mantém como está.
+- **Claude Code no nível `full`:** `.claude/settings.json` habilita
+  `php-lsp@claude-plugins-official`, mas o plugin só carrega se estiver instalado no HOME.
+  O adaptador registra o marketplace (montado só-leitura do host) e instala o plugin no
+  HOME de **todo** run (ambiente idêntico entre níveis); só carrega onde a árvore o
+  habilita, porque `--setting-sources project` ignora as configurações de usuário.
+  Verificado: `full` → ferramenta `LSP` presente; árvore sem settings → ausente. As
+  métricas gravam `plugins` e `lsp_tool` por run.
+- **OpenCode no nível `full`:** `opencode.json` pede `intelephense` (instalado no sandbox,
+  1.18.5) e `laravel-lsp` (**não existe** no sandbox nem no host; o harness original usa
+  um wrapper + `.phar` local). Esse LSP falha silenciosamente nos runs do OpenCode.
+  O `small_model` (Muse) não aparece no export da sessão, então não dá para verificar
+  pelo log; ver decisão 6.
+- **Credenciais do OpenCode:** não ficam em arquivo no host (`auth list` mostra "stored");
+  o adaptador usa `opencode auth export` → arquivo no HOME temporário do run →
+  `auth import` dentro do sandbox → arquivo apagado. O HOME temporário fica em `/tmp`,
+  nunca no repositório, e é removido ao fim do run.
+- **Métricas do OpenCode:** o stream `--format json` pode terminar antes do último
+  `step_finish`; os totais vêm de `opencode session export <id>` (tokens, custo, modelo de
+  cada mensagem do assistente), salvo em `runs/<run_id>/agent.session.json`.
+- O orquestrador remove variáveis `CLAUDE_CODE_*` do ambiente do runner (se ele for
+  disparado de dentro de uma sessão do Claude Code, o filho herdaria a sessão).
+
+## Dúvidas abertas
+
+- `laravel-lsp` no sandbox: instalar o wrapper do harness original (qual versão do `.phar`?)
+  ou registrar a ausência como limitação do nível `full` no OpenCode?
