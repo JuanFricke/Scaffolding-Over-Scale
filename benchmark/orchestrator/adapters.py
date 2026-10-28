@@ -272,7 +272,7 @@ class OpenCodeAdapter(CLIAdapter):
         f = home / "auth.json"
         f.write_bytes(creds.stdout)
         f.chmod(0o600)
-        return ['opencode auth import "$HOME/auth.json" >/dev/null', 'rm -f "$HOME/auth.json"']
+        return ['opencode auth import --standalone "$HOME/auth.json" >/dev/null', 'rm -f "$HOME/auth.json"']
 
     def agent_argv(self, ctx: AgentContext) -> list[str]:
         return ["opencode", "run", "--standalone", "--auto", "--format", "json",
@@ -299,7 +299,7 @@ class OpenCodeAdapter(CLIAdapter):
         # Totals come from the session export (the event stream can end before the last step_finish).
         env = {**os.environ, "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
                "XDG_DATA_HOME": str(home / ".local/share"), "XDG_STATE_HOME": str(home / ".local/state")}
-        exp = subprocess.run([str(self.host_binary()), "session", "export", session_id],
+        exp = subprocess.run([str(self.host_binary()), "session", "export", "--standalone", session_id],
                              capture_output=True, text=True, env=env, timeout=120)
         if exp.returncode != 0:
             res.reason = res.reason or f"session export failed: {exp.stderr[:300]}"
@@ -444,13 +444,33 @@ def make(runner: str) -> Adapter:
 
 # --- contamination detector --------------------------------------------------------------
 
+# Only where a tool *goes* is checked, never what it writes: file contents legitimately mention the
+# project name (README, docs), which would flag every run.
+LOCATION_KEYS = {"command", "path", "filePath", "file_path", "notebook_path", "pattern", "url", "cwd",
+                 "workdir", "directory", "include", "glob"}
+
+
+def _locations(tool_input: str) -> list[str]:
+    try:
+        data = json.loads(tool_input)
+    except json.JSONDecodeError:
+        return [tool_input]
+    if not isinstance(data, dict):
+        return [tool_input]
+    out = []
+    for k, v in data.items():
+        if k in LOCATION_KEYS and isinstance(v, str):
+            out.append(v.split("<<", 1)[0] if k == "command" else v)   # drop heredoc bodies
+    return out
+
+
 def contamination(tool_inputs: list[str], extra: list[str] | None = None) -> list[str]:
     """Tool-call inputs that reach outside the tree (subject repo, benchmark files, host home)."""
-    pats = [r"PegaFilaWeb(?!\.git)", r"Scaffolding-Over-Scale", r"benchmark/(tasks|runs|work)",
+    pats = [r"(^|[/\s\"'])\.\./+PegaFilaWeb|/PegaFilaWeb(\b|/)(?!\.git)", r"Scaffolding-Over-Scale", r"benchmark/(tasks|runs|work)",
             r"\.prompt\.md", r"__(none|agents|skills|full)__", r"\.\./\.\.", r"(^|[\s\"'=])/home/(?!agent)",
             r"(^|[\s\"'=])~/", r"\$HOME(?!/\.)", *(extra or [])]
     rx = re.compile("|".join(f"(?:{p})" for p in pats))
-    return [t[:300] for t in tool_inputs if rx.search(t)]
+    return [t[:300] for t in tool_inputs if any(rx.search(loc) for loc in _locations(t))]
 
 
 # --- helpers ----------------------------------------------------------------------------

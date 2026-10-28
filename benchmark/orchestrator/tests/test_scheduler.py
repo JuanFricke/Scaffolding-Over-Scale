@@ -127,8 +127,11 @@ class ContaminationTests(unittest.TestCase):
             '{"filePath": "/workspace/app/Models/Ticket.php"}',
             '{"command": "./bin/pf shell php artisan test"}',
             '{"command": "git remote -v  # github.com/PegaFila/PegaFilaWeb.git"}',
+            '{"filePath": "/workspace/docs/x.md", "newString": "Domain document for **PegaFilaWeb**"}',
+            '{"command": "cat > docs/a.md <<EOF\\nsee ../../PegaFilaWeb\\nEOF"}',
+            '{"command": "grep -r foo ../PegaFilaWeb/app"}',
         ])
-        self.assertEqual(len(hits), 2)
+        self.assertEqual(len(hits), 3)
 
 
 if __name__ == "__main__":
