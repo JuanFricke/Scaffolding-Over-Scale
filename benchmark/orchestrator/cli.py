@@ -114,7 +114,7 @@ def cmd_status(args, mx):
             groups[key(c)].append(latest.get(c.cell_id, {}))
         for g, recs in sorted(groups.items()):
             done = [r for r in recs if r.get("state") == mf.DONE]
-            clean = [r for r in done if not r.get("contamination_suspected")]
+            clean = [r for r in done if not adapters.suspected(r)]
             passed = sum(1 for r in clean if r.get("hidden_ok"))
             fi = sum(1 for r in recs if r.get("state") == mf.FAILED_INFRA)
             rate = f"{passed}/{len(clean)} pass" if clean else "-"

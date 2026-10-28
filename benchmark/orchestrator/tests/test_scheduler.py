@@ -168,6 +168,13 @@ class ContaminationTests(unittest.TestCase):
         self.assertEqual(adapters.contamination(cmd, sandbox="docker"), [])
         self.assertEqual(len(adapters.contamination(cmd, sandbox="none")), 1)
 
+    def test_parent_dirs_inside_sandbox_are_not_contamination(self):
+        cmd = ['{"command": "cd vendor/livewire/livewire; grep -rn x ../../laravel/framework/src"}']
+        self.assertEqual(adapters.contamination(cmd, sandbox="docker"), [])
+        self.assertEqual(len(adapters.contamination(cmd, sandbox="none")), 1)
+        rec = {"sandbox": "docker", "contamination_hits": cmd, "contamination_suspected": True}
+        self.assertFalse(adapters.suspected(rec))
+
 
 if __name__ == "__main__":
     unittest.main()

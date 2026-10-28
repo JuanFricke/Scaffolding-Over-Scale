@@ -514,12 +514,19 @@ def _locations(tool_input: str) -> list[str]:
 def contamination(tool_inputs: list[str], extra: list[str] | None = None, sandbox: str = "none") -> list[str]:
     """Tool-call inputs that reach outside the tree (subject repo, benchmark files, host home).
 
-    In the Docker sandbox `~` / `$HOME` is the run's own throwaway home, so only host paths count."""
+    In the Docker sandbox `~` / `$HOME` is the run's own throwaway home and nothing of the host sits
+    above /workspace, so only host paths count there (`../..` is routine inside vendor/)."""
     pats = [r"(^|[/\s\"'])\.\./+PegaFilaWeb|/PegaFilaWeb(\b|/)(?!\.git)", r"Scaffolding-Over-Scale", r"benchmark/(tasks|runs|work)",
-            r"\.prompt\.md", r"__(none|agents|skills|full)__", r"\.\./\.\.", r"(^|[\s\"'=])/home/(?!agent)",
-            *([] if sandbox == "docker" else [r"(^|[\s\"'=])~/", r"\$HOME(?!/\.)"]), *(extra or [])]
+            r"\.prompt\.md", r"__(none|agents|skills|full)__", r"(^|[\s\"'=])/home/(?!agent)",
+            *([] if sandbox == "docker" else [r"\.\./\.\.", r"(^|[\s\"'=])~/", r"\$HOME(?!/\.)"]), *(extra or [])]
     rx = re.compile("|".join(f"(?:{p})" for p in pats))
     return [t[:300] for t in tool_inputs if any(rx.search(loc) for loc in _locations(t))]
+
+
+def suspected(rec: dict) -> bool:
+    """Verdict for a manifest record, re-derived from its stored hits with the current detector
+    (a detector fix then applies to runs already recorded; the hits themselves are kept)."""
+    return bool(contamination(rec.get("contamination_hits") or [], sandbox=rec.get("sandbox") or "none"))
 
 
 # --- helpers ----------------------------------------------------------------------------

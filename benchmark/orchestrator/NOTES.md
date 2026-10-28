@@ -201,6 +201,16 @@ contra um `llama-server` (llama.cpp, Vulkan, RX 9070 16 GB) em modo router
 - Smoke (tag, fora dos dados), T02 `full` no sandbox: gpt-oss 73 s / 20 turnos, Qwen 194 s /
   21 turnos; ambos `hidden_ok`, modelo correto, sem contaminação.
 
+## Detector de contaminação: falso positivo com `../..` (2026-10-28, rodada completa 1)
+
+No 1º run da rodada (`claude-sonnet-5-5__T03a-auth-core__full__r3`) o agente rodou
+`cd vendor/livewire/livewire; grep ... ../../laravel/framework/src`: dentro da árvore, mas o
+padrão `../..` marcava qualquer subida de dois níveis. No sandbox Docker nada do host fica acima
+de `/workspace`, então `../..` só conta sem sandbox. O veredito agora é recalculado a partir dos
+hits gravados (`adapters.suspected`) em `status` e `report`: a correção vale para os runs já
+gravados (o processo em andamento ainda grava com o detector antigo) e os hits continuam no
+manifesto para auditoria.
+
 ## Estado em 2026-10-28 (fim da sessão)
 
 **Pronto e validado**
