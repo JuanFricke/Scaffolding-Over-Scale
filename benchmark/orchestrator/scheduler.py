@@ -235,7 +235,7 @@ class Scheduler:
         wrong = [m for m in res.models_seen if not _same_model(m, cell.model.id)]
         if wrong and res.outcome != "infra":
             res.outcome, res.reason = "infra", f"model mismatch: saw {wrong}"
-        hits = adapters.contamination(res.tool_inputs)
+        hits = adapters.contamination(res.tool_inputs, sandbox=self.sandbox)
         if res.outcome == "infra":
             self.man.append(cell.cell_id, mf.INFRA_ERROR, stage="agent", run_id=run_id, attempt=attempt,
                             reason=res.reason, rate_limited=res.rate_limited, agent_s=round(res.wall_s, 1))

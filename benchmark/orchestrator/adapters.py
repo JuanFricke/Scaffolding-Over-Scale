@@ -464,11 +464,13 @@ def _locations(tool_input: str) -> list[str]:
     return out
 
 
-def contamination(tool_inputs: list[str], extra: list[str] | None = None) -> list[str]:
-    """Tool-call inputs that reach outside the tree (subject repo, benchmark files, host home)."""
+def contamination(tool_inputs: list[str], extra: list[str] | None = None, sandbox: str = "none") -> list[str]:
+    """Tool-call inputs that reach outside the tree (subject repo, benchmark files, host home).
+
+    In the Docker sandbox `~` / `$HOME` is the run's own throwaway home, so only host paths count."""
     pats = [r"(^|[/\s\"'])\.\./+PegaFilaWeb|/PegaFilaWeb(\b|/)(?!\.git)", r"Scaffolding-Over-Scale", r"benchmark/(tasks|runs|work)",
             r"\.prompt\.md", r"__(none|agents|skills|full)__", r"\.\./\.\.", r"(^|[\s\"'=])/home/(?!agent)",
-            r"(^|[\s\"'=])~/", r"\$HOME(?!/\.)", *(extra or [])]
+            *([] if sandbox == "docker" else [r"(^|[\s\"'=])~/", r"\$HOME(?!/\.)"]), *(extra or [])]
     rx = re.compile("|".join(f"(?:{p})" for p in pats))
     return [t[:300] for t in tool_inputs if any(rx.search(loc) for loc in _locations(t))]
 

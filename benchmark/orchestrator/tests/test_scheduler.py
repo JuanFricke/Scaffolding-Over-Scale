@@ -133,6 +133,11 @@ class ContaminationTests(unittest.TestCase):
         ])
         self.assertEqual(len(hits), 3)
 
+    def test_sandbox_home_is_not_contamination(self):
+        cmd = ['{"command": "ls ~/.composer; cat $HOME/.cache/x"}']
+        self.assertEqual(adapters.contamination(cmd, sandbox="docker"), [])
+        self.assertEqual(len(adapters.contamination(cmd, sandbox="none")), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
