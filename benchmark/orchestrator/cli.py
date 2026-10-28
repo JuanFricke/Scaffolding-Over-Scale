@@ -159,7 +159,7 @@ def cmd_retry(args, mx):
         man.append(c.cell_id, "requeued", reason=args.reason or "retry --failed-infra",
                    superseded_run_id=latest.get(c.cell_id, {}).get("run_id"))
     print(f"requeued {len(failed)} cells")
-    if failed and not args.dry_run:
+    if failed and not args.dry_run and not args.no_run:
         # run exactly the requeued cells, not everything pending for their models
         _guard_training(failed, args.allow_training_models)
         write_env(mx, args.tag)
@@ -267,6 +267,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--cells", help="requeue these cells whatever their state (needs --reason)")
     p.add_argument("--stale-prompt", action="store_true",
                    help="requeue done cells run with a different prompt version")
+    p.add_argument("--no-run", action="store_true",
+                   help="only requeue; a later `run` over the same selection picks the cells up")
     p.add_argument("--reason"); p.set_defaults(fn=cmd_retry)
     p = sub.add_parser("report"); p.add_argument("--include-validation", action="store_true")
     p.add_argument("--tag")

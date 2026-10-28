@@ -41,6 +41,7 @@ python -m orchestrator retry --failed-infra       # requeue infrastructure failu
 python -m orchestrator report                     # runs/report.csv + runs/report.md (pass@1 per runner)
 python -m orchestrator env                        # runs/env-<ts>.json: tool versions, image ids, SHAs, seed
 python -m orchestrator retry --stale-prompt       # rerun done cells made with another prompt version
+python -m orchestrator retry --stale-prompt --no-run   # only requeue them; the next `run` picks them up
 python -m orchestrator reparse                    # recompute Claude Code metrics from stored logs
 ```
 
