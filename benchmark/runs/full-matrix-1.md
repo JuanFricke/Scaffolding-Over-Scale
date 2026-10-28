@@ -74,9 +74,28 @@ em ordem embaralhada com seed 20261028.
   - Falhas de infraestrutura que esgotarem as tentativas: `retry --failed-infra --models $M`.
 - **Acompanhamento:** `python -m orchestrator status --models $M`.
 
+## Incidentes
+
+- **18:56, falso positivo de contaminação** (`claude-sonnet-5-5__T03a-auth-core__full__r3`): o
+  agente usou `../../laravel/framework` dentro de `vendor/`. O detector foi corrigido (`0b5a1ea`):
+  no Docker, `../..` não conta. `status` e `report` recalculam o veredito a partir dos hits
+  gravados, então o run voltou para os dados.
+- **18:53 e 18:57, saída malformada do gpt-oss** (erro 500 do llama-server, *"does not match the
+  expected peg-native format"*): decisão de tratar como `fail` do modelo (`5606783`).
+  - O processo foi parado às ~19:00. Os 7 agentes em andamento foram mortos e recomeçaram como
+    nova tentativa.
+  - As 2 tentativas afetadas (T01 e T04b, none, r3, a1) foram registradas como `fail`, com o
+    campo `reclassified`, e avaliadas: T01 passou, T04b não.
+  - Reinício às 19:01; log em `runs/_logs/full-matrix-2.log`.
+- **19:10, falha de avaliação mal classificada** (`llama-gpt-oss-20b__T03b-mail-theme__none__r3__a2`):
+  o código do agente quebrava o `artisan` no fim do `composer install`.
+  - A regra foi corrigida e a célula foi reavaliada na mesma árvore com `regrade` (`hidden_ok=False`).
+  - O processo em andamento ainda usa a regra antiga: rodar `regrade --models $M` ao final.
+
 ## Ao terminar
 
-1. `python -m orchestrator status --models $M`: nenhuma célula pendente ou `failed_infra`.
+1. `python -m orchestrator regrade --models $M` (falhas de avaliação da regra antiga), depois
+   `python -m orchestrator status --models $M`: nenhuma célula pendente ou `failed_infra`.
 2. `python -m orchestrator report`: gera `runs/report.csv` e `runs/report.md`.
 3. Commit de `runs/manifest.jsonl`, `runs/results.jsonl`, `runs/env-*.json` e do relatório
    na branch `data/full-matrix`.

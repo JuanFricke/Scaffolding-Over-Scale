@@ -99,6 +99,8 @@ class Options:
     sandbox: str | None = None
     adapter_override: dict | None = None   # runner -> Adapter instance (tests)
     tag: str | None = None                  # separate manifest + run_id suffix (validation runs)
+    cache_tag: str = ""                     # grade cache slots .cache/slot-<cache_tag><n> (a second
+                                            # process, e.g. `regrade`, must not share the run's)
 
 
 class Scheduler:
@@ -297,7 +299,7 @@ class Scheduler:
             try:
                 self.man.append(cell.cell_id, mf.GRADING, run_id=run_id, attempt=attempt, grade_try=n, slot=slot)
                 env = {**os.environ, "PF_REPO": str(self.opts.pf_repo),
-                       "BENCH_CACHE": str(BENCH_DIR / ".cache" / f"slot-{slot}")}
+                       "BENCH_CACHE": str(BENCH_DIR / ".cache" / f"slot-{self.opts.cache_tag}{slot}")}
                 argv = [str(BENCH_DIR / "bin/evaluate.sh"), str(tree), "--run-id", run_id,
                         "--agent", cell.model.runner, "--model", cell.model.id]
                 if metrics_file.exists():
@@ -372,7 +374,11 @@ def grade_problem(code: int, run_dir: Path) -> str | None:
         return f"container exit {(run_dir / 'container.exit').read_text().strip()} (docker/timeout)"
     res = json.loads((run_dir / "result.json").read_text())
     if res["composer"]["exit"] not in (0, None) and not res["composer"]["json_changed"]:
-        return "composer install failed with an untouched composer.json (network/cache)"
+        # the packages installed but the app could not boot for `artisan package:discover`
+        # (post-autoload-dump): the agent's code is broken, a valid (failing) result
+        log_ = (run_dir / "composer.log").read_text(errors="replace") if (run_dir / "composer.log").exists() else ""
+        if not re.search(r"post-autoload-dump|Script @php artisan", log_):
+            return "composer install failed with an untouched composer.json (network/cache)"
     if not res["assets"]["skipped"] and res["assets"]["exit"] != 0:
         numstat = (run_dir / "agent.numstat").read_text() if (run_dir / "agent.numstat").exists() else ""
         if not re.search(r"package(-lock)?\.json|vite\.config|resources/(js|css)/", numstat):

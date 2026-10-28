@@ -6,13 +6,14 @@ PREPARE is real (prepare-task.sh against PF_REPO), so PF_REPO must be available.
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
 from orchestrator import adapters, manifest as mf, matrix
-from orchestrator.scheduler import Options, Pool, Scheduler, check_level, load_preamble
+from orchestrator.scheduler import Options, Pool, Scheduler, check_level, grade_problem, load_preamble
 
 TASK = "T07-call-next-ticket"
 
@@ -150,6 +151,22 @@ class SchedulerTests(unittest.TestCase):
 
 
 class ClassificationTests(unittest.TestCase):
+    def _run_dir(self, composer_log: str) -> Path:
+        d = Path(tempfile.mkdtemp(prefix="orch-grade-"))
+        (d / "result.json").write_text(json.dumps({
+            "composer": {"exit": 1, "json_changed": False}, "assets": {"skipped": True, "exit": None},
+            "tests_full": {"exit": 1}}))
+        (d / "composer.log").write_text(composer_log)
+        return d
+
+    def test_broken_app_code_in_composer_is_a_result(self):
+        d = self._run_dir("Generating optimized autoload files\n> Illuminate\\Foundation\\ComposerScripts::postAutoloadDump\n"
+                          "> @php artisan package:discover --ansi\n  ParseError\n  Unmatched '}'\n"
+                          "Script @php artisan package:discover --ansi handling the post-autoload-dump event returned with error code 255")
+        self.assertIsNone(grade_problem(0, d))
+        d = self._run_dir("curl error 6 while downloading https://repo.packagist.org/p2/x.json: Could not resolve host")
+        self.assertIn("network", grade_problem(0, d))
+
     def test_malformed_model_output_is_a_model_failure(self):
         res = adapters.AgentResult("ok", exit_code=1)
         adapters.CLIAdapter._classify_error(res, '{"error":{"code":500,"message":"The model produced '

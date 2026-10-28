@@ -227,6 +227,20 @@ como nova tentativa) e as duas a1 receberam um registro `agent_done` com `agent_
 métricas da sessão salva e o campo `reclassified` explicando o motivo; a retomada avaliou essas
 árvores, e as a2 já preparadas ficaram órfãs no `work/`.
 
+## Composer que falha no `artisan` = resultado, não erro de avaliação (2026-10-28)
+
+`grade_problem` tratava qualquer falha do `composer install` com `composer.json` intocado como
+problema de rede/cache (regrade, depois `failed_infra`). Mas o install roda
+`artisan package:discover` no fim (post-autoload-dump), que sobe a aplicação: se o agente deixou
+um erro de sintaxe (caso real: gpt-oss, T03b none r3, `}` sobrando em `routes/web.php`), o
+composer falha por culpa do código do agente, os testes rodam e falham, e o resultado é válido.
+Agora só conta como erro de avaliação se a falha não vier do script `artisan`.
+
+Novo comando `regrade`: reavalia na mesma árvore as células `failed_infra` da etapa de
+avaliação (o agente não roda de novo), com cache próprio (`.cache/slot-regrade-N`), podendo
+rodar ao lado de um `run` em andamento. O processo da rodada 1 iniciado às 19:01 ainda usa a
+regra antiga: rodar `regrade --models $M` ao final dele (ou após reiniciar) recupera os casos.
+
 ## Estado em 2026-10-28 (fim da sessão)
 
 **Pronto e validado**

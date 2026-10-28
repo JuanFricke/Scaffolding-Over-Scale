@@ -171,6 +171,30 @@ def cmd_report(args, mx):
     print(out)
 
 
+def cmd_regrade(args, mx):
+    """Grade again, on the same tree, cells that ended `failed_infra` at the grading stage (e.g.
+    after a fix to what counts as a grading failure). The agent is not rerun. Safe next to a
+    running `run`: it touches only cells that process is done with, with its own grade cache."""
+    cells = _selection(args, mx)
+    man = mf.Manifest(mf.path_for(args.tag))
+    latest = man.latest()
+    todo = [c for c in cells if latest.get(c.cell_id, {}).get("state") == mf.FAILED_INFRA
+            and latest[c.cell_id].get("stage") == "grade"
+            and Path(latest[c.cell_id].get("tree", "")).is_dir()]
+    for c in todo:
+        print(f"  {'would regrade' if args.dry_run else 'regrade'} {latest[c.cell_id]['run_id']}")
+    if args.dry_run or not todo:
+        print(f"{len(todo)} cells{' (dry run)' if args.dry_run else ''}")
+        return
+    for c in todo:
+        r = latest[c.cell_id]
+        # back to a resumable grading failure: the scheduler regrades the recorded tree
+        man.append(c.cell_id, mf.GRADE_ERROR, stage="grade", run_id=r["run_id"], attempt=r["attempt"],
+                   tree=r["tree"], reason=f"regrade: {args.reason or 'grading rule changed'}")
+    sch = Scheduler(mx, Options(concurrency=args.concurrency, tag=args.tag, cache_tag="regrade-"), man)
+    print(json.dumps(asyncio.run(sch.run(todo))))
+
+
 def cmd_reparse(args, mx):
     """Recompute Claude Code metrics from the raw logs kept in runs/<run_id>/ (no rerun).
 
@@ -274,6 +298,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--tag")
     p.set_defaults(fn=cmd_report)
     p = sub.add_parser("env"); p.set_defaults(fn=cmd_env)
+    p = sub.add_parser("regrade", help="grade again cells that failed_infra at grading (same tree)")
+    selection(p)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--concurrency", type=int, default=1)
+    p.add_argument("--reason")
+    p.set_defaults(fn=cmd_regrade)
     p = sub.add_parser("reparse", help="recompute Claude Code metrics from stored logs")
     p.add_argument("--tag"); p.set_defaults(fn=cmd_reparse)
 
