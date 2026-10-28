@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 
 from orchestrator import adapters, manifest as mf, matrix
-from orchestrator.scheduler import Options, Pool, Scheduler, check_level
+from orchestrator.scheduler import Options, Pool, Scheduler, check_level, load_preamble
 
 TASK = "T07-call-next-ticket"
 
@@ -136,6 +136,14 @@ class SchedulerTests(unittest.TestCase):
         for t in trees:
             level = t.name.split("__")[2]
             self.assertEqual(check_level(t, level), [], t)
+        # every agent gets the preamble, then the untouched statement
+        preamble, version = load_preamble(mx.run)
+        for t in trees:
+            sent = (matrix.BENCH_DIR / "runs" / t.name / "prompt.sent.md").read_text()
+            self.assertTrue(sent.startswith(preamble))
+            self.assertTrue(sent.endswith(Path(f"{t}.prompt.md").read_text()))
+        done = [r for r in self.man.records() if r["state"] == mf.AGENT_DONE]
+        self.assertTrue(all(r["prompt_version"] == version for r in done))
         none_tree = next(t for t in trees if "__none__" in t.name)
         for p in ("AGENTS.md", "CLAUDE.md", "opencode.json", "ai", ".claude", ".cursor"):
             self.assertFalse((none_tree / p).exists(), p)

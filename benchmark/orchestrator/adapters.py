@@ -390,8 +390,9 @@ class ClaudeCodeAdapter(CLIAdapter):
                 "--no-session-persistence", "--dangerously-skip-permissions", ctx.prompt]
 
     def parse(self, ctx: AgentContext, res: AgentResult, home: Path, stdout: str, stderr: str) -> None:
-        final = None
+        results: list[dict] = []
         models: set[str] = set()
+        message_ids: set[str] = set()
         for line in stdout.splitlines():
             try:
                 ev = json.loads(line)
@@ -407,23 +408,31 @@ class ClaudeCodeAdapter(CLIAdapter):
                 msg = ev.get("message") or {}
                 if msg.get("model"):
                     models.add(msg["model"])
+                if msg.get("id"):
+                    message_ids.add(msg["id"])
                 for c in msg.get("content") or []:
                     if c.get("type") == "tool_use":
                         res.tool_inputs.append(json.dumps(c.get("input"), ensure_ascii=False))
             elif ev.get("type") == "result":
-                final = ev
-        if final is None:
+                results.append(ev)
+        if not results:
             return
-        usage = final.get("usage") or {}
+        # A session can emit several `result` events: when background tasks the agent started
+        # finish, Claude Code wakes up for another turn. `usage`/`num_turns` describe only that
+        # last wake-up; `modelUsage`, `total_cost_usd` and `duration_api_ms` are cumulative.
+        final = results[-1]
         model_usage = final.get("modelUsage") or {}
+        tot = lambda k: sum((u or {}).get(k) or 0 for u in model_usage.values())  # noqa: E731
         res.models_seen = sorted(set(model_usage) | models)
         res.metrics.update({
             "session_id": final.get("session_id"),
-            "turns": final.get("num_turns"),
-            "tokens_in": usage.get("input_tokens"),
-            "tokens_out": usage.get("output_tokens"),
-            "tokens_cache_read": usage.get("cache_read_input_tokens"),
-            "tokens_cache_write": usage.get("cache_creation_input_tokens"),
+            "turns": sum(r.get("num_turns") or 0 for r in results),
+            "api_messages": len(message_ids),
+            "result_events": len(results),
+            "tokens_in": tot("inputTokens"),
+            "tokens_out": tot("outputTokens"),
+            "tokens_cache_read": tot("cacheReadInputTokens"),
+            "tokens_cache_write": tot("cacheCreationInputTokens"),
             "cost_usd": final.get("total_cost_usd"),
             "duration_api_ms": final.get("duration_api_ms"),
             "outcome": final.get("subtype"),

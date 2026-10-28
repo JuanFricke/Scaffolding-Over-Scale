@@ -34,11 +34,19 @@ python -m orchestrator status                     # by state / model / level, pa
 python -m orchestrator retry --failed-infra       # requeue infrastructure failures only
 python -m orchestrator report                     # runs/report.csv + runs/report.md (pass@1 per runner)
 python -m orchestrator env                        # runs/env-<ts>.json: tool versions, image ids, SHAs, seed
+python -m orchestrator retry --stale-prompt       # rerun done cells made with another prompt version
+python -m orchestrator reparse                    # recompute Claude Code metrics from stored logs
 ```
 
 `run` writes an `env-*.json` before executing. Cells already `done` (or
 `failed_infra`) are skipped, so the same command resumes after a crash or Ctrl-C.
 Pilot cells are ordinary rep-1 cells of the matrix: they count as data.
+
+## Prompt
+
+Each agent receives `prompt-preamble.md` (work autonomously, do not ask questions)
+followed by the task statement from `tasks/<id>.yaml`, unchanged. The preamble's hash is
+recorded per run as `prompt_version`, and the exact text sent goes to `runs/<run_id>/prompt.sent.md`.
 
 ## Matrix (`matrix.toml`)
 

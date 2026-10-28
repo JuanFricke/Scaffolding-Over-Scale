@@ -22,7 +22,7 @@ COLUMNS = ["runner", "model", "level", "task", "rep", "cell_id", "run_id", "atte
            "full_failed", "regressions", "pint_ok", "diff_files", "diff_insertions", "diff_deletions",
            "tests_touched", "harness_touched", "unescaped_output_added", "composer_mode", "turns",
            "tokens_in", "tokens_out", "tokens_reasoning", "tokens_cache_read", "cost_usd", "agent_s",
-           "grade_s", "cli_version", "effort", "sandbox"]
+           "grade_s", "cli_version", "effort", "prompt_version", "sandbox"]
 
 
 def load_results() -> dict[str, dict]:
@@ -49,7 +49,9 @@ def rows(include_validation: bool = False, tag: str | None = None) -> list[dict]
         if m.get("runner") in VALIDATION_RUNNERS and not include_validation:
             continue
         r = results[m["run_id"]]
-        met = r.get("agent_metrics") or {}
+        # the manifest holds the latest metrics (`reparse` corrects them there); results.jsonl
+        # keeps the copy made at grading time
+        met = {**(r.get("agent_metrics") or {}), **(m.get("metrics") or {})}
         v = r["violations"]
         out.append({
             "runner": m.get("runner"), "model": r["model"], "level": r["level"], "task": r["task"],
@@ -66,6 +68,7 @@ def rows(include_validation: bool = False, tag: str | None = None) -> list[dict]
             **{k: met.get(k) for k in ("turns", "tokens_in", "tokens_out", "tokens_reasoning",
                                        "tokens_cache_read", "cost_usd", "cli_version", "effort", "sandbox")},
             "agent_s": m.get("agent_s"), "grade_s": m.get("grade_s"),
+            "prompt_version": m.get("prompt_version") or "v0-statement-only",
         })
     return out
 

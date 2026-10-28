@@ -7,6 +7,7 @@ to the manifest, so a killed orchestrator resumes where it stopped.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -121,6 +122,7 @@ class Scheduler:
             self.grade_slots.put_nowait(i)
         self.adapters: dict[str, adapters.Adapter] = dict(opts.adapter_override or {})
         self.sandbox_image_id = _image_id(self.sandbox_image) if self.sandbox == "docker" else None
+        self.preamble, self.prompt_version = load_preamble(run)
         self.versions: dict[str, str] = {}
 
     def adapter(self, runner: str) -> adapters.Adapter:
@@ -236,11 +238,14 @@ class Scheduler:
         adapter = self.adapter(cell.model.runner)
         run_dir = BENCH_DIR / "runs" / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        prompt = Path(f"{tree}.prompt.md").read_text()
+        # the task statement (tasks/*.yaml, untouched) behind the fixed preamble; what was sent is kept
+        prompt = self.preamble + Path(f"{tree}.prompt.md").read_text()
+        (run_dir / "prompt.sent.md").write_text(prompt)
         await pool.acquire()
         try:
             self.man.append(cell.cell_id, mf.AGENT_RUNNING, run_id=run_id, attempt=attempt,
                             pool=pool.name, sandbox=self.sandbox, sandbox_image_id=self.sandbox_image_id,
+                            prompt_version=self.prompt_version,
                             cli_version=self.versions.get(cell.model.runner))
             log(f"{run_id}: agent start ({cell.model.runner})")
             ctx = adapters.AgentContext(cell=cell, run_id=run_id, tree=tree, prompt=prompt, run_dir=run_dir,
@@ -270,10 +275,12 @@ class Scheduler:
         self.man.append(cell.cell_id, mf.AGENT_DONE, run_id=run_id, tree=str(tree), attempt=attempt,
                         agent_outcome=res.outcome, agent_reason=res.reason or None, exit_code=res.exit_code,
                         agent_s=round(res.wall_s, 1), metrics=res.metrics, models_seen=res.models_seen,
-                        contamination_suspected=bool(hits), contamination_hits=hits[:20])
+                        contamination_suspected=bool(hits), contamination_hits=hits[:20],
+                        prompt_version=self.prompt_version)
         metrics = {**res.metrics, "cell_id": cell.cell_id, "rep": cell.rep, "attempt": attempt,
                    "runner": cell.model.runner, "cli_version": self.versions.get(cell.model.runner),
                    "effort": cell.model.effort or "cli-default",
+                   "prompt_version": self.prompt_version,
                    "sandbox": self.sandbox, "sandbox_image_id": self.sandbox_image_id,
                    "agent_outcome": res.outcome,
                    "contamination_suspected": bool(hits), "matrix_sha256": self.mx.sha256, "seed": self.mx.seed}
@@ -315,6 +322,18 @@ class Scheduler:
             await asyncio.sleep(self._backoff(n))
         self.man.append(cell.cell_id, mf.FAILED_INFRA, stage="grade", run_id=run_id, attempt=attempt,
                         reason="evaluate.sh kept failing")
+
+
+PROMPT_V0 = "v0-statement-only"   # runs before the preamble existed (no prompt_version recorded)
+
+
+def load_preamble(run: dict) -> tuple[str, str]:
+    """Fixed text put before every task statement; its hash is the prompt version of each run."""
+    name = run.get("prompt_preamble", "prompt-preamble.md")
+    if not name:
+        return "", PROMPT_V0
+    text = (Path(__file__).resolve().parent / name).read_text()
+    return text, "pre-" + hashlib.sha256(text.encode()).hexdigest()[:12]
 
 
 def _image_id(image: str) -> str | None:
