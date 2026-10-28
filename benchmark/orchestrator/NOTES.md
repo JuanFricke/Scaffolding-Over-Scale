@@ -155,7 +155,11 @@ procurando `PegaFilaWeb`, `benchmark/tasks`, `benchmark/runs`, `.meta`, `..`.
 - O orquestrador remove variáveis `CLAUDE_CODE_*` do ambiente do runner (se ele for
   disparado de dentro de uma sessão do Claude Code, o filho herdaria a sessão).
 
-## Dúvidas abertas
+## laravel-lsp (decisão 7, 2026-10-28)
 
-- `laravel-lsp` no sandbox: instalar o wrapper do harness original (qual versão do `.phar`?)
-  ou registrar a ausência como limitação do nível `full` no OpenCode?
+Instalado no sandbox: `laravel/lsp` v0.0.31 (a versão do commit `c8dd1b7` do repo-sujeito),
+PHAR de `builds/laravel-lsp` com sha256 fixado, extraído e rodado com o PHP 8.4 local (o
+wrapper original usava o contêiner `php:8.4-cli`). Responde a `initialize` por stdio.
+Os runs do piloto `T02 full` e `T06 full` começaram antes do rebuild (sem laravel-lsp) e
+foram reenfileirados com `retry --cells`; o run antigo fica referenciado como
+`superseded_run_id`. Desde então cada run grava `sandbox_image_id`.

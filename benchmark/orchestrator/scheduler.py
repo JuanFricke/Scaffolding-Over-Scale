@@ -100,6 +100,7 @@ class Scheduler:
         for i in range(slots):
             self.grade_slots.put_nowait(i)
         self.adapters: dict[str, adapters.Adapter] = dict(opts.adapter_override or {})
+        self.sandbox_image_id = _image_id(self.sandbox_image) if self.sandbox == "docker" else None
         self.versions: dict[str, str] = {}
 
     def adapter(self, runner: str) -> adapters.Adapter:
@@ -218,7 +219,8 @@ class Scheduler:
         await pool.acquire()
         try:
             self.man.append(cell.cell_id, mf.AGENT_RUNNING, run_id=run_id, attempt=attempt,
-                            pool=pool.name, sandbox=self.sandbox, cli_version=self.versions.get(cell.model.runner))
+                            pool=pool.name, sandbox=self.sandbox, sandbox_image_id=self.sandbox_image_id,
+                            cli_version=self.versions.get(cell.model.runner))
             log(f"{run_id}: agent start ({cell.model.runner})")
             ctx = adapters.AgentContext(cell=cell, run_id=run_id, tree=tree, prompt=prompt, run_dir=run_dir,
                                         timeout_s=self.timeout_s, sandbox=self.sandbox,
@@ -245,7 +247,8 @@ class Scheduler:
                         contamination_suspected=bool(hits), contamination_hits=hits[:20])
         metrics = {**res.metrics, "cell_id": cell.cell_id, "rep": cell.rep, "attempt": attempt,
                    "runner": cell.model.runner, "cli_version": self.versions.get(cell.model.runner),
-                   "sandbox": self.sandbox, "agent_outcome": res.outcome,
+                   "sandbox": self.sandbox, "sandbox_image_id": self.sandbox_image_id,
+                   "agent_outcome": res.outcome,
                    "contamination_suspected": bool(hits), "matrix_sha256": self.mx.sha256, "seed": self.mx.seed}
         (run_dir / "agent-metrics.input.json").write_text(json.dumps(metrics))
         log(f"{run_id}: agent {res.outcome} in {res.wall_s:.0f}s" + (" CONTAMINATION?" if hits else ""))
@@ -285,6 +288,17 @@ class Scheduler:
             await asyncio.sleep(self._backoff(n))
         self.man.append(cell.cell_id, mf.FAILED_INFRA, stage="grade", run_id=run_id, attempt=attempt,
                         reason="evaluate.sh kept failing")
+
+
+def _image_id(image: str) -> str | None:
+    """Pinned at scheduler start: a rebuild mid-matrix shows up as a different id per run."""
+    import subprocess
+    try:
+        r = subprocess.run(["docker", "image", "inspect", "-f", "{{.Id}}", image],
+                           capture_output=True, text=True, timeout=30)
+        return r.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def _same_model(seen: str, wanted: str) -> bool:

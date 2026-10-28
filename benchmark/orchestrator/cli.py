@@ -123,18 +123,31 @@ def cmd_status(args, mx):
 
 
 def cmd_retry(args, mx):
-    if not args.failed_infra:
-        sys.exit("only --failed-infra is supported")
+    if not args.failed_infra and not args.cells:
+        sys.exit("give --failed-infra or --cells <cell_id,...> --reason <why>")
+    if args.cells and not args.reason:
+        sys.exit("--cells needs --reason (it is recorded in the manifest)")
     cells = _selection(args, mx)
     man = mf.Manifest(mf.path_for(args.tag))
     latest = man.latest()
-    failed = [c for c in cells if latest.get(c.cell_id, {}).get("state") == mf.FAILED_INFRA]
+    if args.cells:
+        wanted = set(_csv(args.cells))
+        unknown = wanted - {c.cell_id for c in cells}
+        if unknown:
+            sys.exit(f"cells not in the selection: {sorted(unknown)}")
+        failed = [c for c in cells if c.cell_id in wanted]
+    else:
+        failed = [c for c in cells if latest.get(c.cell_id, {}).get("state") == mf.FAILED_INFRA]
     for c in failed:
-        man.append(c.cell_id, "requeued", reason="retry --failed-infra")
+        # the previous run stays on disk and in results.jsonl; `superseded_run_id` points at it
+        man.append(c.cell_id, "requeued", reason=args.reason or "retry --failed-infra",
+                   superseded_run_id=latest.get(c.cell_id, {}).get("run_id"))
     print(f"requeued {len(failed)} cells")
     if failed and not args.dry_run:
-        args.models = ",".join(sorted({c.model.id for c in failed}))
-        cmd_run(args, mx)
+        # run exactly the requeued cells, not everything pending for their models
+        _guard_training(failed, args.allow_training_models)
+        write_env(mx, args.tag)
+        print(json.dumps(asyncio.run(_scheduler(args, mx).run(failed))))
 
 
 def cmd_report(args, mx):
@@ -204,7 +217,9 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("pilot"); selection(p); execution(p); p.set_defaults(fn=cmd_pilot)
     p = sub.add_parser("status"); selection(p); p.set_defaults(fn=cmd_status)
     p = sub.add_parser("retry"); selection(p); execution(p)
-    p.add_argument("--failed-infra", action="store_true"); p.set_defaults(fn=cmd_retry)
+    p.add_argument("--failed-infra", action="store_true")
+    p.add_argument("--cells", help="requeue these cells whatever their state (needs --reason)")
+    p.add_argument("--reason"); p.set_defaults(fn=cmd_retry)
     p = sub.add_parser("report"); p.add_argument("--include-validation", action="store_true")
     p.add_argument("--tag")
     p.set_defaults(fn=cmd_report)
