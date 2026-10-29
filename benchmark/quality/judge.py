@@ -197,7 +197,8 @@ class JudgeClaude(adapters.ClaudeCodeAdapter):
         return ["claude", "-p", "--model", ctx.cell.model.id, "--effort", ctx.cell.model.effort or "medium",
                 "--output-format", "stream-json", "--verbose", "--setting-sources", "project",
                 "--strict-mcp-config", "--no-session-persistence", "--dangerously-skip-permissions",
-                "--disallowedTools", "WebFetch,WebSearch,Task", ctx.prompt]
+                # `=` form: the flag is variadic and would swallow the prompt as a tool name
+                "--disallowedTools=WebFetch,WebSearch,Task", ctx.prompt]
 
 
 class JudgeOpenCode(adapters.OpenCodeAdapter):
