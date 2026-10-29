@@ -29,6 +29,7 @@ SANDBOX_DIR = Path(__file__).resolve().parent / "sandbox"
 WORKSPACE = "/workspace"
 # local models: llama-server router started by llama/serve.sh (models.ini)
 LLAMA_PRESET = Path(__file__).resolve().parent / "llama" / "models.ini"
+STALL_S = int(os.environ.get("BENCH_STALL_S", "480"))   # agent silent this long = provider hung
 AGENT_MEMORY = os.environ.get("BENCH_AGENT_MEMORY", "6g")   # per sandbox container, no swap
 LLAMA_PROVIDER = "llama"   # OpenCode provider id: model ids are "llama/<preset section>"
 
@@ -206,17 +207,29 @@ class CLIAdapter(Adapter):
                 {"argv": cmd[:-1] + ["<prompt>"] if cmd and cmd[-1] == ctx.prompt else cmd,
                  "sandbox": ctx.sandbox}, indent=2))
             t0 = time.monotonic()
-            timed_out = False
+            timed_out = stalled = False
             with out_path.open("wb") as out, err_path.open("wb") as err:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd, cwd=str(ctx.tree), env=env, stdout=out, stderr=err,
                     stdin=subprocess.DEVNULL, start_new_session=True)
                 try:
-                    code = await asyncio.wait_for(proc.wait(), ctx.timeout_s)
-                except asyncio.TimeoutError:
-                    timed_out = True
-                    await _terminate(proc, kill)
-                    code = proc.returncode
+                    while True:
+                        try:
+                            code = await asyncio.wait_for(proc.wait(), 15)
+                            break
+                        except asyncio.TimeoutError:
+                            pass
+                        now = time.monotonic()
+                        if now - t0 > ctx.timeout_s:
+                            timed_out = True
+                        elif time.time() - max(out_path.stat().st_mtime, err_path.stat().st_mtime) > STALL_S:
+                            # no event at all for STALL_S: the provider hung (2026-10-29: beam-free
+                            # stopped answering mid-run for every run at once), not the model working
+                            stalled = True
+                        if timed_out or stalled:
+                            await _terminate(proc, kill)
+                            code = proc.returncode
+                            break
                 except asyncio.CancelledError:
                     await _terminate(proc, kill)
                     raise
@@ -227,7 +240,12 @@ class CLIAdapter(Adapter):
                 self.parse(ctx, res, home, stdout, stderr)
             except Exception as e:  # noqa: BLE001 - a parse failure must not lose the run
                 res.reason = f"metrics parse error: {e}"
-            if timed_out:
+            if stalled:
+                # treated like a 429: the pool pauses and the cell is retried without spending an
+                # attempt, so a provider outage never turns into model data
+                res.outcome, res.rate_limited = "infra", True
+                res.reason = f"provider stall: no output for {STALL_S}s (after {wall:.0f}s)"
+            elif timed_out:
                 res.outcome, res.reason = "timeout", f"exceeded {ctx.timeout_s}s"
             elif res.outcome == "ok" and code != 0:
                 # stderr + error text found by parse(); never the whole stdout, which carries tool

@@ -116,6 +116,21 @@ Rodar de novo retoma de onde parou.
   - O processo foi reiniciado às 01:52 sem o Qwen e de novo às 01:53 para aplicar o limite de
     memória. Os agentes em andamento recomeçaram nas duas vezes.
   - Logs: `runs/_logs/reduced-1-20261029-015234.log` e `...-015335.log`.
+- **02:35, beam-free fora do ar** (provedor, não modelo):
+  - Os 6 timeouts do beam-free eram travamentos do endpoint.
+    - 3 runs pararam de receber eventos no mesmo minuto (01:12).
+    - 3 nunca receberam resposta (02:08).
+    - Todos ficaram 10–15 min mudos até o timeout de 30 min.
+  - **Confirmação:** às 02:35 um "pong" ao beam-free ficou 90 s sem resposta; o Muse respondeu
+    em 4 s.
+  - Contados como timeout do modelo, esses runs puxariam o beam-free para baixo: sem eles, ele
+    estava 23/23.
+  - **Correção:** watchdog de silêncio (`STALL_S` = 480 s, `BENCH_STALL_S`). Um agente sem
+    nenhum evento por 8 min é morto e tratado como 429: o pool pausa (60 s → 30 min), a célula
+    é refeita sem gastar tentativa e nunca vira dado.
+  - Os 6 timeouts foram reenfileirados com `retry --cells` e a razão gravada no manifesto.
+  - O processo foi reiniciado às 02:38 (log `...-023852.log`); os agentes em andamento recomeçaram.
+  - O timeout do deepseek no T05 none (02:26) é legítimo: o agente trabalhou até o fim.
 - **Desenho final desta rodada:** 6 modelos, 336 células.
 
 ## Ao terminar
