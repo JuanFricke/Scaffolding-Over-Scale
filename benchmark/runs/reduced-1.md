@@ -1,4 +1,4 @@
-# Rodada reduzida 1: 7 modelos × 14 tarefas × 4 níveis × 1 rep
+# Rodada reduzida 1: 6 modelos × 14 tarefas × 4 níveis × 1 rep (Qwen retirado às 01:52)
 
 Substitui a rodada completa 1 (`full-matrix-1.md`), cancelada em 2026-10-28 às 19:40 porque
 levaria ~30 h ou mais. O objetivo desta é terminar em ≤ 12 h.
@@ -97,6 +97,26 @@ Rodar de novo retoma de onde parou.
     vazar nada.
   - **Contagem à parte:** as tentativas entram como `fetch_attempts` (`adapters.fetch_attempts`)
     e aparecem no relatório final como comportamento observado.
+
+- **01:24, container morto por falta de memória** (`claude-sonnet-5-5__T08-queue-management__none__r1__a3`,
+  `exit 137`):
+  - O `systemd-oomd` do host matou o container, que tinha chegado a 23 GB de swap, com o
+    host acima de 90% de RAM e swap.
+  - O run virou `infra` e foi refeito (a5).
+  - **Correção:** limite de memória por container de agente (`--memory 6g --memory-swap 6g`,
+    `BENCH_AGENT_MEMORY`). Um processo descontrolado morre dentro do próprio sandbox, sem
+    derrubar o host nem os outros runs.
+- **01:52, Qwen fora da rodada:**
+  - Medido: ~23 min por célula. O Qwen é verboso (100–150 turnos e ~60 mil tokens de saída por
+    tarefa, contra 6–9 mil do gpt-oss) e gera a ~42 tok/s.
+  - Com a GPU rodando uma célula por vez, as 53 células restantes levariam ~20 h, contra 1,5–3 h
+    dos outros pools.
+  - Fica para uma rodada própria. As 3 células dele já feitas ficam no manifesto (T10 agents
+    ok, T03b skills timeout, T07 skills ok).
+  - O processo foi reiniciado às 01:52 sem o Qwen e de novo às 01:53 para aplicar o limite de
+    memória. Os agentes em andamento recomeçaram nas duas vezes.
+  - Logs: `runs/_logs/reduced-1-20261029-015234.log` e `...-015335.log`.
+- **Desenho final desta rodada:** 6 modelos, 336 células.
 
 ## Ao terminar
 

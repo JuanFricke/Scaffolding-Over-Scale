@@ -29,6 +29,7 @@ SANDBOX_DIR = Path(__file__).resolve().parent / "sandbox"
 WORKSPACE = "/workspace"
 # local models: llama-server router started by llama/serve.sh (models.ini)
 LLAMA_PRESET = Path(__file__).resolve().parent / "llama" / "models.ini"
+AGENT_MEMORY = os.environ.get("BENCH_AGENT_MEMORY", "6g")   # per sandbox container, no swap
 LLAMA_PROVIDER = "llama"   # OpenCode provider id: model ids are "llama/<preset section>"
 
 INFRA_PATTERNS = re.compile(
@@ -270,7 +271,10 @@ class CLIAdapter(Adapter):
             envs += ["-e", f"{k}={v}"]
         script = "\n".join([*pre, 'exec "$@"'])
         # host.docker.internal: the local llama-server (bound to the docker0 bridge, not the LAN)
+        # memory cap per agent: a runaway process (2026-10-29: 23 GB of swap) is killed inside its
+        # own sandbox instead of driving the host into OOM with ~10 runs in parallel
         return ["docker", "run", "--rm", "--name", name, "--init", "--user", f"{uid}:{gid}",
+                "--memory", AGENT_MEMORY, "--memory-swap", AGENT_MEMORY,
                 "--add-host", "host.docker.internal:host-gateway",
                 "--label", "bench.role=agent", "--label", f"bench.run_id={ctx.run_id}",
                 "-e", "HOME=/home/agent", "-e", "CI=1", *envs, *mounts, "-w", WORKSPACE,

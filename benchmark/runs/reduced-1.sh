@@ -7,7 +7,8 @@ set -euo pipefail
 BENCH="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$BENCH"
 export PF_REPO="${PF_REPO:-$HOME/Projetos/PegaFilaWeb}"
-M=claude-sonnet-5-5,claude-haiku-5-5,opencode-go/muse-spark-1.3-contributor,opencode-go/deepseek-v4.1-flash,opencode-go/beam-free,llama/gpt-oss-20b,llama/qwen3.6-35b-a3b
+# qwen3.6-35b-a3b saiu às 01:55 (~23 min/célula na GPU única; ver reduced-1.md, Incidentes)
+M=claude-sonnet-5-5,claude-haiku-5-5,opencode-go/muse-spark-1.3-contributor,opencode-go/deepseek-v4.1-flash,opencode-go/beam-free,llama/gpt-oss-20b
 
 if pgrep -f "python -m orchestrator run" >/dev/null; then
     echo "um 'orchestrator run' já está rodando; nada a fazer"; exit 1
