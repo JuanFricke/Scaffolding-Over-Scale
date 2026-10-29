@@ -149,6 +149,14 @@ Rodar de novo retoma de onde parou.
     modelo.
   - Pausas do pool: 68 s → 120 s → 261 s → 518 s.
   - Um "pong" direto ficou 60 s sem resposta.
+- **04:17, erro passageiro do provedor no Muse** (`provider.rate-limit`, "The model failed to
+  generate a response"): o pool `opencode-go` pausou 70 s e a célula foi refeita sem gastar
+  tentativa. Às 04:20, Muse e deepseek respondiam normalmente.
+- **04:35, estado dos pools:**
+  - Concluídos: Claude (Sonnet 56/56, Haiku 56/56) e gpt-oss (56/56).
+  - Faltam 21 células do Muse e do deepseek.
+  - beam-free ainda fora: segue no catálogo (`opencode models`), mas um "pong" não responde em
+    60 s; 18 travamentos detectados desde 02:38; 33 células pendentes.
 - **Desenho final desta rodada:** 6 modelos, 336 células.
 
 ## Ao terminar
