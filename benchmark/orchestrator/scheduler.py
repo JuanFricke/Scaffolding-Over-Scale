@@ -247,7 +247,7 @@ class Scheduler:
         try:
             self.man.append(cell.cell_id, mf.AGENT_RUNNING, run_id=run_id, attempt=attempt,
                             pool=pool.name, sandbox=self.sandbox, sandbox_image_id=self.sandbox_image_id,
-                            prompt_version=self.prompt_version,
+                            prompt_version=self.prompt_version, served_as=cell.model.serve_as or cell.model.id,
                             cli_version=self.versions.get(cell.model.runner))
             log(f"{run_id}: agent start ({cell.model.runner})")
             ctx = adapters.AgentContext(cell=cell, run_id=run_id, tree=tree, prompt=prompt, run_dir=run_dir,
@@ -261,7 +261,7 @@ class Scheduler:
         finally:
             pool.release()
         # validity: the run must have used exactly the model under test
-        wrong = [m for m in res.models_seen if not _same_model(m, cell.model.id)]
+        wrong = [m for m in res.models_seen if not _same_model(m, cell.model.serve_as or cell.model.id)]
         if wrong and res.outcome != "infra":
             res.outcome, res.reason = "infra", f"model mismatch: saw {wrong}"
         hits = adapters.contamination(res.tool_inputs, sandbox=self.sandbox)
@@ -282,6 +282,7 @@ class Scheduler:
         metrics = {**res.metrics, "cell_id": cell.cell_id, "rep": cell.rep, "attempt": attempt,
                    "runner": cell.model.runner, "cli_version": self.versions.get(cell.model.runner),
                    "effort": cell.model.effort or "cli-default",
+                   "served_as": cell.model.serve_as or cell.model.id,
                    "prompt_version": self.prompt_version,
                    "sandbox": self.sandbox, "sandbox_image_id": self.sandbox_image_id,
                    "agent_outcome": res.outcome,

@@ -24,6 +24,7 @@ class Model:
     training_ok: bool = False
     validation: bool = False
     effort: str | None = None      # Claude Code --effort; None = the CLI's default
+    serve_as: str | None = None    # id actually passed to the runner (another endpoint of the same model)
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,7 @@ def load(path: Path = DEFAULT_MATRIX) -> Matrix:
             training_ok=bool(m.get("training_ok", False)),
             validation=bool(m.get("validation", False)),
             effort=m.get("effort"),
+            serve_as=m.get("serve_as"),
         ))
     pools = {name: int(p.get("max_concurrency", 1)) for name, p in data.get("pool", {}).items()}
     for m in models:

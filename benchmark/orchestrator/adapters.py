@@ -341,7 +341,7 @@ class OpenCodeAdapter(CLIAdapter):
 
     def agent_argv(self, ctx: AgentContext) -> list[str]:
         return ["opencode", "run", "--standalone", "--auto", "--format", "json",
-                "-m", ctx.cell.model.id, "--title", ctx.run_id, ctx.prompt]
+                "-m", ctx.cell.model.serve_as or ctx.cell.model.id, "--title", ctx.run_id, ctx.prompt]
 
     def parse(self, ctx: AgentContext, res: AgentResult, home: Path, stdout: str, stderr: str) -> None:
         session_id = None
