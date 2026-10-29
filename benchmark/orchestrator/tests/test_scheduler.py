@@ -6,13 +6,14 @@ PREPARE is real (prepare-task.sh against PF_REPO), so PF_REPO must be available.
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
 from orchestrator import adapters, manifest as mf, matrix
-from orchestrator.scheduler import Options, Pool, Scheduler, check_level, load_preamble
+from orchestrator.scheduler import Options, Pool, Scheduler, check_level, grade_problem, load_preamble
 
 TASK = "T07-call-next-ticket"
 
@@ -149,6 +150,34 @@ class SchedulerTests(unittest.TestCase):
             self.assertFalse((none_tree / p).exists(), p)
 
 
+class ClassificationTests(unittest.TestCase):
+    def _run_dir(self, composer_log: str) -> Path:
+        d = Path(tempfile.mkdtemp(prefix="orch-grade-"))
+        (d / "result.json").write_text(json.dumps({
+            "composer": {"exit": 1, "json_changed": False}, "assets": {"skipped": True, "exit": None},
+            "tests_full": {"exit": 1}}))
+        (d / "composer.log").write_text(composer_log)
+        return d
+
+    def test_broken_app_code_in_composer_is_a_result(self):
+        d = self._run_dir("Generating optimized autoload files\n> Illuminate\\Foundation\\ComposerScripts::postAutoloadDump\n"
+                          "> @php artisan package:discover --ansi\n  ParseError\n  Unmatched '}'\n"
+                          "Script @php artisan package:discover --ansi handling the post-autoload-dump event returned with error code 255")
+        self.assertIsNone(grade_problem(0, d))
+        d = self._run_dir("curl error 6 while downloading https://repo.packagist.org/p2/x.json: Could not resolve host")
+        self.assertIn("network", grade_problem(0, d))
+
+    def test_malformed_model_output_is_a_model_failure(self):
+        res = adapters.AgentResult("ok", exit_code=1)
+        adapters.CLIAdapter._classify_error(res, '{"error":{"code":500,"message":"The model produced '
+                                                 'output that does not match the expected peg-native format"}}')
+        self.assertEqual(res.outcome, "fail")
+        self.assertFalse(res.rate_limited)
+        res = adapters.AgentResult("ok", exit_code=1)
+        adapters.CLIAdapter._classify_error(res, "HTTP 500 internal server error")
+        self.assertEqual(res.outcome, "infra")
+
+
 class ContaminationTests(unittest.TestCase):
     def test_flags_paths_outside_tree(self):
         hits = adapters.contamination([
@@ -163,10 +192,30 @@ class ContaminationTests(unittest.TestCase):
         ])
         self.assertEqual(len(hits), 3)
 
+    def test_github_link_to_subject_repo_is_not_contamination(self):
+        cmd = ['{"command": "php -r \'$s=\\"see [#25](https://github.com/PegaFila/PegaFilaWeb/pull/25)\\";\'"}']
+        self.assertEqual(adapters.contamination(cmd, sandbox="docker"), [])
+        esc = ['{"command": "php -r \'echo \\"(https:\\\\/\\\\/github.com\\\\/PegaFila\\\\/PegaFilaWeb\\\\/pull\\\\/25)\\";\'"}']
+        self.assertIn("github.com\\/PegaFila", adapters._locations(esc[0])[0].replace("/", "\\/"))
+        self.assertEqual(adapters.contamination(esc, sandbox="docker"), [])
+        url = ['{"url": "https://raw.githubusercontent.com/PegaFila/PegaFilaWeb/main/app/Livewire/Auth/Login.php"}']
+        self.assertEqual(adapters.contamination(url, sandbox="docker"), [])
+        self.assertTrue(adapters.SUBJECT_URL.search(url[0]))
+        api = ['{"command": "curl -s -I https://api.github.com/repos/PegaFila/PegaFilaWeb | head -20"}']
+        self.assertEqual(adapters.contamination(api, sandbox="docker"), [])
+        self.assertEqual(len(adapters.contamination(['{"command": "ls ../PegaFilaWeb"}'], sandbox="docker")), 1)
+
     def test_sandbox_home_is_not_contamination(self):
         cmd = ['{"command": "ls ~/.composer; cat $HOME/.cache/x"}']
         self.assertEqual(adapters.contamination(cmd, sandbox="docker"), [])
         self.assertEqual(len(adapters.contamination(cmd, sandbox="none")), 1)
+
+    def test_parent_dirs_inside_sandbox_are_not_contamination(self):
+        cmd = ['{"command": "cd vendor/livewire/livewire; grep -rn x ../../laravel/framework/src"}']
+        self.assertEqual(adapters.contamination(cmd, sandbox="docker"), [])
+        self.assertEqual(len(adapters.contamination(cmd, sandbox="none")), 1)
+        rec = {"sandbox": "docker", "contamination_hits": cmd, "contamination_suspected": True}
+        self.assertFalse(adapters.suspected(rec))
 
 
 if __name__ == "__main__":

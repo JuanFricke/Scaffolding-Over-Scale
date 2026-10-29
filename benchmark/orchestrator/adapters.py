@@ -9,6 +9,7 @@ Every adapter returns an AgentResult whose `outcome` drives the scheduler:
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import os
@@ -28,6 +29,8 @@ SANDBOX_DIR = Path(__file__).resolve().parent / "sandbox"
 WORKSPACE = "/workspace"
 # local models: llama-server router started by llama/serve.sh (models.ini)
 LLAMA_PRESET = Path(__file__).resolve().parent / "llama" / "models.ini"
+STALL_S = int(os.environ.get("BENCH_STALL_S", "480"))   # agent silent this long = provider hung
+AGENT_MEMORY = os.environ.get("BENCH_AGENT_MEMORY", "6g")   # per sandbox container, no swap
 LLAMA_PROVIDER = "llama"   # OpenCode provider id: model ids are "llama/<preset section>"
 
 INFRA_PATTERNS = re.compile(
@@ -38,6 +41,9 @@ INFRA_PATTERNS = re.compile(
     re.I,
 )
 RATE_LIMIT_PATTERNS = re.compile(r"\b429\b|rate.?limit|too many requests|quota|usage limit", re.I)
+# The model's own output broke the protocol (llama-server could not parse it as a tool call /
+# reply in the model's format; it answers HTTP 500): the model's failure, a data point, not infra.
+MODEL_OUTPUT_PATTERNS = re.compile(r"does not match the expected [\w-]+ format", re.I)
 AGENT_LIMIT_PATTERNS = re.compile(
     r"context.{0,20}(length|window|limit)|prompt is too long|maximum context|max.?turns", re.I)
 
@@ -201,17 +207,29 @@ class CLIAdapter(Adapter):
                 {"argv": cmd[:-1] + ["<prompt>"] if cmd and cmd[-1] == ctx.prompt else cmd,
                  "sandbox": ctx.sandbox}, indent=2))
             t0 = time.monotonic()
-            timed_out = False
+            timed_out = stalled = False
             with out_path.open("wb") as out, err_path.open("wb") as err:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd, cwd=str(ctx.tree), env=env, stdout=out, stderr=err,
                     stdin=subprocess.DEVNULL, start_new_session=True)
                 try:
-                    code = await asyncio.wait_for(proc.wait(), ctx.timeout_s)
-                except asyncio.TimeoutError:
-                    timed_out = True
-                    await _terminate(proc, kill)
-                    code = proc.returncode
+                    while True:
+                        try:
+                            code = await asyncio.wait_for(proc.wait(), 15)
+                            break
+                        except asyncio.TimeoutError:
+                            pass
+                        now = time.monotonic()
+                        if now - t0 > ctx.timeout_s:
+                            timed_out = True
+                        elif time.time() - max(out_path.stat().st_mtime, err_path.stat().st_mtime) > STALL_S:
+                            # no event at all for STALL_S: the provider hung (2026-10-29: beam-free
+                            # stopped answering mid-run for every run at once), not the model working
+                            stalled = True
+                        if timed_out or stalled:
+                            await _terminate(proc, kill)
+                            code = proc.returncode
+                            break
                 except asyncio.CancelledError:
                     await _terminate(proc, kill)
                     raise
@@ -222,7 +240,12 @@ class CLIAdapter(Adapter):
                 self.parse(ctx, res, home, stdout, stderr)
             except Exception as e:  # noqa: BLE001 - a parse failure must not lose the run
                 res.reason = f"metrics parse error: {e}"
-            if timed_out:
+            if stalled:
+                # treated like a 429: the pool pauses and the cell is retried without spending an
+                # attempt, so a provider outage never turns into model data
+                res.outcome, res.rate_limited = "infra", True
+                res.reason = f"provider stall: no output for {STALL_S}s (after {wall:.0f}s)"
+            elif timed_out:
                 res.outcome, res.reason = "timeout", f"exceeded {ctx.timeout_s}s"
             elif res.outcome == "ok" and code != 0:
                 # stderr + error text found by parse(); never the whole stdout, which carries tool
@@ -235,6 +258,10 @@ class CLIAdapter(Adapter):
 
     @staticmethod
     def _classify_error(res: AgentResult, text: str) -> None:
+        m = MODEL_OUTPUT_PATTERNS.search(text)
+        if m:
+            res.outcome, res.reason = "fail", (res.reason or f"exit {res.exit_code}") + f" [{m.group(0)}]"
+            return
         res.rate_limited = res.rate_limited or bool(RATE_LIMIT_PATTERNS.search(text))
         if res.rate_limited or INFRA_PATTERNS.search(text):
             res.outcome = "infra"
@@ -262,7 +289,10 @@ class CLIAdapter(Adapter):
             envs += ["-e", f"{k}={v}"]
         script = "\n".join([*pre, 'exec "$@"'])
         # host.docker.internal: the local llama-server (bound to the docker0 bridge, not the LAN)
+        # memory cap per agent: a runaway process (2026-10-29: 23 GB of swap) is killed inside its
+        # own sandbox instead of driving the host into OOM with ~10 runs in parallel
         return ["docker", "run", "--rm", "--name", name, "--init", "--user", f"{uid}:{gid}",
+                "--memory", AGENT_MEMORY, "--memory-swap", AGENT_MEMORY,
                 "--add-host", "host.docker.internal:host-gateway",
                 "--label", "bench.role=agent", "--label", f"bench.run_id={ctx.run_id}",
                 "-e", "HOME=/home/agent", "-e", "CI=1", *envs, *mounts, "-w", WORKSPACE,
@@ -311,7 +341,7 @@ class OpenCodeAdapter(CLIAdapter):
 
     def agent_argv(self, ctx: AgentContext) -> list[str]:
         return ["opencode", "run", "--standalone", "--auto", "--format", "json",
-                "-m", ctx.cell.model.id, "--title", ctx.run_id, ctx.prompt]
+                "-m", ctx.cell.model.serve_as or ctx.cell.model.id, "--title", ctx.run_id, ctx.prompt]
 
     def parse(self, ctx: AgentContext, res: AgentResult, home: Path, stdout: str, stderr: str) -> None:
         session_id = None
@@ -507,6 +537,7 @@ def _locations(tool_input: str) -> list[str]:
     out = []
     for k, v in data.items():
         if k in LOCATION_KEYS and isinstance(v, str):
+            v = v.replace("\\/", "/")      # JSON/PHP-escaped slashes inside commands
             out.append(v.split("<<", 1)[0] if k == "command" else v)   # drop heredoc bodies
     return out
 
@@ -514,12 +545,71 @@ def _locations(tool_input: str) -> list[str]:
 def contamination(tool_inputs: list[str], extra: list[str] | None = None, sandbox: str = "none") -> list[str]:
     """Tool-call inputs that reach outside the tree (subject repo, benchmark files, host home).
 
-    In the Docker sandbox `~` / `$HOME` is the run's own throwaway home, so only host paths count."""
-    pats = [r"(^|[/\s\"'])\.\./+PegaFilaWeb|/PegaFilaWeb(\b|/)(?!\.git)", r"Scaffolding-Over-Scale", r"benchmark/(tasks|runs|work)",
-            r"\.prompt\.md", r"__(none|agents|skills|full)__", r"\.\./\.\.", r"(^|[\s\"'=])/home/(?!agent)",
-            *([] if sandbox == "docker" else [r"(^|[\s\"'=])~/", r"\$HOME(?!/\.)"]), *(extra or [])]
+    In the Docker sandbox `~` / `$HOME` is the run's own throwaway home and nothing of the host sits
+    above /workspace, so only host paths count there (`../..` is routine inside vendor/)."""
+    # GitHub URLs of the subject repo (links in docs text, fetch attempts) are not paths here: the
+    # repo is private and the sandbox has no GitHub credentials, so they cannot leak anything.
+    # Attempts are counted apart (fetch_attempts) for the report.
+    pats = [r"(^|[/\s\"'])\.\./+PegaFilaWeb|(?<!github\.com/PegaFila)(?<!githubusercontent\.com/PegaFila)"
+            r"/PegaFilaWeb(\b|/)(?!\.git)", r"Scaffolding-Over-Scale", r"benchmark/(tasks|runs|work)",
+            r"\.prompt\.md", r"__(none|agents|skills|full)__", r"(^|[\s\"'=])/home/(?!agent)",
+            *([] if sandbox == "docker" else [r"\.\./\.\.", r"(^|[\s\"'=])~/", r"\$HOME(?!/\.)"]), *(extra or [])]
     rx = re.compile("|".join(f"(?:{p})" for p in pats))
-    return [t[:300] for t in tool_inputs if any(rx.search(loc) for loc in _locations(t))]
+    return [t[:300] for t in tool_inputs
+            if any(rx.search(SUBJECT_URL.sub("<subject-url>", loc)) for loc in _locations(t))]
+
+
+def tool_inputs_from_log(stdout: str) -> list[str]:
+    """Tool-call inputs from a raw agent.stdout.log (OpenCode or Claude Code event stream)."""
+    out = []
+    for line in stdout.splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") == "tool_use":                                  # OpenCode
+            inp = ((ev.get("part") or {}).get("state") or {}).get("input")
+            if inp:
+                out.append(json.dumps(inp, ensure_ascii=False))
+        elif ev.get("type") == "assistant":                               # Claude Code
+            for c in (ev.get("message") or {}).get("content") or []:
+                if isinstance(c, dict) and c.get("type") == "tool_use":
+                    out.append(json.dumps(c.get("input"), ensure_ascii=False))
+    return out
+
+
+@functools.lru_cache(maxsize=4096)
+def _suspected_run(run_id: str, sandbox: str) -> bool | None:
+    log = BENCH_DIR / "runs" / run_id / "agent.stdout.log"
+    if not log.exists():
+        return None
+    return bool(contamination(tool_inputs_from_log(log.read_text(errors="replace")), sandbox=sandbox))
+
+
+SUBJECT_URL = re.compile(r"(https?://)?[\w.]*github[\w.]*\.com/(repos/)?PegaFila/PegaFilaWeb[\w./#?=&%-]*", re.I)
+
+
+def fetch_attempts(run_id: str) -> int:
+    """Tool calls that tried to reach the subject repo over the network (none can succeed)."""
+    log = BENCH_DIR / "runs" / run_id / "agent.stdout.log"
+    if not log.exists():
+        return 0
+    return sum(1 for t in tool_inputs_from_log(log.read_text(errors="replace"))
+               for loc in _locations(t) if SUBJECT_URL.search(loc)
+               and not re.search(r"\]\(https?://github\.com/PegaFila/PegaFilaWeb/(pull|issues)/", loc))
+
+
+def suspected(rec: dict) -> bool:
+    """Verdict for a manifest record, re-derived with the current detector (a detector fix then
+    applies to runs already recorded). From the full raw log when it is on disk: the hits kept in
+    the manifest are cut at 300 characters and may no longer contain what matched."""
+    sandbox = rec.get("sandbox") or "none"
+    verdict = _suspected_run(rec["run_id"], sandbox) if rec.get("run_id") else None
+    if verdict is None:
+        verdict = bool(contamination(rec.get("contamination_hits") or [], sandbox=sandbox))
+    return verdict
 
 
 # --- helpers ----------------------------------------------------------------------------

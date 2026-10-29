@@ -9,7 +9,7 @@ import csv
 import json
 from pathlib import Path
 
-from . import manifest as mf
+from . import adapters, manifest as mf
 from .matrix import BENCH_DIR, LEVELS
 
 RESULTS = BENCH_DIR / "runs" / "results.jsonl"
@@ -57,7 +57,7 @@ def rows(include_validation: bool = False, tag: str | None = None) -> list[dict]
             "runner": m.get("runner"), "model": r["model"], "level": r["level"], "task": r["task"],
             "rep": m.get("rep"), "cell_id": cid, "run_id": m["run_id"], "attempt": m.get("attempt"),
             "agent_outcome": m.get("agent_outcome"),
-            "contamination_suspected": bool(m.get("contamination_suspected")),
+            "contamination_suspected": adapters.suspected(m),
             "hidden_ok": r["tests_hidden"]["ok"], "hidden_passed": r["tests_hidden"]["passed"],
             "hidden_failed": r["tests_hidden"]["failed"], "full_passed": r["tests_full"]["passed"],
             "full_failed": r["tests_full"]["failed"], "regressions": r["regressions"],

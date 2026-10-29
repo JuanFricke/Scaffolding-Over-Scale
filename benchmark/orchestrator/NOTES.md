@@ -201,6 +201,54 @@ contra um `llama-server` (llama.cpp, Vulkan, RX 9070 16 GB) em modo router
 - Smoke (tag, fora dos dados), T02 `full` no sandbox: gpt-oss 73 s / 20 turnos, Qwen 194 s /
   21 turnos; ambos `hidden_ok`, modelo correto, sem contaminação.
 
+## Detector de contaminação: falso positivo com `../..` (2026-10-28, rodada completa 1)
+
+No 1º run da rodada (`claude-sonnet-5-5__T03a-auth-core__full__r3`) o agente rodou
+`cd vendor/livewire/livewire; grep ... ../../laravel/framework/src`: dentro da árvore, mas o
+padrão `../..` marcava qualquer subida de dois níveis. No sandbox Docker nada do host fica acima
+de `/workspace`, então `../..` só conta sem sandbox. O veredito agora é recalculado a partir dos
+hits gravados (`adapters.suspected`) em `status` e `report`: a correção vale para os runs já
+gravados (o processo em andamento ainda grava com o detector antigo) e os hits continuam no
+manifesto para auditoria.
+
+## Saída malformada do modelo local = `fail` (decisão 10, 2026-10-28)
+
+O llama-server responde HTTP 500 *"The model produced output that does not match the expected
+peg-native format"* quando a saída do gpt-oss não segue o formato de tool call/resposta do
+modelo. Isso é comportamento do modelo; tratá-lo como `infra` (refazer até 3×) só deixaria
+virar dado as tentativas em que ele acertou o formato, enviesando o gpt-oss para cima. Decisão
+do Juan: `fail` do agente (dado válido; a árvore é avaliada como ficou). `MODEL_OUTPUT_PATTERNS`
+é checado antes dos padrões de infra.
+
+Antes da correção, 2 tentativas da rodada completa 1 tinham virado `infra_error`
+(`llama-gpt-oss-20b__T01-discord-ops-alert__none__r3__a1`, `...T04b-tenant-onboarding__none__r3__a1`).
+O processo foi parado (SIGTERM + `docker kill` dos agentes em curso; essas células recomeçam
+como nova tentativa) e as duas a1 receberam um registro `agent_done` com `agent_outcome=fail`,
+métricas da sessão salva e o campo `reclassified` explicando o motivo; a retomada avaliou essas
+árvores, e as a2 já preparadas ficaram órfãs no `work/`.
+
+## Composer que falha no `artisan` = resultado, não erro de avaliação (2026-10-28)
+
+`grade_problem` tratava qualquer falha do `composer install` com `composer.json` intocado como
+problema de rede/cache (regrade, depois `failed_infra`). Mas o install roda
+`artisan package:discover` no fim (post-autoload-dump), que sobe a aplicação: se o agente deixou
+um erro de sintaxe (caso real: gpt-oss, T03b none r3, `}` sobrando em `routes/web.php`), o
+composer falha por culpa do código do agente, os testes rodam e falham, e o resultado é válido.
+Agora só conta como erro de avaliação se a falha não vier do script `artisan`.
+
+Novo comando `regrade`: reavalia na mesma árvore as células `failed_infra` da etapa de
+avaliação (o agente não roda de novo), com cache próprio (`.cache/slot-regrade-N`), podendo
+rodar ao lado de um `run` em andamento. O processo da rodada 1 iniciado às 19:01 ainda usa a
+regra antiga: rodar `regrade --models $M` ao final dele (ou após reiniciar) recupera os casos.
+
+## Rodada reduzida (decisão 11, 2026-10-28)
+
+A rodada completa (5 modelos × 3 reps, 840 células) foi cancelada às 19:40: com tempos reais,
+a estimativa passava de 30 h. O limite agora é ≤ 12 h, então ficou 1 rep e os 4 níveis.
+O GLM e o mimo saíram (eram os mais lentos do Go: ~75 e ~45 tok/s nas sessões agentic) e
+entraram os 3 mais rápidos: Muse, beam-free e deepseek. Entraram também os dois modelos locais.
+Detalhes e medições de tok/s em `runs/reduced-1.md`; para disparar, `runs/reduced-1.sh`.
+
 ## Estado em 2026-10-28 (fim da sessão)
 
 **Pronto e validado**
