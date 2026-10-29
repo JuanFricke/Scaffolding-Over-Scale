@@ -62,6 +62,7 @@ class RuleTests(unittest.TestCase):
         self.assertFalse(rules(diff("app/Services/QueueService.php", ["<?php"]))["C6"].ok)
         self.assertFalse(rules(diff("app/Models/Q.php", ["class Q extends Model {}"]))["C8"].ok)
         self.assertTrue(rules(diff("app/Models/Q.php", ["class Q extends Model {", "protected $fillable = ['a'];", "}"]))["C8"].ok)
+        self.assertTrue(rules(diff("app/Models/Q.php", ["#[Fillable(['a'])]", "class Q extends Model {}"]))["C8"].ok)
 
     def test_c7_c9_blade(self):
         self.assertFalse(rules(diff("resources/views/a.blade.php", ["{!! $x !!}"]))["C7"].ok)
