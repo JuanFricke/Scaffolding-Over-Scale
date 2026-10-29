@@ -142,7 +142,7 @@ def check(files: list[pt.FileDiff], tree: Path | None = None) -> list[RuleResult
 
     # C8: new models
     models = [f for f in files if f.path.startswith("app/Models/") and f.status == "added" and f.is_php]
-    ev = [f.path for f in models if not re.search(r"\$(fillable|guarded)\b", "\n".join(f.added))]
+    ev = [f.path for f in models if not re.search(r"\$(fillable|guarded)\b|#\[(Fillable|Guarded|Unguarded)\b", "\n".join(f.added))]
     res.append(RuleResult("C8", bool(models), (not ev) if models else None, ev))
 
     # C9: Bulma only

@@ -276,6 +276,36 @@ Resultado do piloto (`runs/quality/report-pilot.md`):
 - **Cautelas:** n = 10 pares e ~39 comparações sem correção. O sinal de convenções é
   consistente nos três níveis.
 
+Rodada completa (`runs/quality/report-full.md`; 309 runs, 615 revisões, ~4,5 h):
+- **Execução:**
+  - o pool opencode-go passou de 3 para 6 revisões simultâneas, porque o DeepSeek leva 4–8 min
+    nos diffs grandes;
+  - 3 revisões do DeepSeek terminaram em `judge_error`, e esses runs ficam só com 1 juiz.
+- **Correções na análise:**
+  - C8 passou a reconhecer o atributo `#[Fillable]` (Laravel 13); antes dava 7/151, falso
+    positivo;
+  - a análise usa só a dupla atribuída ao conjunto analisado, porque 11 runs do piloto
+    tinham um 3º juiz da rotação gpt-oss/Beam do piloto.
+- **Concordância:** κ ponderado de 0,71 (muse × deepseek) a 0,85 (opus × muse).
+  - **Viés:** muse +0,22, opus −0,17, deepseek −0,09.
+- **Validade:**
+  - nota geral × `hidden_ok`: ρ 0,52;
+  - dimensão conventions × camada 2: ρ 0,73;
+  - nota geral × erros do Larastan: ρ −0,07, sem relação (no piloto era −0,53).
+- **Efeito do harness contra `none`** (70 pares, sem o Beam):
+  - nota geral: +0,31 a +0,34 (p ≤ 0,001);
+  - conventions: +0,44 a +0,52 (p < 0,001);
+  - tests: +0,56 a +0,82 (p < 0,001);
+  - casos de teste: +10 a +11 por run;
+  - escore da camada 2: +0,07 a +0,10;
+  - erros novos do Larastan: −0,5 a −0,6 (p 0,015–0,057);
+  - complexidade: −0,17;
+  - requisitos, segurança, escopo e distância da referência: ≈ 0.
+- **Por modelo:**
+  - quem mais ganha é o DeepSeek (nota geral 3,18 → ~4,0; testes 2,8 → ~4,5), seguido do Muse;
+  - Sonnet e Haiku ganham pouco, porque já partem de ~4;
+  - gpt-oss e Beam não ganham nada (testes ≈ 1 em todos os níveis).
+
 ## Estado em 2026-10-28 (fim da sessão)
 
 **Pronto e validado**

@@ -101,6 +101,8 @@ def kappa_quadratic(xs, ys, k: int = 5):
 def load(runs) -> dict[str, dict]:
     out = {}
     reviews_dir = judge.paths(None)["reviews"]
+    # only the pair assigned on this run set: the pilot's gpt-oss/Beam rotation differs from the full one
+    assigned = judge.assign(runs)
     for r in runs:
         d = {"run": r}
         for layer in ("conventions", "static"):
@@ -109,7 +111,8 @@ def load(runs) -> dict[str, dict]:
         d["reviews"] = {}
         for f in reviews_dir.glob(f"{r.run_id}__*.json"):
             rv = json.loads(f.read_text())
-            d["reviews"][rv["judge"]] = rv["review"]
+            if rv["judge"] in assigned[r.run_id]:
+                d["reviews"][rv["judge"]] = rv["review"]
         out[r.run_id] = d
     return out
 
