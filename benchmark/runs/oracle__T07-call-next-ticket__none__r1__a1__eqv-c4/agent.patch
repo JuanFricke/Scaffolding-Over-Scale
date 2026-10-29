@@ -1,0 +1,193 @@
+diff --git a/app/Actions/CallNextTicket.php b/app/Actions/CallNextTicket.php
+new file mode 100644
+index 0000000..fd95ff4
+--- /dev/null
++++ b/app/Actions/CallNextTicket.php
+@@ -0,0 +1,109 @@
++<?php
++
++namespace App\Actions;
++
++use App\Enums\CallMode;
++use App\Enums\TicketStatus;
++use App\Exceptions\InactiveQueueException;
++use App\Exceptions\NoWaitingTicketsException;
++use App\Models\Queue;
++use App\Models\Ticket;
++use App\Models\User;
++use Illuminate\Support\Facades\DB;
++
++class CallNextTicket
++{
++    public function __invoke(
++        Queue $queue,
++        User $calledBy,
++        CallMode $mode = CallMode::Any,
++    ): Ticket {
++        return DB::transaction(function () use ($queue, $calledBy, $mode): Ticket {
++            $lockedQueue = Queue::query()
++                ->whereKey($queue->id)
++                ->lockForUpdate()
++                ->firstOrFail();
++
++            if (! $lockedQueue->is_active) {
++                throw new InactiveQueueException('Cannot call a ticket from an inactive queue.');
++            }
++
++            $fairnessRestrictsToNormals = $mode === CallMode::Any
++                && $this->fairnessApplies($lockedQueue->id);
++
++            // Winner ids already seen as stale inside this transaction (called
++            // concurrently via Ticket::call(), which takes no queue lock).
++            $skippedIds = [];
++
++            while (true) {
++                $candidates = Ticket::query()
++                    ->where('queue_id', $lockedQueue->id)
++                    ->where('status', TicketStatus::Waiting)
++                    ->when($skippedIds !== [], fn ($query) => $query->whereNotIn('id', $skippedIds));
++
++                match ($mode) {
++                    CallMode::PriorityOnly => $candidates->where('priority', '>', 0),
++                    CallMode::NormalOnly => $candidates->where('priority', 0),
++                    CallMode::Any => $candidates->when(
++                        $fairnessRestrictsToNormals,
++                        fn ($query) => $query->where('priority', 0),
++                    ),
++                };
++
++                $candidate = $candidates
++                    ->orderByDesc('priority')
++                    ->orderBy('issued_at')
++                    ->orderBy('id')
++                    ->first();
++
++                if ($candidate === null) {
++                    throw new NoWaitingTicketsException('No waiting tickets eligible for this call mode.');
++                }
++
++                // Lock the winner row and re-check status: the candidate read
++                // above is not protected against a concurrent Ticket::call().
++                $winner = Ticket::query()
++                    ->whereKey($candidate->id)
++                    ->lockForUpdate()
++                    ->firstOrFail();
++
++                if ($winner->status !== TicketStatus::Waiting) {
++                    $skippedIds[] = $winner->id;
++
++                    continue;
++                }
++
++                $winner->status = TicketStatus::Called;
++                $winner->called_at = now();
++                $winner->called_by_user_id = $calledBy->id;
++                $winner->save();
++
++                return $winner;
++            }
++        });
++    }
++
++    private function fairnessApplies(int $queueId): bool
++    {
++        $recentPriorities = Ticket::query()
++            ->where('queue_id', $queueId)
++            ->where('status', TicketStatus::Called)
++            ->orderByDesc('called_at')
++            ->orderByDesc('id')
++            ->limit(3)
++            ->pluck('priority');
++
++        // Query-builder pluck() bypasses Eloquent casts, so the DB driver —
++        // not the 'integer' cast on Ticket — decides the scalar type. Compare
++        // type-safely so a string "0" from another driver cannot break this.
++        if ($recentPriorities->count() < 3 || $recentPriorities->contains(fn ($priority) => (int) $priority === 0)) {
++            return false;
++        }
++
++        return Ticket::query()
++            ->where('queue_id', $queueId)
++            ->where('status', TicketStatus::Waiting)
++            ->where('priority', 0)
++            ->exists();
++    }
++}
+diff --git a/app/Enums/CallMode.php b/app/Enums/CallMode.php
+new file mode 100644
+index 0000000..26e15cf
+--- /dev/null
++++ b/app/Enums/CallMode.php
+@@ -0,0 +1,10 @@
++<?php
++
++namespace App\Enums;
++
++enum CallMode: string
++{
++    case Any = 'any';
++    case PriorityOnly = 'priority_only';
++    case NormalOnly = 'normal_only';
++}
+diff --git a/app/Exceptions/NoWaitingTicketsException.php b/app/Exceptions/NoWaitingTicketsException.php
+new file mode 100644
+index 0000000..6755d5e
+--- /dev/null
++++ b/app/Exceptions/NoWaitingTicketsException.php
+@@ -0,0 +1,10 @@
++<?php
++
++namespace App\Exceptions;
++
++use RuntimeException;
++
++class NoWaitingTicketsException extends RuntimeException
++{
++    //
++}
+diff --git a/docs/architecture.md b/docs/architecture.md
+index a2550af..19717be 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -119,13 +119,13 @@ ### Call the next ticket
+ Return called ticket / display payload
+ ```
+ 
+-The implementation must prevent two concurrent attendants from successfully
+-calling the same waiting ticket. The exact locking strategy belongs to the
+-implementation and database transaction layer; the domain invariant is that a
+-ticket can be called only once.
+-
+-> TODO (follow-up from review): link the test covering the single-call
+-> invariant and concurrent-call protection once implemented.
++The implementation prevents two concurrent attendants from successfully
++calling the same waiting ticket: `App\Actions\CallNextTicket` serializes
++same-queue calls with a queue-row lock inside a transaction, then locks the
++selected ticket row and re-checks its `waiting` status before marking it
++called (re-selecting on a stale read), so the single-call invariant holds
++against both call paths. Covered by `tests/Feature/CallNextTicketTest.php`
++(deterministic selection, fairness, and the cross-path exactly-once case).
+ 
+ ## Authorization boundary
+ 
+diff --git a/docs/business-rules.md b/docs/business-rules.md
+index 6f98015..d72c8c7 100644
+--- a/docs/business-rules.md
++++ b/docs/business-rules.md
+@@ -1,6 +1,6 @@
+ # Business Rules — PegaFila
+ 
+-Domain document for **PegaFilaWeb** — repository **frontend, backend and totem API** (Laravel monolith). Derived from product requirements. Core domain issuance is implemented via `App\Actions\IssueTicket` (ticket into an active queue); HTTP, Livewire, call-next, and billing remain future work.
++Domain document for **PegaFilaWeb** — repository **frontend, backend and totem API** (Laravel monolith). Derived from product requirements. Core domain issuance is implemented via `App\Actions\IssueTicket` (ticket into an active queue) and deterministic call-next via `App\Actions\CallNextTicket` (three call modes + 3-ticket fairness); HTTP, Livewire, and billing remain future work.
+ 
+ ## MVP Scope
+ 
+@@ -98,7 +98,7 @@ ### Ticket
+ 
+ **Immutability enforcement:** the write-once rule is enforced on the `Ticket` model (`updating` hook), so it applies to Eloquent saves only — mass updates through the query builder (`Ticket::query()->update(...)`) bypass it and must not be used on issued tickets.
+ 
+-**Single-ticket call (scope note):** `Ticket::call()` marks one waiting ticket as `called` (entity-membership checked, exactly-once). This minimal domain primitive proves the mutable `status`/`called_*` fields; deterministic call-next selection (priority + age + 3-ticket fairness) and HTTP/Livewire panels remain out of scope per #14.
++**Single-ticket call (scope note):** `Ticket::call()` marks one waiting ticket as `called` (entity-membership checked, exactly-once). This minimal domain primitive proves the mutable `status`/`called_*` fields. Deterministic call-next selection (priority + age + 3-ticket fairness) is implemented by `App\Actions\CallNextTicket` with the three call-panel modes below (`any` applies fairness; `priority_only`/`normal_only` ignore it); AuthZ stays out of scope per #20 and HTTP/Livewire panels remain future work.
+ 
+ ### Priority
+ 

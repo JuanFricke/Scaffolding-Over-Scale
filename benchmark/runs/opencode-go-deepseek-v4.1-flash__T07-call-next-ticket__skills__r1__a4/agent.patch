@@ -1,0 +1,645 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9806b52..15149d6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,6 +18,7 @@ ### Added
+ - Local and VPS Docker stacks with a `bin/pf` controller (`up`, `down`, `logs`, `doctor`, `deploy`, `smoke`, `shell`) and a GitHub Actions deploy-dev workflow to the VPS ([#8](https://github.com/PegaFila/PegaFilaWeb/pull/8), [#9](https://github.com/PegaFila/PegaFilaWeb/pull/9), [#10](https://github.com/PegaFila/PegaFilaWeb/pull/10), [#11](https://github.com/PegaFila/PegaFilaWeb/pull/11), [#12](https://github.com/PegaFila/PegaFilaWeb/pull/12)).
+ - CI: Pest test gate on PRs/push via `bin/pf shell` ([#21](https://github.com/PegaFila/PegaFilaWeb/pull/21)).
+ - Editor/agent LSP support: Intelephense (general PHP) and first-party Laravel LSP (routes, views/Blade, config, Livewire) wired via `opencode.json`, shared `.claude/settings.json`, and `.vscode/` workspace settings ([#25](https://github.com/PegaFila/PegaFilaWeb/pull/25)).
++- Deterministic call-next domain action `App\Actions\CallNextTicket` with `App\Enums\CallMode` (any/priority/normal), the 3-call fairness rule, inactive-queue rejection, and exactly-once selection under queue/candidate row locks.
+ 
+ ### Changed
+ 
+diff --git a/app/Actions/CallNextTicket.php b/app/Actions/CallNextTicket.php
+new file mode 100644
+index 0000000..9b44ef8
+--- /dev/null
++++ b/app/Actions/CallNextTicket.php
+@@ -0,0 +1,127 @@
++<?php
++
++namespace App\Actions;
++
++use App\Enums\CallMode;
++use App\Enums\TicketStatus;
++use App\Exceptions\InactiveQueueException;
++use App\Exceptions\NoWaitingTicketsException;
++use App\Models\Queue;
++use App\Models\Ticket;
++use App\Models\User;
++use Illuminate\Database\Eloquent\Builder;
++use Illuminate\Support\Collection;
++use Illuminate\Support\Facades\DB;
++
++class CallNextTicket
++{
++    /**
++     * Call the next waiting ticket of a queue according to its call mode.
++     *
++     * Ordering is deterministic: higher priority first, then the oldest
++     * issued ticket, then the lowest id. In "any" mode the three-call
++     * fairness rule may restrict the choice to normal tickets.
++     *
++     * @throws InactiveQueueException When the queue is inactive in the database.
++     * @throws NoWaitingTicketsException When no ticket is eligible for the mode.
++     */
++    public function __invoke(
++        Queue $queue,
++        User $calledBy,
++        CallMode $mode = CallMode::Any,
++    ): Ticket {
++        return DB::transaction(function () use ($queue, $calledBy, $mode): Ticket {
++            // Read the queue state under a row lock: the passed model may be stale,
++            // and the lock serializes calls with issuance and deactivation.
++            $lockedQueue = Queue::query()
++                ->whereKey($queue->id)
++                ->lockForUpdate()
++                ->firstOrFail();
++
++            if (! $lockedQueue->is_active) {
++                throw new InactiveQueueException('Cannot call a ticket from an inactive queue.');
++            }
++
++            $restrictToNormal = $mode === CallMode::Any
++                && $this->mustProtectNormalTickets($lockedQueue->id);
++
++            $candidates = $this->candidatesQuery($lockedQueue->id, $mode, $restrictToNormal)
++                ->orderByDesc('priority')
++                ->orderBy('issued_at')
++                ->orderBy('id')
++                ->get();
++
++            foreach ($candidates as $candidate) {
++                // Re-check under lock: Ticket::call() does not lock the queue, so the
++                // candidate may have been called after the initial read.
++                $ticket = Ticket::query()
++                    ->whereKey($candidate->id)
++                    ->where('status', TicketStatus::Waiting->value)
++                    ->lockForUpdate()
++                    ->first();
++
++                if ($ticket === null) {
++                    continue;
++                }
++
++                $ticket->status = TicketStatus::Called;
++                $ticket->called_at = now();
++                $ticket->called_by_user_id = $calledBy->id;
++                $ticket->save();
++
++                return $ticket;
++            }
++
++            throw new NoWaitingTicketsException('No waiting ticket is eligible for the requested call mode.');
++        });
++    }
++
++    /**
++     * Whether the last three calls of the queue were all priority calls while
++     * at least one normal ticket is still waiting.
++     */
++    private function mustProtectNormalTickets(int $queueId): bool
++    {
++        /** @var Collection<int, Ticket> $recentCalls */
++        $recentCalls = Ticket::query()
++            ->where('queue_id', $queueId)
++            ->where('status', TicketStatus::Called->value)
++            ->whereNotNull('called_at')
++            ->orderByDesc('called_at')
++            ->orderByDesc('id')
++            ->limit(3)
++            ->get(['id', 'priority', 'called_at']);
++
++        if ($recentCalls->count() < 3) {
++            return false;
++        }
++
++        if ($recentCalls->contains(fn (Ticket $ticket): bool => $ticket->priority < 1)) {
++            return false;
++        }
++
++        return Ticket::query()
++            ->where('queue_id', $queueId)
++            ->where('status', TicketStatus::Waiting->value)
++            ->where('priority', 0)
++            ->exists();
++    }
++
++    /**
++     * @return Builder<Ticket>
++     */
++    private function candidatesQuery(int $queueId, CallMode $mode, bool $restrictToNormal): Builder
++    {
++        $query = Ticket::query()
++            ->where('queue_id', $queueId)
++            ->where('status', TicketStatus::Waiting->value);
++
++        if ($restrictToNormal || $mode === CallMode::NormalOnly) {
++            $query->where('priority', 0);
++        } elseif ($mode === CallMode::PriorityOnly) {
++            $query->where('priority', '>', 0);
++        }
++
++        return $query;
++    }
++}
+diff --git a/app/Enums/CallMode.php b/app/Enums/CallMode.php
+new file mode 100644
+index 0000000..26e15cf
+--- /dev/null
++++ b/app/Enums/CallMode.php
+@@ -0,0 +1,10 @@
++<?php
++
++namespace App\Enums;
++
++enum CallMode: string
++{
++    case Any = 'any';
++    case PriorityOnly = 'priority_only';
++    case NormalOnly = 'normal_only';
++}
+diff --git a/app/Exceptions/NoWaitingTicketsException.php b/app/Exceptions/NoWaitingTicketsException.php
+new file mode 100644
+index 0000000..6755d5e
+--- /dev/null
++++ b/app/Exceptions/NoWaitingTicketsException.php
+@@ -0,0 +1,10 @@
++<?php
++
++namespace App\Exceptions;
++
++use RuntimeException;
++
++class NoWaitingTicketsException extends RuntimeException
++{
++    //
++}
+diff --git a/docs/architecture.md b/docs/architecture.md
+index a2550af..256ea35 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -107,25 +107,35 @@ ### Call the next ticket
+ Authorized call action
+    |
+    v
+-Load waiting state for the queue
++App\Actions\CallNextTicket(queue, user, CallMode)
+    |
+    v
+-Apply deterministic priority + age + fairness rules
++Transaction: lock queue row + reject inactive queue
+    |
+    v
+-Atomically mark exactly one ticket as called
++Load ordered waiting candidates (priority desc, issued_at asc, id asc)
++   |
++   v
++Apply mode filter + 3-call fairness rule (any mode only)
++   |
++   v
++Lock candidate, re-check waiting, mark exactly one ticket as called
+    |
+    v
+ Return called ticket / display payload
+ ```
+ 
+-The implementation must prevent two concurrent attendants from successfully
+-calling the same waiting ticket. The exact locking strategy belongs to the
+-implementation and database transaction layer; the domain invariant is that a
++The implementation lives in `App\Actions\CallNextTicket`, with `App\Enums\CallMode`
++for the **Next**, **Priority** and **Normal** panel actions and
++`App\Exceptions\NoWaitingTicketsException` / `App\Exceptions\InactiveQueueException`
++for business failures. It prevents two concurrent attendants from successfully
++calling the same waiting ticket by locking the queue row and re-checking each
++candidate under a row lock before marking it; the domain invariant is that a
+ ticket can be called only once.
+ 
+-> TODO (follow-up from review): link the test covering the single-call
+-> invariant and concurrent-call protection once implemented.
++> Test coverage for the single-call invariant and concurrent-call protection:
++> `tests/Feature/CallNextTicketTest.php` (including the candidate-called-before-lock
++> case) and `tests/Feature/IssueTicketTest.php` (`Ticket::call()` exactly-once).
+ 
+ ## Authorization boundary
+ 
+diff --git a/docs/business-rules.md b/docs/business-rules.md
+index 6f98015..dcda3fd 100644
+--- a/docs/business-rules.md
++++ b/docs/business-rules.md
+@@ -1,6 +1,6 @@
+ # Business Rules — PegaFila
+ 
+-Domain document for **PegaFilaWeb** — repository **frontend, backend and totem API** (Laravel monolith). Derived from product requirements. Core domain issuance is implemented via `App\Actions\IssueTicket` (ticket into an active queue); HTTP, Livewire, call-next, and billing remain future work.
++Domain document for **PegaFilaWeb** — repository **frontend, backend and totem API** (Laravel monolith). Derived from product requirements. Core domain issuance is implemented via `App\Actions\IssueTicket` (ticket into an active queue) and deterministic calling via `App\Actions\CallNextTicket`; HTTP, Livewire and billing remain future work.
+ 
+ ## MVP Scope
+ 
+@@ -98,7 +98,7 @@ ### Ticket
+ 
+ **Immutability enforcement:** the write-once rule is enforced on the `Ticket` model (`updating` hook), so it applies to Eloquent saves only — mass updates through the query builder (`Ticket::query()->update(...)`) bypass it and must not be used on issued tickets.
+ 
+-**Single-ticket call (scope note):** `Ticket::call()` marks one waiting ticket as `called` (entity-membership checked, exactly-once). This minimal domain primitive proves the mutable `status`/`called_*` fields; deterministic call-next selection (priority + age + 3-ticket fairness) and HTTP/Livewire panels remain out of scope per #14.
++**Single-ticket call (scope note):** `Ticket::call()` marks one waiting ticket as `called` (entity-membership checked, exactly-once). This minimal domain primitive proves the mutable `status`/`called_*` fields. Which ticket is called next is decided by `App\Actions\CallNextTicket` (see below); HTTP/Livewire panels remain out of scope per #14.
+ 
+ ### Priority
+ 
+@@ -130,6 +130,19 @@ ### Call Panel (attendant)
+ 
+ After each call, the ticket leaves the waiting queue and enters the session/display call history.
+ 
++### Call-next implementation
++
++`App\Actions\CallNextTicket` (invokable) picks and marks the winner for the call panel. It receives the queue, the attendant `User` and an `App\Enums\CallMode` (`any`, `priority_only`, `normal_only`; default `any`) and returns the updated `Ticket`.
++
++- Candidates are only `waiting` tickets of the requested queue; other queues and already `called` tickets are never selected.
++- Ordering is deterministic: `priority` descending, then `issued_at` ascending, then `id` ascending.
++- `any` applies the full ordering plus the 3-call fairness rule; `priority_only` only considers `priority > 0`; `normal_only` only considers `priority = 0` and calls the oldest first. Fairness is ignored outside `any`, but calls made in any mode count in its history.
++- Fairness: when the last three calls of the queue (most recent first by `called_at`, then `id` desc) are all priority and a normal ticket is waiting, the call is restricted to normal tickets. A normal call resets the streak; with no normal waiting, priority tickets keep being called.
++- An inactive queue is rejected with `App\Exceptions\InactiveQueueException`; no eligible candidate raises `App\Exceptions\NoWaitingTicketsException`.
++- The action runs in a transaction. It locks the queue row, reads the ordered candidates, then locks each candidate and re-checks it is still `waiting` before marking it, so a ticket called concurrently through `Ticket::call()` is skipped and the next candidate is attempted. The winner is updated only in `status`, `called_at` and `called_by_user_id`, and the returned model already reflects the call.
++
++Authorization, HTTP endpoints, the Livewire panel, display/TV broadcasting, recall and skip are out of scope; the caller is trusted.
++
+ ## Display and Issuance Channels
+ 
+ | Channel | Implementation | Function |
+diff --git a/tests/Feature/CallNextTicketTest.php b/tests/Feature/CallNextTicketTest.php
+new file mode 100644
+index 0000000..da1983d
+--- /dev/null
++++ b/tests/Feature/CallNextTicketTest.php
+@@ -0,0 +1,373 @@
++<?php
++
++use App\Actions\CallNextTicket;
++use App\Enums\CallMode;
++use App\Enums\TicketStatus;
++use App\Exceptions\InactiveQueueException;
++use App\Exceptions\NoWaitingTicketsException;
++use App\Models\EntityMembership;
++use App\Models\Queue;
++use App\Models\Ticket;
++use App\Models\User;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Carbon;
++
++uses(RefreshDatabase::class);
++
++function callNextTicketWaiting(Queue $queue, array $attributes = []): Ticket
++{
++    return Ticket::factory()->forQueue($queue)->create(array_merge([
++        'status' => TicketStatus::Waiting,
++    ], $attributes));
++}
++
++function callNextTicketCalled(Queue $queue, User $user, int $priority, Carbon $calledAt): Ticket
++{
++    return Ticket::factory()->forQueue($queue)->create([
++        'priority' => $priority,
++        'status' => TicketStatus::Called,
++        'called_at' => $calledAt,
++        'called_by_user_id' => $user->id,
++    ]);
++}
++
++it('calls the highest priority waiting ticket first', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinutes(10)]);
++    $priority = callNextTicketWaiting($queue, ['priority' => 10, 'issued_at' => now()->subMinute()]);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::Any);
++
++    expect($called->is($priority))->toBeTrue();
++});
++
++it('defaults to any mode', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinutes(10)]);
++    $priority = callNextTicketWaiting($queue, ['priority' => 10, 'issued_at' => now()->subMinute()]);
++
++    $called = (new CallNextTicket)($queue, $attendant);
++
++    expect($called->is($priority))->toBeTrue();
++});
++
++it('calls the oldest ticket within the same priority', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    $newer = callNextTicketWaiting($queue, ['priority' => 5, 'issued_at' => now()->subMinute()]);
++    $older = callNextTicketWaiting($queue, ['priority' => 5, 'issued_at' => now()->subMinutes(10)]);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::Any);
++
++    expect($called->is($older))->toBeTrue()
++        ->and($called->is($newer))->toBeFalse();
++});
++
++it('uses the lowest id as the final tie-break', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++    $issuedAt = now()->subMinutes(5);
++
++    $first = callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => $issuedAt]);
++    callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => $issuedAt]);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::NormalOnly);
++
++    expect($called->is($first))->toBeTrue();
++});
++
++it('never calls a ticket from another queue', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $otherQueue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketWaiting($otherQueue, ['priority' => 100, 'issued_at' => now()->subHour()]);
++    $own = callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinute()]);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::Any);
++
++    expect($called->is($own))->toBeTrue();
++});
++
++it('never calls an already called ticket', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketCalled($queue, $attendant, 100, now()->subMinutes(2));
++    $waiting = callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinute()]);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::Any);
++
++    expect($called->is($waiting))->toBeTrue();
++});
++
++it('returns and persists the ticket as called', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++    $ticket = callNextTicketWaiting($queue);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::Any);
++
++    expect($called)
++        ->status->toBe(TicketStatus::Called)
++        ->called_by_user_id->toBe($attendant->id)
++        ->called_at->not->toBeNull();
++
++    expect($called->fresh())
++        ->status->toBe(TicketStatus::Called)
++        ->called_by_user_id->toBe($attendant->id)
++        ->called_at->not->toBeNull();
++
++    expect($called->is($ticket))->toBeTrue();
++});
++
++it('only calls priority tickets in priority_only mode', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subHour()]);
++    $priority = callNextTicketWaiting($queue, ['priority' => 1, 'issued_at' => now()->subMinute()]);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::PriorityOnly);
++
++    expect($called->is($priority))->toBeTrue();
++});
++
++it('only calls normal tickets in normal_only mode by oldest first', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketWaiting($queue, ['priority' => 50, 'issued_at' => now()->subHour()]);
++    $older = callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinutes(10)]);
++    callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinute()]);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::NormalOnly);
++
++    expect($called->is($older))->toBeTrue();
++});
++
++it('restricts to normal tickets after three consecutive priority calls', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinutes(3));
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinutes(2));
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinute());
++
++    callNextTicketWaiting($queue, ['priority' => 100, 'issued_at' => now()->subHour()]);
++    $normal = callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinutes(10)]);
++    callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinutes(5)]);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::Any);
++
++    expect($called->is($normal))->toBeTrue();
++});
++
++it('does not restrict when fewer than three calls exist', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinutes(2));
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinute());
++
++    $priority = callNextTicketWaiting($queue, ['priority' => 10, 'issued_at' => now()->subHour()]);
++    callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinutes(5)]);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::Any);
++
++    expect($called->is($priority))->toBeTrue();
++});
++
++it('does not restrict when a normal call is among the last three', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinutes(3));
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinutes(2));
++    callNextTicketCalled($queue, $attendant, 0, now()->subMinute());
++
++    $priority = callNextTicketWaiting($queue, ['priority' => 10, 'issued_at' => now()->subHour()]);
++    callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinutes(5)]);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::Any);
++
++    expect($called->is($priority))->toBeTrue();
++});
++
++it('keeps calling priority tickets when no normal ticket is waiting', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinutes(3));
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinutes(2));
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinute());
++
++    $priority = callNextTicketWaiting($queue, ['priority' => 1, 'issued_at' => now()->subHour()]);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::Any);
++
++    expect($called->is($priority))->toBeTrue();
++});
++
++it('uses the id as the tie-break when calls share a called_at timestamp', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++    $calledAt = now()->subMinute();
++
++    callNextTicketCalled($queue, $attendant, 0, $calledAt);
++    callNextTicketCalled($queue, $attendant, 10, $calledAt);
++    callNextTicketCalled($queue, $attendant, 10, $calledAt);
++    callNextTicketCalled($queue, $attendant, 10, $calledAt);
++
++    callNextTicketWaiting($queue, ['priority' => 100, 'issued_at' => now()->subHour()]);
++    $normal = callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinutes(5)]);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::Any);
++
++    expect($called->is($normal))->toBeTrue();
++});
++
++it('only counts calls made in the same queue for fairness', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $otherQueue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketCalled($otherQueue, $attendant, 10, now()->subMinutes(3));
++    callNextTicketCalled($otherQueue, $attendant, 10, now()->subMinutes(2));
++    callNextTicketCalled($otherQueue, $attendant, 10, now()->subMinute());
++
++    $priority = callNextTicketWaiting($queue, ['priority' => 10, 'issued_at' => now()->subHour()]);
++    callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinutes(5)]);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::Any);
++
++    expect($called->is($priority))->toBeTrue();
++});
++
++it('ignores fairness in priority_only mode', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinutes(3));
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinutes(2));
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinute());
++
++    $priority = callNextTicketWaiting($queue, ['priority' => 10, 'issued_at' => now()->subHour()]);
++    callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinutes(5)]);
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::PriorityOnly);
++
++    expect($called->is($priority))->toBeTrue();
++});
++
++it('counts priority_only calls in the fairness history', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinutes(2));
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinute());
++
++    $firstPriority = callNextTicketWaiting($queue, ['priority' => 20, 'issued_at' => now()->subHour()]);
++    callNextTicketWaiting($queue, ['priority' => 10, 'issued_at' => now()->subMinutes(30)]);
++    $normal = callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinutes(5)]);
++
++    $priorityCall = (new CallNextTicket)($queue, $attendant, CallMode::PriorityOnly);
++    $next = (new CallNextTicket)($queue, $attendant, CallMode::Any);
++
++    expect($priorityCall->is($firstPriority))->toBeTrue()
++        ->and($next->is($normal))->toBeTrue();
++});
++
++it('counts normal_only calls in the fairness history so a normal call resets the streak', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinutes(2));
++    callNextTicketCalled($queue, $attendant, 10, now()->subMinute());
++
++    $priority = callNextTicketWaiting($queue, ['priority' => 10, 'issued_at' => now()->subHour()]);
++    $oldestNormal = callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinutes(30)]);
++    callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinutes(5)]);
++
++    $normalCall = (new CallNextTicket)($queue, $attendant, CallMode::NormalOnly);
++    $next = (new CallNextTicket)($queue, $attendant, CallMode::Any);
++
++    expect($normalCall->is($oldestNormal))->toBeTrue()
++        ->and($next->is($priority))->toBeTrue();
++});
++
++it('rejects calling from an inactive queue without changing tickets', function () {
++    $queue = Queue::factory()->create(['is_active' => false]);
++    $attendant = User::factory()->create();
++    $ticket = callNextTicketWaiting($queue);
++
++    expect(fn () => (new CallNextTicket)($queue, $attendant, CallMode::Any))
++        ->toThrow(InactiveQueueException::class);
++
++    expect($ticket->fresh()->status)->toBe(TicketStatus::Waiting);
++});
++
++it('reads the queue state from the database instead of the passed instance', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $stale = Queue::query()->findOrFail($queue->id);
++    $attendant = User::factory()->create();
++    $ticket = callNextTicketWaiting($queue);
++
++    $queue->update(['is_active' => false]);
++
++    expect(fn () => (new CallNextTicket)($stale, $attendant, CallMode::Any))
++        ->toThrow(InactiveQueueException::class);
++
++    expect($ticket->fresh()->status)->toBe(TicketStatus::Waiting);
++});
++
++it('throws when the selected mode has no candidate', function (CallMode $mode, int $waitingPriority) {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    callNextTicketWaiting($queue, ['priority' => $waitingPriority]);
++
++    expect(fn () => (new CallNextTicket)($queue, $attendant, $mode))
++        ->toThrow(NoWaitingTicketsException::class);
++})->with([
++    'priority_only with only normal tickets' => [CallMode::PriorityOnly, 0],
++    'normal_only with only priority tickets' => [CallMode::NormalOnly, 10],
++]);
++
++it('throws on an empty queue', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++
++    expect(fn () => (new CallNextTicket)($queue, $attendant, CallMode::Any))
++        ->toThrow(NoWaitingTicketsException::class);
++});
++
++it('skips a candidate that was called concurrently before it could be locked', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $attendant = User::factory()->create();
++    EntityMembership::factory()->for($queue->entity)->for($attendant)->employee()->create();
++
++    $first = callNextTicketWaiting($queue, ['priority' => 10, 'issued_at' => now()->subMinutes(10)]);
++    $second = callNextTicketWaiting($queue, ['priority' => 0, 'issued_at' => now()->subMinute()]);
++
++    $injected = false;
++    Ticket::retrieved(function (Ticket $ticket) use (&$injected, $first, $attendant): void {
++        if ($injected || $ticket->id !== $first->id) {
++            return;
++        }
++
++        $injected = true;
++        $first->call($attendant);
++    });
++
++    $called = (new CallNextTicket)($queue, $attendant, CallMode::Any);
++
++    expect($injected)->toBeTrue()
++        ->and($called->is($second))->toBeTrue()
++        ->and($first->fresh()->status)->toBe(TicketStatus::Called);
++});

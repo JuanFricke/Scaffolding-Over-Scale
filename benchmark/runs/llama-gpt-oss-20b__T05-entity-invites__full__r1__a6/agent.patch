@@ -1,0 +1,427 @@
+diff --git a/app/Livewire/Entity/Members.php b/app/Livewire/Entity/Members.php
+index 9ce5a06..6bcfe98 100644
+--- a/app/Livewire/Entity/Members.php
++++ b/app/Livewire/Entity/Members.php
+@@ -8,6 +8,9 @@
+ use App\Models\UserRole;
+ use Illuminate\Contracts\View\View;
+ use Illuminate\Support\Facades\Log;
++use Illuminate\Support\Facades\Mail;
++use App\Mail\EntityInviteMail;
++use App\Models\EntityInvite;
+ use Livewire\Attributes\Layout;
+ use Livewire\Attributes\Locked;
+ use Livewire\Attributes\Validate;
+@@ -19,8 +22,8 @@ class Members extends Component
+     #[Locked]
+     public Entity $entity;
+ 
+-    #[Validate('required|email:strict|exists:users,email')]
+-    public string $email = '';
++    #[Validate('required|email:strict|max:255')]
++    public string $inviteEmail = '';
+ 
+     /**
+      * Roles an actor may assign here (never owner — that is ownership transfer in Settings).
+@@ -33,35 +36,68 @@ public function mount(Entity $entity): void
+         $this->entity = $entity;
+     }
+ 
+-    public function addMember(): void
++    #[Validate('required|in:admin,employee')]
++    public string $inviteRole = 'employee';
++
++    public function sendInvite(): void
+     {
+         $this->authorize('update', $this->entity);
+ 
+         $data = $this->validate();
++        $email = strtolower(trim($data['inviteEmail']));
++        $role = $data['inviteRole'];
+ 
+-        $user = User::where('email', $data['email'])->firstOrFail();
+-
+-        if ($this->entity->memberships()->where('user_id', $user->id)->exists()) {
+-            $this->addError('email', __('entity.member_exists'));
++        // Reject if email already a member
++        if ($this->entity->memberships()->whereHas('user', fn($q)=>$q->where('email',$email))->exists()) {
++            $this->addError('inviteEmail', __('entity.invite_exists'));
++            return;
++        }
+ 
++        // Reject if pending invite exists
++        $pending = $this->entity->invites()->where('email',$email)->whereNull('accepted_at')->first();
++        if ($pending) {
++            $this->addError('inviteEmail', __('entity.invite_exists'));
+             return;
+         }
+ 
+-        EntityMembership::create([
+-            'entity_id' => $this->entity->id,
+-            'user_id' => $user->id,
+-            'role' => UserRole::Employee->value,
+-        ]);
++        // Create invite, handling race
++        try {
++            $invite = EntityInvite::create([
++                'entity_id' => $this->entity->id,
++                'invited_by' => auth()->id(),
++                'email' => $email,
++                'role' => $role,
++                'expires_at' => now()->addDays(7),
++            ]);
++        } catch (\\Illuminate\\Database\\QueryException $e) {
++            if ($e->getCode() === '23000') {
++                $this->addError('inviteEmail', __('entity.invite_exists'));
++                return;
++            }
++            throw $e;
++        }
+ 
+-        Log::channel('audit')->info('Member added', [
++        // Queue email
++        Mail::to($email)->queue(new EntityInviteMail($invite));
++
++        Log::channel('audit')->info('Invite sent', [
+             'entity_id' => $this->entity->id,
+             'actor_id' => auth()->id(),
+-            'target_user_id' => $user->id,
++            'invite_id' => $invite->id,
+         ]);
+ 
+-        $this->reset('email');
++        $this->reset(['email','inviteRole']);
++    }
++
++    public function cancelInvite($inviteId): void
++    {
++        $this->authorize('update', $this->entity);
++        $invite = $this->entity->invites()->findOrFail($inviteId);
++        $invite->delete();
+     }
+ 
++    // removed addMember method
++
+     public function assignRole($membershipId, string $role): void
+     {
+         $membership = $this->entity->memberships()->findOrFail($membershipId);
+diff --git a/app/Livewire/Entity/PendingInvites.php b/app/Livewire/Entity/PendingInvites.php
+new file mode 100644
+index 0000000..6911432
+--- /dev/null
++++ b/app/Livewire/Entity/PendingInvites.php
+@@ -0,0 +1,52 @@
++<?php
++
++namespace App\Livewire\Entity;
++
++use App\Models\EntityInvite;
++use Illuminate\Support\Facades\Log;
++use Livewire\Component;
++
++class PendingInvites extends Component
++{
++    public function accept(int $inviteId): void
++    {
++        $invite = EntityInvite::findOrFail($inviteId);
++        // Only invitee can accept
++        abort_if(strtolower(auth()->user()->email) !== strtolower($invite->email), 403);
++        if ($invite->accepted_at) {
++            return; // idempotent
++        }
++        if ($invite->expires_at->isPast()) {
++            $this->addError('invite', __('entity.invite_expired'));
++            return;
++        }
++        $invite->update(['accepted_at' => now()]);
++        // Create membership
++        $invite->entity->memberships()->create([
++            'user_id' => auth()->id(),
++            'role' => $invite->role,
++        ]);
++        Log::channel('audit')->info('Invite accepted', [
++            'invite_id' => $invite->id,
++            'user_id' => auth()->id(),
++        ]);
++        // TODO: set tenant session and redirect
++    }
++
++    public function decline(int $inviteId): void
++    {
++        $invite = EntityInvite::findOrFail($inviteId);
++        abort_if(strtolower(auth()->user()->email) !== strtolower($invite->email), 403);
++        $invite->delete();
++    }
++
++    public function render()
++    {
++        $userEmail = strtolower(auth()->user()->email);
++        $invites = EntityInvite::where('email', $userEmail)
++            ->whereNull('accepted_at')
++            ->where('expires_at', '>', now())
++            ->get();
++        return view('livewire.entity.pending-invites', ['invites' => $invites]);
++    }
++}
+diff --git a/app/Mail/EntityInviteMail.php b/app/Mail/EntityInviteMail.php
+new file mode 100644
+index 0000000..8d2a554
+--- /dev/null
++++ b/app/Mail/EntityInviteMail.php
+@@ -0,0 +1,25 @@
++<?php
++
++namespace App\Mail;
++
++use App\Models\EntityInvite;
++use Illuminate\Mail\Mailable;
++use Illuminate\Mail\Queueable;
++use Illuminate\Support\Facades\Lang;
++
++class EntityInviteMail extends Mailable
++{
++    use Queueable;
++
++    public function __construct(public EntityInvite $invite)
++    {
++        $this->subject(
++            Lang::get('emails.entity_invite.subject', ['entity' => $this->invite->entity->name])
++        );
++    }
++
++    public function build()
++    {
++        return $this->markdown('emails.entity-invite');
++    }
++}
+diff --git a/app/Models/Entity.php b/app/Models/Entity.php
+index 803b07f..91229ab 100644
+--- a/app/Models/Entity.php
++++ b/app/Models/Entity.php
+@@ -60,4 +60,9 @@ public function ownerMembership(): ?EntityMembership
+     {
+         return $this->memberships()->where('role', UserRole::Owner->value)->first();
+     }
++
++    public function invites()
++    {
++        return $this->hasMany(EntityInvite::class);
++    }
+ }
+diff --git a/app/Models/EntityInvite.php b/app/Models/EntityInvite.php
+new file mode 100644
+index 0000000..04003e0
+--- /dev/null
++++ b/app/Models/EntityInvite.php
+@@ -0,0 +1,40 @@
++<?php
++
++namespace App\Models;
++
++use Illuminate\Database\Eloquent\Attributes\Fillable;
++use Illuminate\Database\Eloquent\Attributes\HasFactory;
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++use Illuminate\Database\Eloquent\Relations\BelongsToMany;
++
++class EntityInvite extends Model
++{
++    use HasFactory;
++
++    #[Fillable([
++        'entity_id',
++        'invited_by',
++        'email',
++        'role',
++        'expires_at',
++        'accepted_at',
++    ])]
++    protected $fillable = [];
++
++    protected $casts = [
++        'role' => UserRole::class,
++        'expires_at' => 'datetime',
++        'accepted_at' => 'datetime',
++    ];
++
++    public function entity(): BelongsTo
++    {
++        return $this->belongsTo(Entity::class);
++    }
++
++    public function invitedBy(): BelongsTo
++    {
++        return $this->belongsTo(User::class, 'invited_by');
++    }
++}
+diff --git a/database/factories/EntityInviteFactory.php b/database/factories/EntityInviteFactory.php
+new file mode 100644
+index 0000000..8f01999
+--- /dev/null
++++ b/database/factories/EntityInviteFactory.php
+@@ -0,0 +1,36 @@
++<?php
++
++use App\Models\EntityInvite;
++use Illuminate\Database\Eloquent\Factories\Factory;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++
++class EntityInviteFactory extends Factory
++{
++    protected $model = EntityInvite::class;
++
++    public function definition(): array
++    {
++        return [
++            'entity_id' => null,
++            'invited_by' => null,
++            'email' => $this->faker->unique()->safeEmail,
++            'role' => 'employee',
++            'expires_at' => now()->addDays(7),
++            'accepted_at' => null,
++        ];
++    }
++
++    public function forEntity($entity): Factory
++    {
++        return $this->state(fn (array $attributes) => [
++            'entity_id' => $entity->id,
++        ]);
++    }
++
++    public function expired(): Factory
++    {
++        return $this->state(fn (array $attributes) => [
++            'expires_at' => now()->subDays(1),
++        ]);
++    }
++}
+diff --git a/database/migrations/2026_10_29_000000_create_entity_invites_table.php b/database/migrations/2026_10_29_000000_create_entity_invites_table.php
+new file mode 100644
+index 0000000..d2d1162
+--- /dev/null
++++ b/database/migrations/2026_10_29_000000_create_entity_invites_table.php
+@@ -0,0 +1,27 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration {
++    public function up(): void
++    {
++        Schema::create('entity_invites', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('entity_id')->constrained()->cascadeOnDelete();
++            $table->foreignId('invited_by')->nullable()->constrained('users')->nullOnDelete();
++            $table->string('email', 255);
++            $table->enum('role', ['owner', 'admin', 'employee'])->default('employee');
++            $table->timestamp('expires_at');
++            $table->timestamp('accepted_at')->nullable();
++            $table->timestamps();
++            $table->unique(['entity_id', 'email']);
++        });
++    }
++
++    public function down(): void
++    {
++        Schema::dropIfExists('entity_invites');
++    }
++};
+diff --git a/lang/en/emails.php b/lang/en/emails.php
+new file mode 100644
+index 0000000..e23b7b0
+--- /dev/null
++++ b/lang/en/emails.php
+@@ -0,0 +1,11 @@
++<?php
++return [
++    'entity_invite' => [
++        'subject' => 'You are invited to :entity',
++        'greeting' => 'Hello',
++        'body' => 'You are invited to join :entity as :role.',
++        'button' => 'Sign in to PegaFila',
++        'expiry' => 'This invitation expires on :date.',
++        'signature' => 'Team PegaFila',
++    ],
++];
+diff --git a/lang/en/ui.php b/lang/en/ui.php
+index ad42c29..8736caa 100644
+--- a/lang/en/ui.php
++++ b/lang/en/ui.php
+@@ -74,4 +74,11 @@
+     'settings_transfer' => 'Transfer',
+     'settings_confirm_delete' => 'Confirm deletion?',
+     'settings_delete' => 'Soft-delete entity',
++    'role_owner' => 'Owner',
++    'role_admin' => 'Admin',
++    'role_employee' => 'Employee',
++    'invites_title' => 'Pending invites',
++    'members_details' => 'Member details',
++    'members_remove_title' => 'Remove member',
++
+ ];
+diff --git a/lang/pt_BR/emails.php b/lang/pt_BR/emails.php
+new file mode 100644
+index 0000000..8474608
+--- /dev/null
++++ b/lang/pt_BR/emails.php
+@@ -0,0 +1,11 @@
++<?php
++return [
++    'entity_invite' => [
++        'subject' => 'Você foi convidado(a) para :entity',
++        'greeting' => 'Olá',
++        'body' => 'Você foi convidado(a) para se juntar a :entity como :role.',
++        'button' => 'Entrar no PegaFila',
++        'expiry' => 'Este convite expira em :date.',
++        'signature' => 'Time PegaFila',
++    ],
++];
+diff --git a/lang/pt_BR/ui.php b/lang/pt_BR/ui.php
+index 2f5f729..f82ce71 100644
+--- a/lang/pt_BR/ui.php
++++ b/lang/pt_BR/ui.php
+@@ -74,4 +74,11 @@
+     'settings_transfer' => 'Transferir',
+     'settings_confirm_delete' => 'Confirmar exclusão?',
+     'settings_delete' => 'Excluir entidade',
++    'role_owner' => 'Proprietário',
++    'role_admin' => 'Administrador',
++    'role_employee' => 'Empregado',
++    'invites_title' => 'Convites pendentes',
++    'members_details' => 'Detalhes do membro',
++    'members_remove_title' => 'Remover membro',
++
+ ];
+diff --git a/resources/views/emails/entity-invite.blade.php b/resources/views/emails/entity-invite.blade.php
+new file mode 100644
+index 0000000..9457db5
+--- /dev/null
++++ b/resources/views/emails/entity-invite.blade.php
+@@ -0,0 +1,15 @@
++@component('mail::message')
++
++{{ __('emails.entity_invite.greeting') }},
++
++{{ __('emails.entity_invite.body', ['entity' => $invite->entity->name, 'role' => __('ui.role_' . $invite->role->value)]) }}
++
++@component('mail::button', ['url' => route('login')])
++    {{ __('emails.entity_invite.button') }}
++@endcomponent
++
++{{ __('emails.entity_invite.expiry', ['date' => $invite->expires_at->format('M j, Y')]) }}
++
++{{ __('emails.entity_invite.signature') }}
++
++@endcomponent
+\ No newline at end of file
+diff --git a/resources/views/livewire/entity/pending-invites.blade.php b/resources/views/livewire/entity/pending-invites.blade.php
+new file mode 100644
+index 0000000..69d3f40
+--- /dev/null
++++ b/resources/views/livewire/entity/pending-invites.blade.php
+@@ -0,0 +1 @@
++<div>Pending Invites List</div>
+\ No newline at end of file

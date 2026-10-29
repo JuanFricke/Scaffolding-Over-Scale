@@ -1,0 +1,1948 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9806b52..d51e1e1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -21,6 +21,8 @@ ### Added
+ 
+ ### Changed
+ 
++- Members are now invite-only: managers invite an e-mail with a role (`entity_invites`, 7-day expiry, 10 invites per manager and entity per hour). The invitee accepts or declines on onboarding or the entity switcher; membership exists only after acceptance. Replaces instant adding of existing users by e-mail.
++- The members page is manager-only and edits a member in a details modal (explicit "save role", confirmation modal for removal).
+ - Documented architecture: PegaFilaWeb is a single repository for frontend, backend and totem API; Flutter remains only as a separate client.
+ - Simplified model: ticket is single-use (one call; write-once except `called_at`/`called_by`) — removed `ticket_calls` table; ticket knows only its queue (no `totem_id`). `tickets.priority` is now an integer (higher = more prioritized).
+ - Expanded financial model: `billing_accounts` (1:0..1 with entity) + `subscriptions` + `plans` isolate financial data. New tables: `payment_options` (cycle, method, discount, refund window) and `payments` (individual charges). `billing_accounts` has `cpf_cnpj`. Subscription 1:1 with `billing_account_id` (UK); history in `payments`. Added `tickets.code`, explicit unique constraints, and circular FK note for owner. Removed per-queue user access limit.
+diff --git a/app/Livewire/Entity/Members.php b/app/Livewire/Entity/Members.php
+index 9ce5a06..30cb288 100644
+--- a/app/Livewire/Entity/Members.php
++++ b/app/Livewire/Entity/Members.php
+@@ -2,101 +2,184 @@
+ 
+ namespace App\Livewire\Entity;
+ 
++use App\Mail\EntityInviteMail;
+ use App\Models\Entity;
++use App\Models\EntityInvite;
+ use App\Models\EntityMembership;
+-use App\Models\User;
+ use App\Models\UserRole;
+ use Illuminate\Contracts\View\View;
++use Illuminate\Database\QueryException;
+ use Illuminate\Support\Facades\Log;
++use Illuminate\Support\Facades\Mail;
++use Illuminate\Support\Facades\RateLimiter;
++use Illuminate\Support\Str;
+ use Livewire\Attributes\Layout;
+ use Livewire\Attributes\Locked;
+-use Livewire\Attributes\Validate;
+ use Livewire\Component;
+ 
+ #[Layout('layouts::default-page')]
+ class Members extends Component
+ {
+-    #[Locked]
+-    public Entity $entity;
+-
+-    #[Validate('required|email:strict|exists:users,email')]
+-    public string $email = '';
++    /**
++     * Successful invites a manager may send per entity within an hour.
++     */
++    protected const INVITES_PER_HOUR = 10;
+ 
+     /**
+      * Roles an actor may assign here (never owner — that is ownership transfer in Settings).
+      */
+     protected const ASSIGNABLE_ROLES = ['admin', 'employee'];
+ 
++    #[Locked]
++    public Entity $entity;
++
++    public string $inviteEmail = '';
++
++    public string $inviteRole = 'employee';
++
++    public ?int $selectedMembershipId = null;
++
++    public string $memberRole = '';
++
++    public bool $confirmingRemoval = false;
++
+     public function mount(Entity $entity): void
+     {
+-        $this->authorize('view', $entity);
++        $this->authorize('update', $entity);
+         $this->entity = $entity;
+     }
+ 
+-    public function addMember(): void
++    public function sendInvite(): void
+     {
+         $this->authorize('update', $this->entity);
+ 
+-        $data = $this->validate();
++        $this->inviteEmail = Str::lower(trim($this->inviteEmail));
++        $this->validate([
++            'inviteEmail' => 'required|email:strict|max:255',
++            'inviteRole' => 'required|in:admin,employee',
++        ]);
++
++        $email = $this->inviteEmail;
++
++        $isMember = $this->entity->memberships()
++            ->whereHas('user', fn ($query) => $query->whereRaw('LOWER(email) = ?', [$email]))
++            ->exists();
++
++        if ($isMember) {
++            $this->addError('inviteEmail', __('ui.invite_already_member'));
++
++            return;
++        }
++
++        // An expired or already-accepted invite row may be reused; only a pending one blocks.
++        $existing = $this->entity->invites()->where('email', $email)->first();
+ 
+-        $user = User::where('email', $data['email'])->firstOrFail();
++        if ($existing?->isPending()) {
++            $this->addError('inviteEmail', __('ui.invite_already_pending'));
+ 
+-        if ($this->entity->memberships()->where('user_id', $user->id)->exists()) {
+-            $this->addError('email', __('entity.member_exists'));
++            return;
++        }
++
++        // Checked after validation and duplicate checks so rejected input never uses up the quota.
++        $rateKey = 'entity-invites:'.$this->entity->id.':'.auth()->id();
++
++        if (RateLimiter::tooManyAttempts($rateKey, self::INVITES_PER_HOUR)) {
++            $this->addError('inviteEmail', __('ui.invite_rate_limited'));
+ 
+             return;
+         }
+ 
+-        EntityMembership::create([
++        try {
++            $invite = $this->storeInvite($existing, $email);
++        } catch (QueryException $e) {
++            // Lost a race with a concurrent invite for the same address.
++            if (! $this->isUniqueViolation($e)) {
++                throw $e;
++            }
++
++            $this->addError('inviteEmail', __('ui.invite_already_pending'));
++
++            return;
++        }
++
++        RateLimiter::hit($rateKey, 60 * 60);
++
++        Mail::to($invite->email)->queue(new EntityInviteMail($invite));
++
++        Log::channel('audit')->info('Invite sent', [
+             'entity_id' => $this->entity->id,
+-            'user_id' => $user->id,
+-            'role' => UserRole::Employee->value,
++            'actor_id' => auth()->id(),
++            'invite_id' => $invite->id,
++            'role' => $invite->role->value,
+         ]);
+ 
+-        Log::channel('audit')->info('Member added', [
++        $this->reset(['inviteEmail', 'inviteRole']);
++    }
++
++    public function cancelInvite($inviteId): void
++    {
++        $this->authorize('update', $this->entity);
++
++        $invite = $this->entity->invites()->findOrFail($inviteId);
++        $invite->delete();
++
++        Log::channel('audit')->info('Invite cancelled', [
+             'entity_id' => $this->entity->id,
+             'actor_id' => auth()->id(),
+-            'target_user_id' => $user->id,
++            'invite_id' => $invite->id,
+         ]);
+-
+-        $this->reset('email');
+     }
+ 
+-    public function assignRole($membershipId, string $role): void
++    public function openMember($membershipId): void
+     {
++        $this->authorize('update', $this->entity);
++
+         $membership = $this->entity->memberships()->findOrFail($membershipId);
+ 
+-        $this->authorize('assignRole', $membership);
++        $this->selectedMembershipId = $membership->id;
++        $this->memberRole = $membership->role->value;
++        $this->confirmingRemoval = false;
++    }
+ 
+-        // The owner membership is immutable here — that path is ownership transfer in Settings.
+-        abort_if($membership->role === UserRole::Owner, 403);
++    public function saveRole(): void
++    {
++        $this->authorize('update', $this->entity);
+ 
+-        // The owner role is never assignable here — that path is ownership transfer in Settings.
+-        if (! in_array($role, self::ASSIGNABLE_ROLES, true)) {
+-            $this->addError('role', __('validation.in'));
++        $membership = $this->selectedMembership();
++        $data = $this->validate([
++            'memberRole' => 'required|in:'.implode(',', self::ASSIGNABLE_ROLES),
++        ]);
+ 
+-            return;
+-        }
++        // The owner membership is immutable here — that path is ownership transfer in Settings.
++        abort_if($membership->role === UserRole::Owner, 403);
+ 
+         // Demoting the last manager would leave the entity unmanaged.
+-        if ($membership->role === UserRole::Admin && $role === UserRole::Employee->value) {
+-            $managers = $this->entity->memberships()
+-                ->whereIn('role', [UserRole::Owner->value, UserRole::Admin->value])
+-                ->count();
+-
+-            abort_if($managers <= 1, 403);
++        if ($membership->role === UserRole::Admin && $data['memberRole'] === UserRole::Employee->value) {
++            abort_if($this->managerCount() <= 1, 403);
+         }
+ 
+-        $membership->update(['role' => $role]);
++        $membership->update(['role' => $data['memberRole']]);
+ 
+         Log::channel('audit')->info('Member role changed', [
+             'entity_id' => $this->entity->id,
+             'actor_id' => auth()->id(),
+             'target_membership_id' => $membership->id,
+-            'role' => $role,
++            'role' => $data['memberRole'],
+         ]);
+     }
+ 
++    public function confirmRemoval(): void
++    {
++        $this->authorize('update', $this->entity);
++
++        $this->confirmingRemoval = true;
++    }
++
++    public function cancelRemoval(): void
++    {
++        $this->confirmingRemoval = false;
++    }
++
+     public function removeMember($membershipId): void
+     {
+         $membership = $this->entity->memberships()->findOrFail($membershipId);
+@@ -105,11 +188,7 @@ public function removeMember($membershipId): void
+ 
+         // Never leave the entity without a manager (owner or admin).
+         if (in_array($membership->role, [UserRole::Owner, UserRole::Admin], true)) {
+-            $managers = $this->entity->memberships()
+-                ->whereIn('role', [UserRole::Owner->value, UserRole::Admin->value])
+-                ->count();
+-
+-            abort_if($managers <= 1, 403);
++            abort_if($this->managerCount() <= 1, 403);
+         }
+ 
+         $membership->delete();
+@@ -119,12 +198,63 @@ public function removeMember($membershipId): void
+             'actor_id' => auth()->id(),
+             'target_membership_id' => $membership->id,
+         ]);
++
++        $this->selectedMembershipId = null;
++        $this->confirmingRemoval = false;
+     }
+ 
+     public function render(): View
+     {
+         return view('livewire.entity.members', [
+-            'memberships' => $this->entity->memberships()->latest('id')->get(),
++            'memberships' => $this->entity->memberships()->with('user')->latest('id')->get(),
++            'invites' => $this->entity->invites()->pending()->latest('id')->get(),
++            'selectedMembership' => $this->selectedMembershipId
++                ? $this->entity->memberships()->with('user')->find($this->selectedMembershipId)
++                : null,
+         ]);
+     }
++
++    /**
++     * The membership currently open in the details modal (scoped to this entity).
++     */
++    protected function selectedMembership(): EntityMembership
++    {
++        return $this->entity->memberships()->findOrFail($this->selectedMembershipId);
++    }
++
++    protected function managerCount(): int
++    {
++        return $this->entity->memberships()
++            ->whereIn('role', [UserRole::Owner->value, UserRole::Admin->value])
++            ->count();
++    }
++
++    /**
++     * Reuses an expired or accepted invite row for the address (the unique key is
++     * per entity + e-mail), otherwise inserts a new one.
++     */
++    protected function storeInvite(?EntityInvite $existing, string $email): EntityInvite
++    {
++        $attributes = [
++            'invited_by' => auth()->id(),
++            'role' => $this->inviteRole,
++            'expires_at' => now()->addDays(EntityInvite::EXPIRES_IN_DAYS),
++            'accepted_at' => null,
++        ];
++
++        if ($existing) {
++            $existing->update($attributes);
++
++            return $existing;
++        }
++
++        return $this->entity->invites()->create(['email' => $email] + $attributes);
++    }
++
++    protected function isUniqueViolation(QueryException $e): bool
++    {
++        $message = strtolower($e->getMessage());
++
++        return str_contains($message, 'unique') || str_contains($message, 'duplicate');
++    }
+ }
+diff --git a/app/Livewire/Entity/PendingInvites.php b/app/Livewire/Entity/PendingInvites.php
+new file mode 100644
+index 0000000..eb18ed2
+--- /dev/null
++++ b/app/Livewire/Entity/PendingInvites.php
+@@ -0,0 +1,99 @@
++<?php
++
++namespace App\Livewire\Entity;
++
++use App\Models\EntityInvite;
++use App\Models\EntityMembership;
++use Illuminate\Contracts\View\View;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Log;
++use Livewire\Component;
++
++/**
++ * Lists the signed-in user's pending invites and lets them accept or decline.
++ */
++class PendingInvites extends Component
++{
++    public function accept($inviteId): void
++    {
++        $entity = DB::transaction(function () use ($inviteId) {
++            // Row lock so two concurrent accepts cannot both create the membership.
++            $invite = EntityInvite::with('entity')->lockForUpdate()->findOrFail($inviteId);
++
++            $this->authorizeInvitee($invite);
++
++            // The entity may have been soft-deleted after the invite was sent.
++            abort_unless($invite->entity, 404);
++
++            if ($invite->isAccepted()) {
++                return null;
++            }
++
++            if ($invite->isExpired()) {
++                $this->addError('invite', __('ui.invite_expired'));
++
++                return null;
++            }
++
++            EntityMembership::firstOrCreate(
++                ['entity_id' => $invite->entity_id, 'user_id' => auth()->id()],
++                ['role' => $invite->role->value],
++            );
++
++            $invite->update(['accepted_at' => now()]);
++
++            Log::channel('audit')->info('Invite accepted', [
++                'entity_id' => $invite->entity_id,
++                'actor_id' => auth()->id(),
++                'invite_id' => $invite->id,
++            ]);
++
++            return $invite->entity;
++        });
++
++        if (! $entity) {
++            return;
++        }
++
++        session(['current_entity_id' => $entity->id]);
++
++        $this->redirect(route('entity.dashboard', $entity->slug));
++    }
++
++    public function decline($inviteId): void
++    {
++        $invite = EntityInvite::findOrFail($inviteId);
++
++        $this->authorizeInvitee($invite);
++
++        // An accepted invite is history, not a pending decision.
++        if ($invite->isAccepted()) {
++            return;
++        }
++
++        $invite->delete();
++
++        Log::channel('audit')->info('Invite declined', [
++            'entity_id' => $invite->entity_id,
++            'actor_id' => auth()->id(),
++            'invite_id' => $invite->id,
++        ]);
++    }
++
++    public function render(): View
++    {
++        return view('livewire.entity.pending-invites', [
++            'invites' => EntityInvite::with('entity')
++                ->forEmail((string) auth()->user()?->email)
++                ->pending()
++                ->whereHas('entity')
++                ->latest('id')
++                ->get(),
++        ]);
++    }
++
++    protected function authorizeInvitee(EntityInvite $invite): void
++    {
++        abort_unless($invite->email === strtolower(trim((string) auth()->user()?->email)), 403);
++    }
++}
+diff --git a/app/Livewire/Entity/Settings.php b/app/Livewire/Entity/Settings.php
+index 1c48edc..e733906 100644
+--- a/app/Livewire/Entity/Settings.php
++++ b/app/Livewire/Entity/Settings.php
+@@ -3,6 +3,7 @@
+ namespace App\Livewire\Entity;
+ 
+ use App\Models\Entity;
++use App\Models\EntityInvite;
+ use App\Models\EntityMembership;
+ use App\Models\UserRole;
+ use Illuminate\Contracts\View\View;
+@@ -80,6 +81,7 @@ public function delete(): void
+ 
+             $entity->delete();
+             EntityMembership::where('entity_id', $entity->id)->delete();
++            EntityInvite::where('entity_id', $entity->id)->delete();
+ 
+             Log::channel('audit')->info('Entity soft-deleted', [
+                 'entity_id' => $entity->id,
+diff --git a/app/Mail/EntityInviteMail.php b/app/Mail/EntityInviteMail.php
+new file mode 100644
+index 0000000..8cc66cc
+--- /dev/null
++++ b/app/Mail/EntityInviteMail.php
+@@ -0,0 +1,43 @@
++<?php
++
++namespace App\Mail;
++
++use App\Models\EntityInvite;
++use Illuminate\Bus\Queueable;
++use Illuminate\Contracts\Queue\ShouldQueue;
++use Illuminate\Mail\Mailable;
++use Illuminate\Mail\Mailables\Content;
++use Illuminate\Mail\Mailables\Envelope;
++use Illuminate\Queue\SerializesModels;
++
++class EntityInviteMail extends Mailable implements ShouldQueue
++{
++    use Queueable, SerializesModels;
++
++    public function __construct(public EntityInvite $invite) {}
++
++    /**
++     * Get the message envelope.
++     */
++    public function envelope(): Envelope
++    {
++        return new Envelope(
++            subject: __('You are invited to :entity', ['entity' => $this->invite->entity->name]),
++        );
++    }
++
++    /**
++     * Get the message content definition.
++     */
++    public function content(): Content
++    {
++        return new Content(
++            markdown: 'emails.entity-invite',
++            with: [
++                'entityName' => $this->invite->entity->name,
++                'roleName' => __('ui.role_'.$this->invite->role->value),
++                'expiresAt' => $this->invite->expires_at->format('d/m/Y'),
++            ],
++        );
++    }
++}
+diff --git a/app/Models/Entity.php b/app/Models/Entity.php
+index 803b07f..5889a80 100644
+--- a/app/Models/Entity.php
++++ b/app/Models/Entity.php
+@@ -38,6 +38,11 @@ public function memberships(): HasMany
+         return $this->hasMany(EntityMembership::class);
+     }
+ 
++    public function invites(): HasMany
++    {
++        return $this->hasMany(EntityInvite::class);
++    }
++
+     /**
+      * Every user that belongs to this entity (pivot = entity_memberships).
+      */
+diff --git a/app/Models/EntityInvite.php b/app/Models/EntityInvite.php
+new file mode 100644
+index 0000000..c583849
+--- /dev/null
++++ b/app/Models/EntityInvite.php
+@@ -0,0 +1,87 @@
++<?php
++
++namespace App\Models;
++
++use Illuminate\Database\Eloquent\Attributes\Fillable;
++use Illuminate\Database\Eloquent\Builder;
++use Illuminate\Database\Eloquent\Casts\Attribute;
++use Illuminate\Database\Eloquent\Factories\HasFactory;
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++use Illuminate\Support\Str;
++
++#[Fillable(['entity_id', 'invited_by', 'email', 'role', 'expires_at', 'accepted_at'])]
++class EntityInvite extends Model
++{
++    use HasFactory;
++
++    /**
++     * How long an invite stays acceptable after it is sent.
++     */
++    public const EXPIRES_IN_DAYS = 7;
++
++    /**
++     * Get the attributes that should be cast.
++     *
++     * @return array<string, string>
++     */
++    protected function casts(): array
++    {
++        return [
++            'role' => UserRole::class,
++            'expires_at' => 'datetime',
++            'accepted_at' => 'datetime',
++        ];
++    }
++
++    /**
++     * Every write path stores the e-mail lowercase and trimmed.
++     */
++    protected function email(): Attribute
++    {
++        return Attribute::make(
++            set: fn (string $value) => Str::lower(trim($value)),
++        );
++    }
++
++    public function entity(): BelongsTo
++    {
++        return $this->belongsTo(Entity::class);
++    }
++
++    public function inviter(): BelongsTo
++    {
++        return $this->belongsTo(User::class, 'invited_by');
++    }
++
++    /**
++     * Invites not yet accepted and not yet expired.
++     */
++    public function scopePending(Builder $query): void
++    {
++        $query->whereNull('accepted_at')->where('expires_at', '>', now());
++    }
++
++    /**
++     * Invites addressed to the given e-mail (normalized the same way as writes).
++     */
++    public function scopeForEmail(Builder $query, string $email): void
++    {
++        $query->where('email', Str::lower(trim($email)));
++    }
++
++    public function isAccepted(): bool
++    {
++        return $this->accepted_at !== null;
++    }
++
++    public function isExpired(): bool
++    {
++        return $this->expires_at->isPast();
++    }
++
++    public function isPending(): bool
++    {
++        return ! $this->isAccepted() && ! $this->isExpired();
++    }
++}
+diff --git a/database/factories/EntityInviteFactory.php b/database/factories/EntityInviteFactory.php
+new file mode 100644
+index 0000000..e4ce4ed
+--- /dev/null
++++ b/database/factories/EntityInviteFactory.php
+@@ -0,0 +1,38 @@
++<?php
++
++namespace Database\Factories;
++
++use App\Models\Entity;
++use App\Models\EntityInvite;
++use App\Models\UserRole;
++use Illuminate\Database\Eloquent\Factories\Factory;
++
++/**
++ * @extends Factory<EntityInvite>
++ */
++class EntityInviteFactory extends Factory
++{
++    /**
++     * Define the model's default state.
++     *
++     * @return array<string, mixed>
++     */
++    public function definition(): array
++    {
++        return [
++            'entity_id' => Entity::factory(),
++            'invited_by' => null,
++            'email' => fake()->unique()->safeEmail(),
++            'role' => UserRole::Employee->value,
++            'expires_at' => now()->addDays(EntityInvite::EXPIRES_IN_DAYS),
++            'accepted_at' => null,
++        ];
++    }
++
++    public function expired(): static
++    {
++        return $this->state(fn (array $attributes) => [
++            'expires_at' => now()->subDay(),
++        ]);
++    }
++}
+diff --git a/database/migrations/2026_10_28_120000_create_entity_invites_table.php b/database/migrations/2026_10_28_120000_create_entity_invites_table.php
+new file mode 100644
+index 0000000..9e7651e
+--- /dev/null
++++ b/database/migrations/2026_10_28_120000_create_entity_invites_table.php
+@@ -0,0 +1,36 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    /**
++     * Run the migrations.
++     */
++    public function up(): void
++    {
++        Schema::create('entity_invites', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('entity_id')->constrained()->cascadeOnDelete();
++            $table->foreignId('invited_by')->nullable()->constrained('users')->nullOnDelete();
++            // Always stored lowercase and trimmed (see EntityInvite::email()).
++            $table->string('email');
++            $table->string('role')->default('employee');
++            $table->timestamp('expires_at');
++            $table->timestamp('accepted_at')->nullable();
++            $table->timestamps();
++
++            $table->unique(['entity_id', 'email']);
++        });
++    }
++
++    /**
++     * Reverse the migrations.
++     */
++    public function down(): void
++    {
++        Schema::dropIfExists('entity_invites');
++    }
++};
+diff --git a/docs/database-schema.md b/docs/database-schema.md
+index 770fd91..61c05c0 100644
+--- a/docs/database-schema.md
++++ b/docs/database-schema.md
+@@ -133,6 +133,7 @@ ## Main Relationships
+ | `payment_options` → `subscriptions` | 1 : 1 | Defines payment method (cycle, method, discount) |
+ | `subscriptions` → `payments` | 1 : N | Individual charges; status synced with Asaas |
+ | `entities` → `entity_memberships` | 1 : N | N:N user↔entity link; `role` = owner|admin|employee |
++| `entities` → `entity_invites` | 1 : N | Invite by e-mail (lowercased); `role` = admin|employee (never owner); pending = not accepted and `expires_at` in the future (7 days). Membership is created only when the invitee accepts. Unique `(entity_id, email)`; `invited_by` nullable FK to `users` |
+ | **Owner invariant** | `entity_memberships` has exactly one `role='owner'` per `entity_id`. Enforced by `entities.owner_seq` (generated `CASE WHEN role='owner' THEN 1 ELSE NULL END`) + unique `(entity_id, owner_seq)` — permits multiple non-owners, rejects a 2nd owner. No FK back to `entities`. Ownership transfer = demote old owner (role→admin), promote target admin (role→owner); the generated column + unique index tolerate the transient no-owner row within the transaction. |
+ | `entity_memberships.role` | enum | `admin`, `owner`, `employee` — billing only for owner |
+ | `plans` → limits | — | `max_users`, `max_queues` |
+diff --git a/lang/en/ui.php b/lang/en/ui.php
+index ad42c29..5532096 100644
+--- a/lang/en/ui.php
++++ b/lang/en/ui.php
+@@ -74,4 +74,15 @@
+     'settings_transfer' => 'Transfer',
+     'settings_confirm_delete' => 'Confirm deletion?',
+     'settings_delete' => 'Soft-delete entity',
++
++    'members_details' => 'Member details',
++    'members_remove_title' => 'Remove member',
++    'invites_title' => 'Pending invites',
++    'role_owner' => 'Owner',
++    'role_admin' => 'Admin',
++    'role_employee' => 'Employee',
++    'invite_already_member' => 'This person is already a member of this entity.',
++    'invite_already_pending' => 'A pending invite already exists for this e-mail.',
++    'invite_rate_limited' => 'Too many invites were sent recently. Try again later.',
++    'invite_expired' => 'This invite has expired.',
+ ];
+diff --git a/lang/pt_BR.json b/lang/pt_BR.json
+index c421564..63f2c87 100644
+--- a/lang/pt_BR.json
++++ b/lang/pt_BR.json
+@@ -14,7 +14,9 @@
+     "A new verification link has been sent to the email address you provided during registration.": "Um novo link de verificação foi enviado para o endereço de e-mail que você forneceu durante o processo de cadastro.",
+     "A new verification link has been sent to the email address you provided in your profile settings.": "Um novo link de verificação foi enviado para o endereço de e-mail fornecido nas configurações do seu perfil.",
+     "A new verification link has been sent to your email address.": "Um novo link de verificação foi enviado para seu endereço de e-mail.",
++    "Accept": "Aceitar",
+     "Accept Invitation": "Aceitar convite",
++    "Access the link below to sign in and accept your invite:": "Acesse o link abaixo para entrar e aceitar seu convite:",
+     "Action": "Ação",
+     "Action Event": "Evento de ação",
+     "Action Events": "Eventos de ação",
+@@ -81,6 +83,7 @@
+     "Are you sure you want to force delete this resource?": "Você tem certeza que deseja forçar a exclusão deste recurso?",
+     "Are you sure you want to log out?": "Tem certeza que deseja sair?",
+     "Are you sure you want to mark all notifications as read?": "Tem certeza de que deseja marcar todas as notificações como lidas?",
++    "Are you sure you want to remove :name from this entity?": "Tem certeza que deseja remover :name desta entidade?",
+     "Are you sure you want to remove this item?": "Tem certeza de que deseja remover este item?",
+     "Are you sure you want to restore the selected resources?": "Você tem certeza que deseja restaurar os recursos selecionados?",
+     "Are you sure you want to restore this resource?": "Você tem certeza que deseja restaurar esse recurso?",
+@@ -135,6 +138,7 @@
+     "Cameroon": "Camarões",
+     "Canada": "Canadá",
+     "Cancel": "Cancelar",
++    "Cancel invite": "Cancelar convite",
+     "Cancel Subscription": "Cancelar a assinatura",
+     "Cape Verde": "Cabo Verde",
+     "Card": "Cartão",
+@@ -206,6 +210,7 @@
+     "Dark": "Escuro",
+     "Dashboard": "Painel",
+     "December": "Dezembro",
++    "Decline": "Recusar",
+     "Decrease": "Diminuir",
+     "Default": "Padrão",
+     "Delete": "Excluir",
+@@ -262,6 +267,7 @@
+     "Ethiopia": "Etiópia",
+     "ex VAT": "sem VAT",
+     "Excel (.xlsx)": "Excel (.xlsx)",
++    "Expires": "Expira em",
+     "Expires :expiration": "Expira :expiration",
+     "Export As CSV": "Exportar Como CSV",
+     "Extra Billing Information": "Informações extras de faturamento",
+@@ -339,6 +345,7 @@
+     "Indonesia": "Indonésia",
+     "Invalid filename.": "Nome de arquivo inválido.",
+     "Invalid JSON was returned from the route.": "JSON inválido foi retornado da rota.",
++    "Invite member": "Convidar membro",
+     "Invoice Email Addresses": "Endereços de e-mail da fatura",
+     "Invoice emails updated successfully.": "E-mails da fatura foram atualizados com sucesso.",
+     "Invoices": "Faturas",
+@@ -422,6 +429,8 @@
+     "Mauritius": "Mauritania",
+     "May": "Maio",
+     "Mayotte": "Mayotte",
++    "Members": "Membros",
++    "Members of :entity": "Membros de :entity",
+     "Mexico": "México",
+     "Micronesia, Federated States Of": "Estados Federados da Micronésia",
+     "Micronesia, Federated States of": "Estados Federados da Micronésia",
+@@ -465,8 +474,10 @@
+     "No Data": "Sem Dados",
+     "no file selected": "nenhum arquivo selecionado",
+     "No Increase": "Sem Aumento",
++    "No members yet.": "Nenhum membro ainda.",
+     "No payment methods on file.": "Nenhum método de pagamento registrado.",
+     "No payment scheduled.": "Nenhum pagamento agendado.",
++    "No pending invites.": "Nenhum convite pendente.",
+     "No Prior Data": "Sem Dados Anteriores",
+     "No Results Found.": "Não Foram Encontrados Resultados.",
+     "Norfolk Island": "Ilha Norfolk",
+@@ -594,6 +605,7 @@
+     "Sao Tome and Principe": "São Tomé e Príncipe",
+     "Saudi Arabia": "Arábia Saudita",
+     "Save": "Salvar",
++    "Save role": "Salvar papel",
+     "Saved.": "Salvo.",
+     "Scroll to bottom": "Role para baixo",
+     "Scroll to top": "Role para cima",
+@@ -607,6 +619,7 @@
+     "Select all": "Selecionar Tudo",
+     "Select All Dropdown": "Selecionar Todas As Listas Suspensas",
+     "Select this page": "Selecionar esta página",
++    "Send invite": "Enviar convite",
+     "Send Password Reset Link": "Enviar link de redefinição de senha",
+     "Senegal": "Senegal",
+     "September": "Setembro",
+@@ -621,6 +634,7 @@
+     "Show Recovery Codes": "Mostrar Códigos de Recuperação",
+     "Showing": "Mostrando",
+     "Sierra Leone": "Serra Leoa",
++    "Sign in to PegaFila": "Entrar no PegaFila",
+     "Signed in as": "Logado como",
+     "Singapore": "Singapura",
+     "Sint Maarten (Dutch part)": "Ilha de São Martinho (Parte holandesa)",
+@@ -670,6 +684,7 @@
+     "Team Members": "Membros do Time",
+     "Team Name": "Nome do Time",
+     "Team Owner": "Dono do Time",
++    "Team PegaFila": "Time PegaFila",
+     "Team Settings": "Configurações do Time",
+     "Terms of Service": "Termos de Serviço",
+     "Thailand": "Tailândia",
+@@ -732,6 +747,7 @@
+     "This coupon code can only be used by new customers.": "Este código de cupom só pode ser usado por novos clientes.",
+     "This device": "Este dispositivo",
+     "This file field is read-only.": "Este campo de arquivo é apenas para leitura.",
++    "This invite expires on :date.": "Este convite expira em :date.",
+     "This invoice is no longer open.": "Essa fatura não está mais aberta.",
+     "This is a secure area of the application. Please confirm your password before continuing.": "Esta é uma área segura da aplicação. Por favor, confirme a sua senha antes de continuar.",
+     "This password does not match our records.": "Esta senha não corresponde aos nossos registros.",
+@@ -829,6 +845,8 @@
+     "You are already subscribed.": "Você já esta inscrito.",
+     "You are currently within your free trial period. Your trial will expire on :date.": "Você atualmente está no período de teste. Seu teste irá expirar em :date.",
+     "You are currently within your free trial period. Your trial will expire on :date. Starting a new subscription will end your trial.": "Você atualmente está no período de teste. Seu teste irá expirar em :date. Iniciar uma nova assinatura encerrará sua avaliação.",
++    "You are invited to :entity": "Você foi convidado(a) para :entity",
++    "You are invited to :entity as :role.": "Você foi convidado(a) para :entity como :role.",
+     "You are logged in!": "Você está logado!",
+     "You are receiving this email because we received a password reset request for your account.": "Você recebeu esse e-mail porque foi solicitado uma redefinição de senha na sua conta.",
+     "You have been invited to join the :team team!": "Foi convidado para se juntar ao time :team!",
+diff --git a/lang/pt_BR/ui.php b/lang/pt_BR/ui.php
+index 2f5f729..5b4be01 100644
+--- a/lang/pt_BR/ui.php
++++ b/lang/pt_BR/ui.php
+@@ -74,4 +74,15 @@
+     'settings_transfer' => 'Transferir',
+     'settings_confirm_delete' => 'Confirmar exclusão?',
+     'settings_delete' => 'Excluir entidade',
++
++    'members_details' => 'Detalhes do membro',
++    'members_remove_title' => 'Remover membro',
++    'invites_title' => 'Convites pendentes',
++    'role_owner' => 'Proprietário',
++    'role_admin' => 'Administrador',
++    'role_employee' => 'Funcionário',
++    'invite_already_member' => 'Esta pessoa já é membro desta entidade.',
++    'invite_already_pending' => 'Já existe um convite pendente para este e-mail.',
++    'invite_rate_limited' => 'Muitos convites foram enviados recentemente. Tente novamente mais tarde.',
++    'invite_expired' => 'Este convite expirou.',
+ ];
+diff --git a/resources/views/emails/entity-invite.blade.php b/resources/views/emails/entity-invite.blade.php
+new file mode 100644
+index 0000000..dfe9ef9
+--- /dev/null
++++ b/resources/views/emails/entity-invite.blade.php
+@@ -0,0 +1,15 @@
++<x-mail::message>
++{{ __('Hello!') }}
++
++{{ __('You are invited to :entity as :role.', ['entity' => $entityName, 'role' => $roleName]) }}
++
++{{ __('Access the link below to sign in and accept your invite:') }}
++
++<x-mail::button :url="route('login')" color="primary">
++{{ __('Sign in to PegaFila') }}
++</x-mail::button>
++
++{{ __('This invite expires on :date.', ['date' => $expiresAt]) }}
++
++{{ __('Team PegaFila') }}
++</x-mail::message>
+diff --git a/resources/views/entity/switcher.blade.php b/resources/views/entity/switcher.blade.php
+index b7bbee1..75ac6d4 100644
+--- a/resources/views/entity/switcher.blade.php
++++ b/resources/views/entity/switcher.blade.php
+@@ -4,6 +4,7 @@
+             <div class="box">
+                 <p class="title is-5">{{ __('ui.switch_entity') }}</p>
+                 <x-entity-switcher />
++                <livewire:entity.pending-invites />
+             </div>
+         </div>
+     </div>
+diff --git a/resources/views/layouts/default-page.blade.php b/resources/views/layouts/default-page.blade.php
+index d6826d3..b3dd4d9 100644
+--- a/resources/views/layouts/default-page.blade.php
++++ b/resources/views/layouts/default-page.blade.php
+@@ -41,6 +41,8 @@
+                         @can('view', $currentEntity)
+                             <a class="navbar-item"
+                                href="{{ route('entity.dashboard', ['entity' => $currentEntity->slug]) }}">{{ __('ui.nav_dashboard') }}</a>
++                        @endcan
++                        @can('update', $currentEntity)
+                             <a class="navbar-item"
+                                href="{{ route('entity.members', ['entity' => $currentEntity->slug]) }}">{{ __('ui.nav_members') }}</a>
+                         @endcan
+diff --git a/resources/views/livewire/entity/create-entity.blade.php b/resources/views/livewire/entity/create-entity.blade.php
+index d0feff5..a985b87 100644
+--- a/resources/views/livewire/entity/create-entity.blade.php
++++ b/resources/views/livewire/entity/create-entity.blade.php
+@@ -14,4 +14,6 @@
+ 
+         <button type="submit" class="button is-primary is-fullwidth">{{ __('ui.onboarding_submit') }}</button>
+     </form>
++
++    <livewire:entity.pending-invites />
+ </div>
+diff --git a/resources/views/livewire/entity/dashboard.blade.php b/resources/views/livewire/entity/dashboard.blade.php
+index dc622a7..7159422 100644
+--- a/resources/views/livewire/entity/dashboard.blade.php
++++ b/resources/views/livewire/entity/dashboard.blade.php
+@@ -18,10 +18,6 @@
+                     @if (Route::has('entity.members'))
+                         <a class="button is-link" href="{{ route('entity.members', $entity->slug) }}">{{ __('ui.nav_members') }}</a>
+                     @endif
+-                @else
+-                    @if (Route::has('entity.members'))
+-                        <a class="button is-link" href="{{ route('entity.members', $entity->slug) }}">{{ __('ui.nav_members') }}</a>
+-                    @endif
+                 @endif
+             </nav>
+ 
+diff --git a/resources/views/livewire/entity/members.blade.php b/resources/views/livewire/entity/members.blade.php
+index bb3ca45..47dcc02 100644
+--- a/resources/views/livewire/entity/members.blade.php
++++ b/resources/views/livewire/entity/members.blade.php
+@@ -1,28 +1,63 @@
++@use('App\Models\UserRole')
++
+ <x-slot name="title">
+     {{ __('Members of :entity', ['entity' => $entity->name]) }}
+ </x-slot>
+ 
+ <div class="card">
+     <div class="card-content">
+-        <div class="level mb-4">
+-            <div class="level-left">
+-                <p class="title is-5 mb-0">{{ __('Members') }}</p>
+-            </div>
+-        </div>
++        <p class="title is-5 mb-4">{{ __('Members of :entity', ['entity' => $entity->name]) }}</p>
+ 
+-        @can('update', $entity)
+-            <form wire:submit.prevent="addMember" class="mb-4">
+-                <div class="field has-addons">
+-                    <div class="control is-expanded">
+-                        <x-input type="email" name="email" placeholder="{{ __('user@example.com') }}" wire:model="email" />
+-                        @error('email') <p class="help is-danger">{{ $message }}</p> @enderror
+-                    </div>
+-                    <div class="control">
+-                        <button type="submit" class="button is-primary">{{ __('Add') }}</button>
+-                    </div>
++        <p class="subtitle is-6 mb-2">{{ __('Invite member') }}</p>
++
++        <form wire:submit.prevent="sendInvite" class="mb-5">
++            <div class="field has-addons">
++                {{-- x-input renders its own error message for inviteEmail. --}}
++                <div class="control is-expanded">
++                    <x-input type="email" name="inviteEmail" placeholder="{{ __('user@example.com') }}" wire:model="inviteEmail" />
++                </div>
++                <div class="control">
++                    <div class="select"><select wire:model="inviteRole" aria-label="{{ __('Role') }}">
++                        <option value="employee">{{ __('ui.role_employee') }}</option>
++                        <option value="admin">{{ __('ui.role_admin') }}</option>
++                    </select></div>
+                 </div>
+-            </form>
+-        @endcan
++                <div class="control">
++                    <button type="submit" class="button is-primary">{{ __('Send invite') }}</button>
++                </div>
++            </div>
++            @error('inviteRole') <p class="help is-danger">{{ $message }}</p> @enderror
++        </form>
++
++        <p class="subtitle is-6 mb-2">{{ __('ui.invites_title') }}</p>
++
++        <table class="table is-striped is-fullwidth mb-5">
++            <thead>
++                <tr>
++                    <th>{{ __('E-mail') }}</th>
++                    <th>{{ __('Role') }}</th>
++                    <th>{{ __('Expires') }}</th>
++                    <th></th>
++                </tr>
++            </thead>
++            <tbody>
++                @forelse ($invites as $invite)
++                    <tr>
++                        <td>{{ $invite->email }}</td>
++                        <td>{{ __('ui.role_'.$invite->role->value) }}</td>
++                        <td>{{ $invite->expires_at->format('d/m/Y') }}</td>
++                        <td>
++                            <button type="button" class="button is-small is-light is-danger"
++                                    wire:click="cancelInvite({{ $invite->id }})">{{ __('Cancel invite') }}</button>
++                        </td>
++                    </tr>
++                @empty
++                    <tr><td colspan="4">{{ __('No pending invites.') }}</td></tr>
++                @endforelse
++            </tbody>
++        </table>
++
++        <p class="subtitle is-6 mb-2">{{ __('Members') }}</p>
+ 
+         <table class="table is-striped is-fullwidth">
+             <thead>
+@@ -38,20 +73,10 @@
+                     <tr>
+                         <td>{{ $membership->user->name }}</td>
+                         <td>{{ $membership->user->email }}</td>
+-                        <td>{{ $membership->role->name }}</td>
++                        <td>{{ __('ui.role_'.$membership->role->value) }}</td>
+                         <td>
+-                            @can('assignRole', $membership)
+-                                <div class="select is-small"><select wire:change="assignRole({{ $membership->id }}, $event.target.value)">
+-                                    <option value="">{{ __('Change') }}</option>
+-                                    <option value="admin">{{ __('Admin') }}</option>
+-                                    <option value="employee">{{ __('Employee') }}</option>
+-                                </select></div>
+-                            @endcan
+-                            @can('delete', $membership)
+-                                <button type="button" class="button is-small is-light is-danger"
+-                                        wire:click="removeMember({{ $membership->id }})"
+-                                        wire:confirm="{{ __('Confirm removal?') }}">{{ __('Remove') }}</button>
+-                            @endcan
++                            <button type="button" class="button is-small is-light"
++                                    wire:click="openMember({{ $membership->id }})">{{ __('Details') }}</button>
+                         </td>
+                     </tr>
+                 @empty
+@@ -61,3 +86,63 @@
+         </table>
+     </div>
+ </div>
++
++@if ($selectedMembership)
++    @if ($confirmingRemoval)
++        <div class="modal is-active">
++            <div class="modal-background" wire:click="cancelRemoval"></div>
++            <div class="modal-card">
++                <header class="modal-card-head">
++                    <p class="modal-card-title">{{ __('ui.members_remove_title') }}</p>
++                    <button type="button" class="delete" aria-label="{{ __('Close') }}" wire:click="cancelRemoval"></button>
++                </header>
++                <section class="modal-card-body">
++                    <p>{{ __('Are you sure you want to remove :name from this entity?', ['name' => $selectedMembership->user->name]) }}</p>
++                </section>
++                <footer class="modal-card-foot">
++                    <button type="button" class="button is-danger"
++                            wire:click="removeMember({{ $selectedMembership->id }})">{{ __('Remove') }}</button>
++                    <button type="button" class="button" wire:click="cancelRemoval">{{ __('Cancel') }}</button>
++                </footer>
++            </div>
++        </div>
++    @else
++        <div class="modal is-active">
++            <div class="modal-background" wire:click="$set('selectedMembershipId', null)"></div>
++            <div class="modal-card">
++                <header class="modal-card-head">
++                    <p class="modal-card-title">{{ __('ui.members_details') }}</p>
++                    <button type="button" class="delete" aria-label="{{ __('Close') }}" wire:click="$set('selectedMembershipId', null)"></button>
++                </header>
++                <section class="modal-card-body">
++                    <p class="has-text-weight-semibold">{{ $selectedMembership->user->name }}</p>
++                    <p class="mb-4">{{ $selectedMembership->user->email }}</p>
++
++                    <div class="field">
++                        <label class="label" for="memberRole">{{ __('Role') }}</label>
++                        <div class="control">
++                            <div class="select is-fullwidth"><select id="memberRole" wire:model="memberRole"
++                                    @disabled($selectedMembership->role === UserRole::Owner)>
++                                @if ($selectedMembership->role === UserRole::Owner)
++                                    <option value="owner">{{ __('ui.role_owner') }}</option>
++                                @endif
++                                <option value="admin">{{ __('ui.role_admin') }}</option>
++                                <option value="employee">{{ __('ui.role_employee') }}</option>
++                            </select></div>
++                        </div>
++                        @error('memberRole') <p class="help is-danger">{{ $message }}</p> @enderror
++                    </div>
++                </section>
++                <footer class="modal-card-foot">
++                    @unless ($selectedMembership->role === UserRole::Owner)
++                        <button type="button" class="button is-primary" wire:click="saveRole">{{ __('Save role') }}</button>
++                    @endunless
++                    @can('delete', $selectedMembership)
++                        <button type="button" class="button is-danger is-light" wire:click="confirmRemoval">{{ __('Remove') }}</button>
++                    @endcan
++                    <button type="button" class="button" wire:click="$set('selectedMembershipId', null)">{{ __('Close') }}</button>
++                </footer>
++            </div>
++        </div>
++    @endif
++@endif
+diff --git a/resources/views/livewire/entity/pending-invites.blade.php b/resources/views/livewire/entity/pending-invites.blade.php
+new file mode 100644
+index 0000000..b97fdf2
+--- /dev/null
++++ b/resources/views/livewire/entity/pending-invites.blade.php
+@@ -0,0 +1,30 @@
++<div>
++    @if ($invites->isNotEmpty())
++        <hr>
++
++        <p class="title is-5">{{ __('ui.invites_title') }}</p>
++
++        @error('invite') <p class="help is-danger mb-2">{{ $message }}</p> @enderror
++
++        @foreach ($invites as $invite)
++            <div class="level mb-2">
++                <div class="level-left">
++                    <div class="level-item">
++                        <div>
++                            <p class="has-text-weight-semibold">{{ $invite->entity->name }}</p>
++                            <p class="is-size-7">{{ __('ui.role_'.$invite->role->value) }} · {{ __('Expires') }} {{ $invite->expires_at->format('d/m/Y') }}</p>
++                        </div>
++                    </div>
++                </div>
++                <div class="level-right">
++                    <div class="level-item buttons">
++                        <button type="button" class="button is-small is-primary"
++                                wire:click="accept({{ $invite->id }})">{{ __('Accept') }}</button>
++                        <button type="button" class="button is-small is-light"
++                                wire:click="decline({{ $invite->id }})">{{ __('Decline') }}</button>
++                    </div>
++                </div>
++            </div>
++        @endforeach
++    @endif
++</div>
+diff --git a/tests/Feature/Entity/EntityInviteMailTest.php b/tests/Feature/Entity/EntityInviteMailTest.php
+new file mode 100644
+index 0000000..40f6eaf
+--- /dev/null
++++ b/tests/Feature/Entity/EntityInviteMailTest.php
+@@ -0,0 +1,70 @@
++<?php
++
++use App\Mail\EntityInviteMail;
++use App\Models\Entity;
++use App\Models\EntityInvite;
++use App\Models\UserRole;
++use Illuminate\Contracts\Queue\ShouldQueue;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Facades\Mail;
++
++uses(RefreshDatabase::class);
++
++test('the invite mail is queued markdown using the entity-invite view', function () {
++    $invite = EntityInvite::factory()->create();
++
++    $mail = new EntityInviteMail($invite);
++
++    expect($mail)->toBeInstanceOf(ShouldQueue::class)
++        ->and($mail->content()->markdown)->toBe('emails.entity-invite');
++});
++
++test('the invite mail is queued to the invitee', function () {
++    Mail::fake();
++
++    $invite = EntityInvite::factory()->create(['email' => 'guest@example.com']);
++
++    Mail::to($invite->email)->queue(new EntityInviteMail($invite));
++
++    Mail::assertQueued(EntityInviteMail::class, fn ($mail) => $mail->hasTo('guest@example.com'));
++});
++
++test('the invite mail renders in English with the entity, role, expiry and sign-in button', function () {
++    app()->setLocale('en');
++
++    $entity = Entity::factory()->create(['name' => 'Acme Ltda']);
++    $invite = EntityInvite::factory()->for($entity)->create(['role' => UserRole::Admin]);
++
++    $mail = new EntityInviteMail($invite);
++    $html = $mail->render();
++
++    expect($mail->envelope()->subject)->toBe('You are invited to Acme Ltda')
++        ->and($html)->toContain('Hello!')
++        ->and($html)->toContain('You are invited to Acme Ltda as Admin.')
++        ->and($html)->toContain('Access the link below to sign in and accept your invite:')
++        ->and($html)->toContain('Sign in to PegaFila')
++        ->and($html)->toContain(route('login'))
++        ->and($html)->toContain($invite->expires_at->format('d/m/Y'))
++        ->and($html)->toContain('Team PegaFila');
++
++    app()->setLocale('pt_BR');
++});
++
++test('the invite mail is written in Brazilian Portuguese', function () {
++    app()->setLocale('pt_BR');
++
++    $entity = Entity::factory()->create(['name' => 'Acme Ltda']);
++    $invite = EntityInvite::factory()->for($entity)->create(['role' => UserRole::Admin]);
++
++    $mail = new EntityInviteMail($invite);
++    $html = $mail->render();
++
++    expect($mail->envelope()->subject)->toBe('Você foi convidado(a) para Acme Ltda')
++        ->and($html)->toContain('Você foi convidado(a) para Acme Ltda como Administrador.')
++        ->and($html)->toContain('Acesse o link abaixo para entrar e aceitar seu convite:')
++        ->and($html)->toContain('Entrar no PegaFila')
++        ->and($html)->toContain('Time PegaFila')
++        ->and($html)->toContain('Olá!');
++
++    app()->setLocale('en');
++});
+diff --git a/tests/Feature/Entity/EntityInviteTest.php b/tests/Feature/Entity/EntityInviteTest.php
+new file mode 100644
+index 0000000..1a9366e
+--- /dev/null
++++ b/tests/Feature/Entity/EntityInviteTest.php
+@@ -0,0 +1,63 @@
++<?php
++
++use App\Models\Entity;
++use App\Models\EntityInvite;
++use App\Models\UserRole;
++use Illuminate\Database\QueryException;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++
++uses(RefreshDatabase::class);
++
++test('the invite e-mail is stored lowercase and trimmed on every write path', function () {
++    $invite = EntityInvite::factory()->create(['email' => '  Mixed.Case@Example.COM ']);
++
++    expect($invite->email)->toBe('mixed.case@example.com')
++        ->and(EntityInvite::whereKey($invite->id)->value('email'))->toBe('mixed.case@example.com');
++
++    $invite->update(['email' => ' Other@Example.com']);
++
++    expect($invite->fresh()->email)->toBe('other@example.com');
++});
++
++test('the role is cast to the user role enum and defaults to employee', function () {
++    $invite = EntityInvite::factory()->create();
++
++    expect($invite->fresh()->role)->toBe(UserRole::Employee)
++        ->and($invite->expires_at->between(now()->addDays(7)->subMinute(), now()->addDays(7)->addMinute()))->toBeTrue();
++});
++
++test('an invite is pending only while not accepted and not expired', function () {
++    expect(EntityInvite::factory()->create()->isPending())->toBeTrue()
++        ->and(EntityInvite::factory()->expired()->create()->isPending())->toBeFalse()
++        ->and(EntityInvite::factory()->create(['accepted_at' => now()])->isPending())->toBeFalse();
++
++    expect(EntityInvite::query()->pending()->count())->toBe(1);
++});
++
++test('one invite per e-mail per entity is enforced by the database', function () {
++    $entity = Entity::factory()->create();
++    EntityInvite::factory()->for($entity)->create(['email' => 'dup@example.com']);
++
++    expect(fn () => EntityInvite::factory()->for($entity)->create(['email' => 'DUP@example.com']))
++        ->toThrow(QueryException::class);
++
++    // The same address may be invited to another entity.
++    expect(EntityInvite::factory()->create(['email' => 'dup@example.com'])->exists)->toBeTrue();
++});
++
++test('invites are removed with their entity', function () {
++    $entity = Entity::factory()->create();
++    EntityInvite::factory()->for($entity)->create();
++
++    $entity->forceDelete();
++
++    expect(EntityInvite::count())->toBe(0);
++});
++
++test('the entity exposes its invites', function () {
++    $entity = Entity::factory()->create();
++    EntityInvite::factory()->for($entity)->count(2)->create();
++
++    expect($entity->invites)->toHaveCount(2)
++        ->and($entity->invites->first())->toBeInstanceOf(EntityInvite::class);
++});
+diff --git a/tests/Feature/Entity/MembersTest.php b/tests/Feature/Entity/MembersTest.php
+index 798a937..f019d02 100644
+--- a/tests/Feature/Entity/MembersTest.php
++++ b/tests/Feature/Entity/MembersTest.php
+@@ -1,34 +1,79 @@
+ <?php
+ 
+ use App\Livewire\Entity\Members;
++use App\Mail\EntityInviteMail;
+ use App\Models\Entity;
++use App\Models\EntityInvite;
+ use App\Models\EntityMembership;
+ use App\Models\User;
+ use App\Models\UserRole;
++use Illuminate\Database\Eloquent\ModelNotFoundException;
+ use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Mail;
+ use Livewire\Livewire;
+ 
+ uses(RefreshDatabase::class);
+ 
+-test('manager can add an existing user as employee', function () {
++test('the members page is manager-only', function () {
++    $employee = User::factory()->create();
++    $entity = Entity::factory()->create();
++    EntityMembership::factory()->for($entity)->for($employee)->employee()->create();
++
++    $this->actingAs($employee)->post(route('entity.pick', $entity->slug));
++
++    $this->actingAs($employee)
++        ->get(route('entity.members', $entity->slug))
++        ->assertForbidden();
++
++    Livewire::test(Members::class, ['entity' => $entity])->assertForbidden();
++});
++
++test('an admin can open the members page', function () {
+     $admin = User::factory()->create();
+     $entity = Entity::factory()->create();
+-    $target = User::factory()->create(['email' => 'target@example.com']);
+-    EntityMembership::factory()->for($entity)->for($admin)->owner()->create();
++    EntityMembership::factory()->for($entity)->for($admin)->admin()->create();
+ 
+     $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
+ 
+     Livewire::test(Members::class, ['entity' => $entity])
+-        ->set('email', 'target@example.com')
+-        ->call('addMember')
+-        ->assertHasNoErrors();
++        ->assertOk()
++        ->assertSee('Invite member')
++        ->assertSee('Send invite');
++});
++
++test('a manager invites an address with a role and an e-mail is queued', function () {
++    Mail::fake();
++
++    $admin = User::factory()->create();
++    $entity = Entity::factory()->create();
++    EntityMembership::factory()->for($entity)->for($admin)->owner()->create();
++
++    $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
+ 
+-    $membership = EntityMembership::where('entity_id', $entity->id)->where('user_id', $target->id)->first();
+-    expect($membership)->not->toBeNull()
+-        ->and($membership->role)->toBe(UserRole::Employee);
++    Livewire::test(Members::class, ['entity' => $entity])
++        ->set('inviteEmail', '  New.Person@Example.com ')
++        ->set('inviteRole', 'admin')
++        ->call('sendInvite')
++        ->assertHasNoErrors()
++        ->assertSet('inviteEmail', '')
++        ->assertSet('inviteRole', 'employee');
++
++    $invite = EntityInvite::where('entity_id', $entity->id)->first();
++
++    expect($invite)->not->toBeNull()
++        ->and($invite->email)->toBe('new.person@example.com')
++        ->and($invite->role)->toBe(UserRole::Admin)
++        ->and($invite->invited_by)->toBe($admin->id)
++        ->and($invite->isPending())->toBeTrue()
++        ->and(EntityMembership::where('entity_id', $entity->id)->count())->toBe(1);
++
++    Mail::assertQueued(EntityInviteMail::class, fn ($mail) => $mail->hasTo('new.person@example.com'));
+ });
+ 
+-test('adding a nonexistent user fails validation', function () {
++test('invite e-mail validation rejects owner, bad addresses and missing input', function () {
++    Mail::fake();
++
+     $admin = User::factory()->create();
+     $entity = Entity::factory()->create();
+     EntityMembership::factory()->for($entity)->for($admin)->owner()->create();
+@@ -36,119 +81,329 @@
+     $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
+ 
+     Livewire::test(Members::class, ['entity' => $entity])
+-        ->set('email', 'nobody@example.com')
+-        ->call('addMember')
+-        ->assertHasErrors(['email' => 'exists']);
++        ->set('inviteEmail', 'someone@example.com')
++        ->set('inviteRole', 'owner')
++        ->call('sendInvite')
++        ->assertHasErrors(['inviteRole']);
++
++    Livewire::test(Members::class, ['entity' => $entity])
++        ->set('inviteEmail', 'not-an-email')
++        ->set('inviteRole', 'employee')
++        ->call('sendInvite')
++        ->assertHasErrors(['inviteEmail']);
++
++    Livewire::test(Members::class, ['entity' => $entity])
++        ->call('sendInvite')
++        ->assertHasErrors(['inviteEmail' => 'required']);
++
++    expect(EntityInvite::count())->toBe(0);
++    Mail::assertNothingQueued();
++});
++
++test('a validation error on the invite e-mail renders exactly once', function () {
++    $admin = User::factory()->create();
++    $entity = Entity::factory()->create();
++    EntityMembership::factory()->for($entity)->for($admin)->owner()->create();
++
++    $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
++
++    $html = Livewire::test(Members::class, ['entity' => $entity])
++        ->set('inviteEmail', 'not-an-email')
++        ->call('sendInvite')
++        ->html();
+ 
+-    expect(EntityMembership::where('entity_id', $entity->id)->count())->toBe(1);
++    expect(substr_count($html, 'help is-danger'))->toBe(1);
+ });
+ 
+-test('adding an existing member reports a conflict', function () {
++test('inviting an existing member is rejected on the invite e-mail', function () {
++    Mail::fake();
++
+     $admin = User::factory()->create();
+     $entity = Entity::factory()->create();
+-    $member = User::factory()->create();
++    $member = User::factory()->create(['email' => 'member@example.com']);
+     EntityMembership::factory()->for($entity)->for($admin)->owner()->create();
+-    EntityMembership::factory()->for($entity)->for($member)->admin()->create();
++    EntityMembership::factory()->for($entity)->for($member)->employee()->create();
+ 
+     $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
+ 
+     Livewire::test(Members::class, ['entity' => $entity])
+-        ->set('email', $member->email)
+-        ->call('addMember')
+-        ->assertHasErrors('email');
++        ->set('inviteEmail', 'MEMBER@example.com')
++        ->set('inviteRole', 'employee')
++        ->call('sendInvite')
++        ->assertHasErrors(['inviteEmail']);
++
++    expect(EntityInvite::count())->toBe(0);
++    Mail::assertNothingQueued();
+ });
+ 
+-test('employee cannot add members or assign roles', function () {
+-    $employee = User::factory()->create();
++test('a second pending invite for the same address is rejected', function () {
++    Mail::fake();
++
++    $admin = User::factory()->create();
+     $entity = Entity::factory()->create();
++    EntityMembership::factory()->for($entity)->for($admin)->owner()->create();
++    EntityInvite::factory()->for($entity)->create(['email' => 'dup@example.com']);
++
++    $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
++
++    Livewire::test(Members::class, ['entity' => $entity])
++        ->set('inviteEmail', 'dup@example.com')
++        ->call('sendInvite')
++        ->assertHasErrors(['inviteEmail']);
++
++    expect(EntityInvite::where('email', 'dup@example.com')->count())->toBe(1);
++    Mail::assertNothingQueued();
++});
++
++test('an expired invite can be replaced by a new one', function () {
++    Mail::fake();
++
+     $admin = User::factory()->create();
+-    $target = User::factory()->create(['email' => 't@example.com']);
++    $entity = Entity::factory()->create();
+     EntityMembership::factory()->for($entity)->for($admin)->owner()->create();
+-    EntityMembership::factory()->for($entity)->for($employee)->employee()->create();
++    $old = EntityInvite::factory()->for($entity)->expired()->create(['email' => 'late@example.com']);
+ 
+-    $this->actingAs($employee)->post(route('entity.pick', $entity->slug));
++    $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
+ 
+     Livewire::test(Members::class, ['entity' => $entity])
+-        ->set('email', 't@example.com')
+-        ->call('addMember')
+-        ->assertForbidden();
++        ->set('inviteEmail', 'late@example.com')
++        ->set('inviteRole', 'admin')
++        ->call('sendInvite')
++        ->assertHasNoErrors();
++
++    $fresh = EntityInvite::where('email', 'late@example.com')->sole();
++
++    expect($fresh->id)->toBe($old->id)
++        ->and($fresh->isPending())->toBeTrue()
++        ->and($fresh->role)->toBe(UserRole::Admin);
++    Mail::assertQueued(EntityInviteMail::class);
++});
++
++test('a database unique violation at insert time becomes an error on the invite e-mail', function () {
++    Mail::fake();
++
++    $admin = User::factory()->create();
++    $entity = Entity::factory()->create();
++    EntityMembership::factory()->for($entity)->for($admin)->owner()->create();
++
++    $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
++
++    // Simulates a concurrent insert: the row appears after the pending check passed.
++    EntityInvite::creating(function (EntityInvite $invite) {
++        DB::table('entity_invites')->insert([
++            'entity_id' => $invite->entity_id,
++            'email' => $invite->email,
++            'role' => 'employee',
++            'expires_at' => now()->addDay(),
++            'created_at' => now(),
++            'updated_at' => now(),
++        ]);
++    });
+ 
+     Livewire::test(Members::class, ['entity' => $entity])
+-        ->call('assignRole', EntityMembership::where('user_id', $admin->id)->first()->id, 'admin')
+-        ->assertForbidden();
++        ->set('inviteEmail', 'race@example.com')
++        ->call('sendInvite')
++        ->assertHasErrors(['inviteEmail']);
+ 
+-    expect(EntityMembership::where('entity_id', $entity->id)->count())->toBe(2);
++    Mail::assertNothingQueued();
+ });
+ 
+-test('manager can assign admin or employee but never the owner role', function () {
++test('invites are rate limited to ten successful sends per manager and entity per hour', function () {
++    Mail::fake();
++
+     $admin = User::factory()->create();
+     $entity = Entity::factory()->create();
+-    $target = User::factory()->create();
+-    $membership = EntityMembership::factory()->for($entity)->for($target)->employee()->create();
+     EntityMembership::factory()->for($entity)->for($admin)->owner()->create();
+ 
+     $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
+ 
+-    // Valid promotion.
++    $component = Livewire::test(Members::class, ['entity' => $entity]);
++
++    // Invalid input does not consume the quota.
++    $component->set('inviteEmail', 'bad')->call('sendInvite')->assertHasErrors(['inviteEmail']);
++
++    for ($i = 1; $i <= 10; $i++) {
++        $component->set('inviteEmail', "guest{$i}@example.com")->call('sendInvite')->assertHasNoErrors();
++    }
++
++    $component->set('inviteEmail', 'guest11@example.com')
++        ->call('sendInvite')
++        ->assertHasErrors(['inviteEmail']);
++
++    expect(EntityInvite::count())->toBe(10);
++});
++
++test('a manager can cancel a pending invite of their entity only', function () {
++    $admin = User::factory()->create();
++    $entity = Entity::factory()->create();
++    $other = Entity::factory()->create();
++    EntityMembership::factory()->for($entity)->for($admin)->owner()->create();
++
++    $mine = EntityInvite::factory()->for($entity)->create();
++    $foreign = EntityInvite::factory()->for($other)->create();
++
++    $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
++
+     Livewire::test(Members::class, ['entity' => $entity])
+-        ->call('assignRole', $membership->id, 'admin')
++        ->call('cancelInvite', $mine->id)
+         ->assertHasNoErrors();
+ 
+-    expect($membership->fresh()->role)->toBe(UserRole::Admin);
++    expect(EntityInvite::whereKey($mine->id)->exists())->toBeFalse();
++
++    expect(fn () => Livewire::test(Members::class, ['entity' => $entity])
++        ->call('cancelInvite', $foreign->id))->toThrow(ModelNotFoundException::class);
++
++    expect(EntityInvite::whereKey($foreign->id)->exists())->toBeTrue();
++});
++
++test('opening a foreign membership fails with not-found and selects nothing', function () {
++    $admin = User::factory()->create();
++    $entity = Entity::factory()->create();
++    $other = Entity::factory()->create();
++    EntityMembership::factory()->for($entity)->for($admin)->owner()->create();
++    $foreign = EntityMembership::factory()->for($other)->employee()->create();
++
++    $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
++
++    expect(fn () => Livewire::test(Members::class, ['entity' => $entity])
++        ->call('openMember', $foreign->id))->toThrow(ModelNotFoundException::class);
++
++    expect(EntityMembership::whereKey($foreign->id)->exists())->toBeTrue();
++});
++
++test('openMember selects the membership and prefills the draft role', function () {
++    $admin = User::factory()->create();
++    $entity = Entity::factory()->create();
++    $target = User::factory()->create(['name' => 'Ana Souza']);
++    EntityMembership::factory()->for($entity)->for($admin)->owner()->create();
++    $membership = EntityMembership::factory()->for($entity)->for($target)->admin()->create();
++
++    $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
+ 
+-    // Tamper: owner role is not assignable here.
+     Livewire::test(Members::class, ['entity' => $entity])
+-        ->call('assignRole', $membership->id, 'owner')
+-        ->assertHasErrors('role');
++        ->call('openMember', $membership->id)
++        ->assertSet('selectedMembershipId', $membership->id)
++        ->assertSet('memberRole', 'admin')
++        ->assertSee('Ana Souza')
++        ->assertSeeHtml('<p class="modal-card-title">Member details</p>');
++});
++
++test('changing the draft role persists nothing until saveRole', function () {
++    $admin = User::factory()->create();
++    $entity = Entity::factory()->create();
++    $target = User::factory()->create();
++    EntityMembership::factory()->for($entity)->for($admin)->owner()->create();
++    $membership = EntityMembership::factory()->for($entity)->for($target)->employee()->create();
++
++    $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
++
++    $component = Livewire::test(Members::class, ['entity' => $entity])
++        ->call('openMember', $membership->id)
++        ->set('memberRole', 'admin');
++
++    expect($membership->fresh()->role)->toBe(UserRole::Employee);
++
++    $component->call('saveRole')->assertHasNoErrors();
+ 
+     expect($membership->fresh()->role)->toBe(UserRole::Admin);
+ });
+ 
+-test('cannot remove the last manager of an entity', function () {
++test('saveRole never assigns owner and the owner membership is immutable', function () {
++    $owner = User::factory()->create();
++    $entity = Entity::factory()->create();
++    $target = User::factory()->create();
++    $ownerMem = EntityMembership::factory()->for($entity)->for($owner)->owner()->create();
++    $membership = EntityMembership::factory()->for($entity)->for($target)->employee()->create();
++
++    $this->actingAs($owner)->post(route('entity.pick', $entity->slug));
++
++    Livewire::test(Members::class, ['entity' => $entity])
++        ->call('openMember', $membership->id)
++        ->set('memberRole', 'owner')
++        ->call('saveRole')
++        ->assertHasErrors(['memberRole']);
++
++    expect($membership->fresh()->role)->toBe(UserRole::Employee);
++
++    Livewire::test(Members::class, ['entity' => $entity])
++        ->call('openMember', $ownerMem->id)
++        ->set('memberRole', 'admin')
++        ->call('saveRole')
++        ->assertForbidden();
++
++    expect($ownerMem->fresh()->role)->toBe(UserRole::Owner);
++});
++
++test('the last manager cannot be demoted', function () {
+     $admin = User::factory()->create();
+-    $employee = User::factory()->create();
+     $entity = Entity::factory()->create();
+-    // Corrupt-but-possible state: no owner, single admin + employee.
+     $adminMem = EntityMembership::factory()->for($entity)->for($admin)->admin()->create();
+-    EntityMembership::factory()->for($entity)->for($employee)->employee()->create();
+ 
+     $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
+ 
+-    // Removing the employee is fine (not a manager).
+     Livewire::test(Members::class, ['entity' => $entity])
+-        ->call('removeMember', EntityMembership::where('user_id', $employee->id)->first()->id)
+-        ->assertHasNoErrors();
+-
+-    // Removing the last manager is forbidden — entity must keep one.
+-    Livewire::test(Members::class, ['entity' => $entity->fresh()])
+-        ->call('removeMember', $adminMem->id)
++        ->call('openMember', $adminMem->id)
++        ->set('memberRole', 'employee')
++        ->call('saveRole')
+         ->assertForbidden();
+ 
+-    expect(EntityMembership::where('id', $adminMem->id)->exists())->toBeTrue();
++    expect($adminMem->fresh()->role)->toBe(UserRole::Admin);
+ });
+ 
+-test('cannot remove the owner; managers can remove members', function () {
++test('removal goes through a confirmation modal', function () {
++    $admin = User::factory()->create();
++    $entity = Entity::factory()->create();
++    $employee = User::factory()->create(['name' => 'Bia']);
++    EntityMembership::factory()->for($entity)->for($admin)->owner()->create();
++    $membership = EntityMembership::factory()->for($entity)->for($employee)->employee()->create();
++
++    $this->actingAs($admin)->post(route('entity.pick', $entity->slug));
++
++    $component = Livewire::test(Members::class, ['entity' => $entity])
++        ->call('openMember', $membership->id)
++        ->call('confirmRemoval')
++        ->assertSet('confirmingRemoval', true)
++        ->assertSee('Remove member')
++        ->assertDontSee('wire:confirm', false);
++
++    $component->call('cancelRemoval')->assertSet('confirmingRemoval', false);
++    expect(EntityMembership::whereKey($membership->id)->exists())->toBeTrue();
++
++    $component->call('confirmRemoval')
++        ->call('removeMember', $membership->id)
++        ->assertHasNoErrors()
++        ->assertSet('selectedMembershipId', null)
++        ->assertSet('confirmingRemoval', false);
++
++    expect(EntityMembership::whereKey($membership->id)->exists())->toBeFalse();
++});
++
++test('the owner and the last manager cannot be removed', function () {
+     $owner = User::factory()->create();
+     $entity = Entity::factory()->create();
+-    $admin = User::factory()->create();
+-    $employee = User::factory()->create();
+     $ownerMem = EntityMembership::factory()->for($entity)->for($owner)->owner()->create();
+-    $adminMem = EntityMembership::factory()->for($entity)->for($admin)->admin()->create();
+-    EntityMembership::factory()->for($entity)->for($employee)->employee()->create();
+ 
+     $this->actingAs($owner)->post(route('entity.pick', $entity->slug));
+ 
+-    // Nobody (not even an admin) can remove the owner.
+     Livewire::test(Members::class, ['entity' => $entity])
+         ->call('removeMember', $ownerMem->id)
+         ->assertForbidden();
+ 
+-    expect(EntityMembership::where('id', $ownerMem->id)->exists())->toBeTrue();
++    expect(EntityMembership::whereKey($ownerMem->id)->exists())->toBeTrue();
++});
++
++test('managers can remove an employee', function () {
++    $owner = User::factory()->create();
++    $entity = Entity::factory()->create();
++    $employee = User::factory()->create();
++    EntityMembership::factory()->for($entity)->for($owner)->owner()->create();
++    $empMem = EntityMembership::factory()->for($entity)->for($employee)->employee()->create();
++
++    $this->actingAs($owner)->post(route('entity.pick', $entity->slug));
+ 
+-    // An admin can remove an employee.
+     Livewire::test(Members::class, ['entity' => $entity])
+-        ->call('removeMember', EntityMembership::where('user_id', $employee->id)->first()->id);
++        ->call('removeMember', $empMem->id)
++        ->assertHasNoErrors();
+ 
+-    expect(EntityMembership::where('user_id', $employee->id)->exists())->toBeFalse()
+-        ->and(EntityMembership::where('id', $ownerMem->id)->exists())->toBeTrue();
++    expect(EntityMembership::whereKey($empMem->id)->exists())->toBeFalse();
+ });
+diff --git a/tests/Feature/Entity/PendingInvitesTest.php b/tests/Feature/Entity/PendingInvitesTest.php
+new file mode 100644
+index 0000000..dfc81a2
+--- /dev/null
++++ b/tests/Feature/Entity/PendingInvitesTest.php
+@@ -0,0 +1,178 @@
++<?php
++
++use App\Livewire\Entity\PendingInvites;
++use App\Models\Entity;
++use App\Models\EntityInvite;
++use App\Models\EntityMembership;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Livewire\Livewire;
++
++uses(RefreshDatabase::class);
++
++test('the invitee accepts an invite, gets the role, and lands in the entity', function () {
++    $user = User::factory()->create(['email' => 'invitee@example.com']);
++    $entity = Entity::factory()->create(['slug' => 'acme']);
++    $invite = EntityInvite::factory()->for($entity)->create([
++        'email' => 'invitee@example.com',
++        'role' => UserRole::Admin,
++    ]);
++
++    Livewire::actingAs($user)
++        ->test(PendingInvites::class)
++        ->call('accept', $invite->id)
++        ->assertHasNoErrors()
++        ->assertRedirect(route('entity.dashboard', 'acme'));
++
++    $membership = EntityMembership::where('entity_id', $entity->id)->where('user_id', $user->id)->sole();
++
++    expect($membership->role)->toBe(UserRole::Admin)
++        ->and($invite->fresh()->isAccepted())->toBeTrue()
++        ->and(session('current_entity_id'))->toBe($entity->id);
++});
++
++test('accepting matches the e-mail case-insensitively', function () {
++    $user = User::factory()->create(['email' => 'Ana@Example.com']);
++    $entity = Entity::factory()->create();
++    $invite = EntityInvite::factory()->for($entity)->create(['email' => 'ana@example.com']);
++
++    Livewire::actingAs($user)
++        ->test(PendingInvites::class)
++        ->call('accept', $invite->id)
++        ->assertHasNoErrors();
++
++    expect(EntityMembership::where('user_id', $user->id)->where('role', UserRole::Employee->value)->exists())
++        ->toBeTrue();
++});
++
++test('someone else cannot accept or decline an invite', function () {
++    $other = User::factory()->create(['email' => 'other@example.com']);
++    $invite = EntityInvite::factory()->create(['email' => 'invitee@example.com']);
++
++    Livewire::actingAs($other)->test(PendingInvites::class)
++        ->call('accept', $invite->id)
++        ->assertForbidden();
++
++    Livewire::actingAs($other)->test(PendingInvites::class)
++        ->call('decline', $invite->id)
++        ->assertForbidden();
++
++    expect($invite->fresh()->isPending())->toBeTrue()
++        ->and(EntityMembership::count())->toBe(0);
++});
++
++test('an expired invite cannot be accepted', function () {
++    $user = User::factory()->create(['email' => 'invitee@example.com']);
++    $invite = EntityInvite::factory()->expired()->create(['email' => 'invitee@example.com']);
++
++    Livewire::actingAs($user)
++        ->test(PendingInvites::class)
++        ->call('accept', $invite->id)
++        ->assertHasErrors(['invite']);
++
++    expect(EntityMembership::count())->toBe(0)
++        ->and($invite->fresh()->accepted_at)->toBeNull();
++});
++
++test('accepting an already accepted invite is a silent no-op', function () {
++    $user = User::factory()->create(['email' => 'invitee@example.com']);
++    $entity = Entity::factory()->create();
++    $invite = EntityInvite::factory()->for($entity)->create([
++        'email' => 'invitee@example.com',
++        'accepted_at' => now()->subHour(),
++    ]);
++    EntityMembership::factory()->for($entity)->for($user)->employee()->create();
++
++    Livewire::actingAs($user)
++        ->test(PendingInvites::class)
++        ->call('accept', $invite->id)
++        ->assertHasNoErrors()
++        ->assertNoRedirect();
++
++    expect(EntityMembership::where('user_id', $user->id)->count())->toBe(1);
++});
++
++test('accepting never creates a duplicate membership', function () {
++    $user = User::factory()->create(['email' => 'invitee@example.com']);
++    $entity = Entity::factory()->create();
++    $invite = EntityInvite::factory()->for($entity)->create([
++        'email' => 'invitee@example.com',
++        'role' => UserRole::Admin,
++    ]);
++    EntityMembership::factory()->for($entity)->for($user)->employee()->create();
++
++    Livewire::actingAs($user)
++        ->test(PendingInvites::class)
++        ->call('accept', $invite->id)
++        ->assertHasNoErrors();
++
++    expect(EntityMembership::where('entity_id', $entity->id)->where('user_id', $user->id)->count())->toBe(1)
++        ->and($invite->fresh()->isAccepted())->toBeTrue();
++});
++
++test('the invitee declines an invite, which deletes it', function () {
++    $user = User::factory()->create(['email' => 'invitee@example.com']);
++    $invite = EntityInvite::factory()->create(['email' => 'invitee@example.com']);
++
++    Livewire::actingAs($user)
++        ->test(PendingInvites::class)
++        ->call('decline', $invite->id)
++        ->assertHasNoErrors();
++
++    expect(EntityInvite::whereKey($invite->id)->exists())->toBeFalse()
++        ->and(EntityMembership::count())->toBe(0);
++});
++
++test('only pending invites of the signed-in e-mail are listed', function () {
++    $user = User::factory()->create(['email' => 'invitee@example.com']);
++    $mine = EntityInvite::factory()->create(['email' => 'invitee@example.com']);
++    EntityInvite::factory()->create(['email' => 'invitee@example.com', 'accepted_at' => now()]);
++    EntityInvite::factory()->expired()->create(['email' => 'invitee@example.com']);
++    EntityInvite::factory()->create(['email' => 'someone@example.com']);
++
++    Livewire::actingAs($user)
++        ->test(PendingInvites::class)
++        ->assertViewHas('invites', fn ($invites) => $invites->pluck('id')->all() === [$mine->id]);
++});
++
++test('onboarding shows pending invites after the create form, separated by a rule', function () {
++    $user = User::factory()->create(['email' => 'invitee@example.com', 'email_verified_at' => now()]);
++    $entity = Entity::factory()->create(['name' => 'Padaria Central']);
++    EntityInvite::factory()->for($entity)->create(['email' => 'invitee@example.com']);
++
++    $this->actingAs($user)
++        ->withHeaders(['Accept-Language' => 'pt-BR'])
++        ->get(route('onboarding'))
++        ->assertOk()
++        ->assertSee('Convites pendentes')
++        ->assertSee('Padaria Central')
++        ->assertSee('Aceitar')
++        ->assertSee('Recusar')
++        ->assertSeeInOrder(['Criar', 'Convites pendentes'], false)
++        ->assertSee('<hr>', false);
++});
++
++test('onboarding renders no separator when there are no invites', function () {
++    $user = User::factory()->create(['email_verified_at' => now()]);
++
++    $this->actingAs($user)
++        ->withHeaders(['Accept-Language' => 'en'])
++        ->get(route('onboarding'))
++        ->assertOk()
++        ->assertDontSee('Pending invites')
++        ->assertDontSee('<hr>', false);
++});
++
++test('the entity switcher lists pending invites', function () {
++    $user = User::factory()->create(['email' => 'invitee@example.com', 'email_verified_at' => now()]);
++    $entity = Entity::factory()->create(['name' => 'Oficina Norte']);
++    EntityInvite::factory()->for($entity)->create(['email' => 'invitee@example.com']);
++
++    $this->actingAs($user)
++        ->withHeaders(['Accept-Language' => 'en'])
++        ->get(route('entity.switcher'))
++        ->assertOk()
++        ->assertSee('Oficina Norte')
++        ->assertSee('Pending invites');
++});
