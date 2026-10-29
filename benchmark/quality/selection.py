@@ -25,10 +25,11 @@ class Run:
     task: str
     tree: Path
     hidden_ok: bool
+    runs_root: Path = BENCH_DIR / "runs"      # tests point this at a temporary directory
 
     @property
     def run_dir(self) -> Path:
-        return BENCH_DIR / "runs" / self.run_id
+        return self.runs_root / self.run_id
 
     @property
     def patch(self) -> Path:
