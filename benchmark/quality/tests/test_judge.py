@@ -39,6 +39,16 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(a[next(r.run_id for r in runs if r.model == "claude-sonnet-5-5")], ["muse", "deepseek"])
         self.assertEqual(judge.assign(runs), a)            # deterministic
 
+    def test_self_family_judge(self):
+        runs = [self.run_(m, "none") for m in selection.ROUND_MODELS]
+        want = judge.wanted(runs, self_family=True)
+        got = {r.model: want.get(r.run_id) for r in runs}
+        self.assertEqual(got["claude-sonnet-5-5"], ["opus"])
+        self.assertEqual(got["opencode-go/muse-spark-1.3-contributor"], ["muse"])
+        self.assertEqual(got["opencode-go/deepseek-v4.1-flash"], ["deepseek"])
+        self.assertIsNone(got["llama/gpt-oss-20b"])                   # no judge of its family
+        self.assertNotEqual(judge.paths(None, True)["manifest"], judge.paths(None)["manifest"])
+
     def test_workspace_is_blind_and_drops_harness(self):
         patch = ("diff --git a/AGENTS.md b/AGENTS.md\n--- a/AGENTS.md\n+++ b/AGENTS.md\n@@ -1 +1 @@\n+x\n"
                  "diff --git a/app/A.php b/app/A.php\n--- a/app/A.php\n+++ b/app/A.php\n@@ -1 +1 @@\n"

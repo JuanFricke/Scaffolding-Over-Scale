@@ -228,6 +228,39 @@ def build(runs, name: str = "pilot") -> str:
         out(f"| {an} | {bn} | {fmt(spearman(xs, ys))} | {n} |")
     out("")
 
+    out("## Autopreferência: juiz da mesma família vs os dois de fora\n")
+    out("Revisões extras, fora das médias acima: Opus nos diffs de Sonnet/Haiku, Muse nos do Muse e "
+        "DeepSeek nos do DeepSeek. Δ = nota do juiz da família − média dos dois juízes de outras "
+        "famílias no mesmo run (Wilcoxon exato pareado).\n")
+    self_dir = judge.paths(None, self_family=True)["reviews"]
+    out("| juiz | autores | n | Δ geral | p | leniência fora da família | autopreferência | "
+        + " | ".join(f"Δ {d}" for d in DIMS) + " |")
+    out("|---|---|---|---|---|---|---|" + "---|" * len(DIMS))
+    for j in judge.JUDGES:
+        rows = []
+        for d in data.values():
+            f = self_dir / f"{d['run'].run_id}__{j}.json"
+            if f.exists() and len(d["reviews"]) >= 2:
+                rows.append((json.loads(f.read_text())["review"], list(d["reviews"].values())))
+        if not rows:
+            continue
+        authors = sorted({SHORT.get(d["run"].model, d["run"].model) for d in data.values()
+                          if judge.self_judge(d["run"]) == j})
+        diffs = [s["overall"] - mean([x["overall"] for x in o]) for s, o in rows]
+        _, p = wilcoxon_exact(diffs)
+        dims = [statistics.mean(s["scores"][dim]["score"] - mean([x["scores"][dim]["score"] for x in o])
+                                for s, o in rows) for dim in DIMS]
+        # how much more generous j is than the other judge on runs of other families
+        lenient = mean([d["reviews"][j]["overall"] - next(x["overall"] for k, x in d["reviews"].items() if k != j)
+                        for d in data.values() if j in d["reviews"] and len(d["reviews"]) == 2])
+        out(f"| {j} | {', '.join(authors)} | {len(rows)} | {statistics.mean(diffs):+.2f} | {p:.3f} | "
+            f"{fmt(lenient, 2)} | {statistics.mean(diffs) - (lenient or 0):+.2f} | "
+            + " | ".join(f"{x:+.2f}" for x in dims) + " |")
+    out("")
+    out("Leniência fora da família: média de (nota do juiz − nota do outro juiz) nos runs de outras "
+        "famílias, ou seja, o quanto ele já é mais generoso em geral. Autopreferência = Δ geral − "
+        "leniência. Os Δ por dimensão não descontam a leniência.\n")
+
     out("## Convenções: quantas vezes cada regra se aplicou e foi cumprida\n")
     out("| regra | descrição | aplica | cumpre |")
     out("|---|---|---|---|")

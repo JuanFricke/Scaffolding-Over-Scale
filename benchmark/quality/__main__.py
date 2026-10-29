@@ -80,6 +80,7 @@ def cmd_status(args):
     try:
         from . import judge
         print(judge.status(rs))
+        print(judge.status(rs, self_family=True))
     except ImportError:
         pass
 
@@ -102,6 +103,8 @@ def main() -> None:
             p.add_argument("--tag", help="smoke runs: separate manifest, kept out of the data")
             p.add_argument("--max-reviews", type=int)
             p.add_argument("--dry-run", action="store_true")
+            p.add_argument("--self-family", action="store_true",
+                           help="the excluded same-family judge only (separate manifest, self-preference check)")
         if name == "analyze":
             p.add_argument("--name", default="pilot")
     args = ap.parse_args()
