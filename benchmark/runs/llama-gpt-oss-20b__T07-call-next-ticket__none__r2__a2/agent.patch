@@ -1,0 +1,197 @@
+diff --git a/app/Actions/CallNextTicket.php b/app/Actions/CallNextTicket.php
+new file mode 100644
+index 0000000..2a14ebc
+--- /dev/null
++++ b/app/Actions/CallNextTicket.php
+@@ -0,0 +1,122 @@
++<?php
++
++namespace App\Actions;
++
++use App\Enums\CallMode;
++use App\Exceptions\InactiveQueueException;
++use App\Exceptions\NoWaitingTicketsException;
++use App\Models\Queue;
++use App\Models\Ticket;
++use App\Models\User;
++
++use App\Enums\TicketStatus;
++
++use Illuminate\Support\Facades\DB;
++
++/**
++ * Call the next ticket in a queue according to the specified mode.
++ *
++ * This action is a pure domain operation that does not depend on HTTP or
++ * authorization layers. It performs the following steps inside a single
++ * database transaction:
++ *   1. Locks the queue row to read its current active status.
++ *   2. Determines the fairness rule when the mode is `Any`.
++ *   3. Builds a candidate query according to the mode and the fairness
++ *      restriction (if any).
++ *   4. Loops, locking each candidate ticket and verifying it is still
++ *      waiting, then marks it as called.
++ *   5. Throws a dedicated exception if no eligible ticket is found.
++ *
++ * @throws InactiveQueueException
++ * @throws NoWaitingTicketsException
++ */
++class CallNextTicket
++{
++    public function __invoke(Queue $queue, User $calledBy, CallMode $mode = CallMode::Any): Ticket
++    {
++        // Ensure the queue is still active and lock the row.
++        $ticket = DB::transaction(function () use ($queue, $calledBy, $mode) {
++            $lockedQueue = Queue::query()->whereKey($queue->id)->lockForUpdate()->firstOrFail();
++
++            if (! $lockedQueue->is_active) {
++                throw new InactiveQueueException('Cannot call ticket on an inactive queue.');
++            }
++
++            $queueId = $lockedQueue->id;
++
++            // Determine if fairness applies (only relevant for CallMode::Any).
++            $fairnessEnforced = false;
++            if ($mode === CallMode::Any) {
++                $lastCalled = Ticket::query()
++                    ->where('queue_id', $queueId)
++                    ->where('status', TicketStatus::Called)
++                    ->orderByDesc('called_at')
++                    ->orderByDesc('id')
++                    ->limit(3)
++                    ->get();
++
++                if ($lastCalled->count() === 3 && $lastCalled->every(fn (Ticket $t) => $t->priority > 0)) {
++                    // At least one normal waiting ticket must exist to trigger fairness.
++                    $hasNormalWaiting = Ticket::query()
++                        ->where('queue_id', $queueId)
++                        ->where('status', TicketStatus::Waiting)
++                        ->where('priority', 0)
++                        ->exists();
++                    if ($hasNormalWaiting) {
++                        $fairnessEnforced = true;
++                    }
++                }
++            }
++
++            // Build the candidate query.
++            $query = Ticket::query()
++                ->where('queue_id', $queueId)
++                ->where('status', TicketStatus::Waiting);
++
++            if ($mode === CallMode::PriorityOnly) {
++                $query->where('priority', '>', 0);
++            } elseif ($mode === CallMode::NormalOnly) {
++                $query->where('priority', 0);
++            } elseif ($fairnessEnforced) {
++                // Only normal tickets allowed.
++                $query->where('priority', 0);
++            }
++
++            // Ordering
++            if ($mode === CallMode::NormalOnly || $fairnessEnforced) {
++                $query->orderBy('issued_at')
++                    ->orderBy('id');
++            } else {
++                $query->orderByDesc('priority')
++                    ->orderBy('issued_at')
++                    ->orderBy('id');
++            }
++
++            // Loop to handle potential race conditions.
++            while (true) {
++                $candidate = $query->lockForUpdate()->first();
++
++                if (! $candidate) {
++                    throw new NoWaitingTicketsException('No waiting tickets available for the requested mode.');
++                }
++
++                // Re-check status after acquiring lock.
++                if ($candidate->status !== TicketStatus::Waiting) {
++                    // It was called by another process; retry.
++                    continue;
++                }
++
++                // Mark as called.
++                $candidate->status = TicketStatus::Called;
++                $candidate->called_at = now();
++                $candidate->called_by_user_id = $calledBy->id;
++                $candidate->save();
++
++                return $candidate;
++            }
++        });
++
++        // After transaction, refresh the ticket to return latest state.
++        return $ticket;
++    }
++}
+diff --git a/app/Enums/CallMode.php b/app/Enums/CallMode.php
+new file mode 100644
+index 0000000..26e15cf
+--- /dev/null
++++ b/app/Enums/CallMode.php
+@@ -0,0 +1,10 @@
++<?php
++
++namespace App\Enums;
++
++enum CallMode: string
++{
++    case Any = 'any';
++    case PriorityOnly = 'priority_only';
++    case NormalOnly = 'normal_only';
++}
+diff --git a/app/Exceptions/NoWaitingTicketsException.php b/app/Exceptions/NoWaitingTicketsException.php
+new file mode 100644
+index 0000000..81732e5
+--- /dev/null
++++ b/app/Exceptions/NoWaitingTicketsException.php
+@@ -0,0 +1,10 @@
++<?php
++
++namespace App\Exceptions;
++
++use RuntimeException;
++
++class NoWaitingTicketsException extends RuntimeException
++{
++    // No additional behavior needed
++}
+diff --git a/docs/architecture.md b/docs/architecture.md
+index a2550af..e4b9e2c 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -100,6 +100,15 @@ ### Issue a ticket
+ 
+ ### Call the next ticket
+ 
++The domain action `App\Actions\CallNextTicket` orchestrates the deterministic calling of tickets:
++
++1. **Transaction & locking** – The queue row is locked (`FOR UPDATE`) to check that it remains active. All subsequent reads and updates occur inside the same transaction.
++2. **Fairness** – When the mode is *Any*, the algorithm checks the last three called tickets. If all three were priority and a normal ticket is waiting, the next call is forced to a normal ticket.
++3. **Ordering** – Waiting tickets are ordered by priority (higher first), then by issuance time (oldest first) and finally by id. Priority‑only and normal‑only modes filter the candidate set accordingly.
++4. **Concurrency protection** – The candidate ticket is locked (`FOR UPDATE`) and its status is re‑verified. If another attendant has already called it, the loop retries with the next candidate.
++5. **Result** – The selected ticket is marked as called, timestamps and the caller user are recorded, and the updated ticket model is returned.
++
++All operations are performed atomically to guarantee that no two attendants can call the same ticket concurrently.
+ ```text
+ Attendant
+    |
+diff --git a/docs/business-rules.md b/docs/business-rules.md
+index 6f98015..f99d2fb 100644
+--- a/docs/business-rules.md
++++ b/docs/business-rules.md
+@@ -130,6 +130,12 @@ ### Call Panel (attendant)
+ 
+ After each call, the ticket leaves the waiting queue and enters the session/display call history.
+ 
++> The domain action `App\Actions\CallNextTicket` implements the deterministic selection algorithm. It:
++> * Locks the queue row to verify activity.
++> * Applies the fairness rule (no more than 3 consecutive priority calls before a normal ticket).
++> * Orders waiting tickets by priority (higher first), issuance time, and id.
++> * Handles concurrent calls safely by re‑checking the ticket status after locking each candidate.
++
+ ## Display and Issuance Channels
+ 
+ | Channel | Implementation | Function |

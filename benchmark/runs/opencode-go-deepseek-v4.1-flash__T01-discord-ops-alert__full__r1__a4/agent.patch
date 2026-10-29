@@ -1,0 +1,572 @@
+diff --git a/.env.example b/.env.example
+index ee2974c..2cd2bc3 100644
+--- a/.env.example
++++ b/.env.example
+@@ -16,10 +16,16 @@ APP_MAINTENANCE_DRIVER=file
+ BCRYPT_ROUNDS=12
+ 
+ LOG_CHANNEL=stack
+-LOG_STACK=single
++LOG_STACK=daily
++LOG_DAILY_DAYS=14
++LOG_AUDIT_LEVEL=info
++LOG_AUDIT_DAYS=90
+ LOG_DEPRECATIONS_CHANNEL=null
+ LOG_LEVEL=debug
+ 
++# Ops alerts (Discord incoming webhook). Leave blank to disable paging.
++DISCORD_WEBHOOK_URL=
++
+ DB_CONNECTION=mariadb
+ DB_HOST=127.0.0.1
+ DB_PORT=3306
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4bd35fa..ef64207 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,8 @@ ## [Unreleased]
+ 
+ ### Added
+ 
++- Discord ops alert notifier (`App\Ops\DiscordOpsAlert`) for human-pageable incidents, with context redaction, truncation and soft-fail logging.
++- Audit logging channel (`storage/logs/audit.log`, 90-day retention) and the three-lane observability guide in [`docs/ops/logging.md`](docs/ops/logging.md).
+ - Database schema and Mermaid diagram in [`docs/database-schema.md`](docs/database-schema.md).
+ - Business rules documentation in [`docs/business-rules.md`](docs/business-rules.md): MVP queue management, entity/subscription, roles (admin, owner, employee), tickets, priorities, fairness (3-ticket rule), deterministic call panel, and channels (Flutter totem, web TV, attendant).
+ - This changelog (Keep a Changelog).
+diff --git a/app/Ops/DiscordOpsAlert.php b/app/Ops/DiscordOpsAlert.php
+new file mode 100644
+index 0000000..91d6547
+--- /dev/null
++++ b/app/Ops/DiscordOpsAlert.php
+@@ -0,0 +1,159 @@
++<?php
++
++namespace App\Ops;
++
++use Illuminate\Support\Facades\Http;
++use Illuminate\Support\Facades\Log;
++use Throwable;
++
++/**
++ * Sends human-pageable operations incidents to a Discord incoming webhook.
++ *
++ * Discord is deliberately not a Monolog channel: application code decides when
++ * an incident is worth paging someone. Every failure is soft — the notifier
++ * never throws and never leaks the webhook token into the logs.
++ */
++class DiscordOpsAlert
++{
++    private const MAX_LENGTH = 1800;
++
++    private const TIMEOUT_SECONDS = 5;
++
++    /**
++     * Key fragments that mark a context value as sensitive.
++     *
++     * @var list<string>
++     */
++    private const SENSITIVE_KEY_FRAGMENTS = [
++        'password',
++        'token',
++        'secret',
++        'authorization',
++        'api_key',
++        'api-key',
++        'apikey',
++        'webhook',
++    ];
++
++    /**
++     * Send one alert. A missing webhook configuration is a silent no-op.
++     */
++    public function send(string $title, string $message, array $context = []): void
++    {
++        $webhookUrl = config('services.discord.webhook_url');
++
++        if (blank($webhookUrl)) {
++            return;
++        }
++
++        $webhookUrl = (string) $webhookUrl;
++
++        try {
++            $content = $this->content($title, $message, $context);
++
++            $response = Http::timeout(self::TIMEOUT_SECONDS)->post($webhookUrl, [
++                'content' => $content,
++            ]);
++
++            if (! $response->successful()) {
++                Log::error('Discord ops alert failed', [
++                    'status' => $response->status(),
++                ]);
++            }
++        } catch (Throwable $exception) {
++            Log::error('Discord ops alert failed', [
++                'exception' => $this->scrub($exception->getMessage(), $webhookUrl),
++            ]);
++        }
++    }
++
++    /**
++     * Build the Discord message body, redacting and truncating it.
++     */
++    private function content(string $title, string $message, array $context): string
++    {
++        $lines = [$title, $message];
++
++        foreach ($context as $key => $value) {
++            $lines[] = $key.'='.$this->renderValue((string) $key, $value);
++        }
++
++        return mb_substr(implode("\n", $lines), 0, self::MAX_LENGTH);
++    }
++
++    /**
++     * Render a single context value, redacting it first when needed.
++     */
++    private function renderValue(string $key, mixed $value): string
++    {
++        if ($this->isSensitiveKey($key)) {
++            return '[redacted]';
++        }
++
++        if (is_array($value)) {
++            return (string) json_encode(
++                $this->redactArray($value),
++                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE,
++            );
++        }
++
++        if (is_string($value) && $this->containsBearerCredential($value)) {
++            return '[redacted]';
++        }
++
++        return match (true) {
++            $value === null => '',
++            $value === true => 'true',
++            $value === false => 'false',
++            default => (string) $value,
++        };
++    }
++
++    /**
++     * Redact an associative array recursively using the same rules.
++     */
++    private function redactArray(array $values): array
++    {
++        $redacted = [];
++
++        foreach ($values as $key => $value) {
++            if (is_string($key) && $this->isSensitiveKey($key)) {
++                $redacted[$key] = '[redacted]';
++            } elseif (is_array($value)) {
++                $redacted[$key] = $this->redactArray($value);
++            } elseif (is_string($value) && $this->containsBearerCredential($value)) {
++                $redacted[$key] = '[redacted]';
++            } else {
++                $redacted[$key] = $value;
++            }
++        }
++
++        return $redacted;
++    }
++
++    private function isSensitiveKey(string $key): bool
++    {
++        $key = strtolower($key);
++
++        foreach (self::SENSITIVE_KEY_FRAGMENTS as $fragment) {
++            if (str_contains($key, $fragment)) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++
++    private function containsBearerCredential(string $value): bool
++    {
++        return preg_match('/bearer\s+\S+/i', $value) === 1;
++    }
++
++    /**
++     * Remove the webhook URL (which embeds its token) from log output.
++     */
++    private function scrub(string $value, string $webhookUrl): string
++    {
++        return str_replace($webhookUrl, '[redacted]', $value);
++    }
++}
+diff --git a/config/logging.php b/config/logging.php
+index b09cb25..04ca9a5 100644
+--- a/config/logging.php
++++ b/config/logging.php
+@@ -54,7 +54,7 @@
+ 
+         'stack' => [
+             'driver' => 'stack',
+-            'channels' => explode(',', (string) env('LOG_STACK', 'single')),
++            'channels' => explode(',', (string) env('LOG_STACK', 'daily')),
+             'ignore_exceptions' => false,
+         ],
+ 
+@@ -73,6 +73,14 @@
+             'replace_placeholders' => true,
+         ],
+ 
++        'audit' => [
++            'driver' => 'daily',
++            'path' => storage_path('logs/audit.log'),
++            'level' => env('LOG_AUDIT_LEVEL', 'info'),
++            'days' => env('LOG_AUDIT_DAYS', 90),
++            'replace_placeholders' => true,
++        ],
++
+         'slack' => [
+             'driver' => 'slack',
+             'url' => env('LOG_SLACK_WEBHOOK_URL'),
+diff --git a/config/services.php b/config/services.php
+index 6a90eb8..90184db 100644
+--- a/config/services.php
++++ b/config/services.php
+@@ -35,4 +35,8 @@
+         ],
+     ],
+ 
++    'discord' => [
++        'webhook_url' => env('DISCORD_WEBHOOK_URL'),
++    ],
++
+ ];
+diff --git a/docs/ops/devops.md b/docs/ops/devops.md
+index 11d701d..1504f6a 100644
+--- a/docs/ops/devops.md
++++ b/docs/ops/devops.md
+@@ -29,6 +29,8 @@ ## Controller (`bin/pf`)
+ 
+ Config (`.env`): `HOSTINGER_API`, `PF_VPS_ID`, `PF_DOMAIN`, `PF_PROJECT`, `PF_GIT_URL`, `PF_GIT_REF`, `TELESCOPE_ENABLED`.
+ 
++Observability lanes (archive / audit / Discord alerts): [`logging.md`](logging.md).
++
+ ## VPS target
+ 
+ - VM **700899** (`103.199.186.228`), Ubuntu + Docker
+diff --git a/docs/ops/logging.md b/docs/ops/logging.md
+new file mode 100644
+index 0000000..dd5d4e8
+--- /dev/null
++++ b/docs/ops/logging.md
+@@ -0,0 +1,132 @@
++# Logging and ops alerts
++
++PegaFila has three observability lanes. Pick the lane based on **who needs the
++information** and **how long it must survive**, not on how important the message
++feels in the moment.
++
++| Lane | Where it goes | Retention | Use it for |
++| --- | --- | --- | --- |
++| **Archive** | `storage/logs/laravel-YYYY-MM-DD.log` (`daily`) | 14 days | Routine application logs: debug, info, warnings and handled errors. This is the default `Log::` lane. |
++| **Audit** | `storage/logs/audit-YYYY-MM-DD.log` (`audit`) | 90 days | Durable "who changed what / who tried what" trail: membership role changes, subscription transitions, login lockouts, authorization denials. |
++| **Alert** | Discord incoming webhook | Discord history | Human-pageable ops incidents: exhausted jobs, failing payment-gateway webhooks, plan limits blocking an entity. |
++
++Discord is **not** a Monolog channel. An alert is an explicit call made by code
++that decides an incident is worth waking someone up for. Discord does not
++replace the archive or audit trail.
++
++## Decision guide
++
++1. **Does a person need to act now, outside normal working hours?**
++   Send an alert with `App\Ops\DiscordOpsAlert`. Also log the same incident to
++   the archive lane if it is useful for debugging.
++2. **Is this a durable record of a user or system decision?**
++   Write to the `audit` channel. Audit entries should name the actor, the
++   subject and the outcome (for example `actor_id`, `entity_id`, `from`,
++   `to`, `result`). Never put secrets or raw credentials in an audit entry.
++3. **Everything else** is an archive entry. Use the normal `Log` facade at the
++   appropriate level (`debug`, `info`, `warning`, `error`).
++
++If an event fits both audit and alert (for example a plan limit blocking an
++entity), write the audit record and send the alert. They answer different
++questions: "what happened and who did it?" versus "does someone need to fix it
++now?".
++
++## Archive lane
++
++The default `stack` logs to `daily`, which writes `storage/logs/laravel.log`
++and rotates it every day.
++
++```php
++Log::info('Queue ticket issued', ['queue_id' => $queue->id, 'ticket_id' => $ticket->id]);
++Log::error('Asaas webhook failed', ['event' => $event, 'status' => $status]);
++```
++
++Configuration (`.env`):
++
++| Key | Default | Meaning |
++| --- | --- | --- |
++| `LOG_STACK` | `daily` | Channels in the default stack. Keep `daily`. |
++| `LOG_DAILY_DAYS` | `14` | Days of archive logs to keep. |
++| `LOG_LEVEL` | `debug` | Minimum level for the archive lane. |
++
++## Audit lane
++
++Write audit entries explicitly through the `audit` channel:
++
++```php
++Log::channel('audit')->info('Subscription status changed', [
++    'actor_id' => $actor->id,
++    'entity_id' => $entity->id,
++    'from' => $oldStatus,
++    'to' => $newStatus,
++]);
++
++Log::channel('audit')->warning('Login locked out', [
++    'email' => $email,
++    'ip' => $request->ip(),
++]);
++```
++
++Configuration (`.env`):
++
++| Key | Default | Meaning |
++| --- | --- | --- |
++| `LOG_AUDIT_LEVEL` | `info` | Minimum level accepted by the audit lane. |
++| `LOG_AUDIT_DAYS` | `90` | Days of audit logs to keep. |
++
++Audit logs are still files on the application server. Do not log passwords,
++tokens, full card data or other secrets — see the redaction rules below.
++
++## Alert lane
++
++Send a pageable incident with the container-resolvable notifier:
++
++```php
++use App\Ops\DiscordOpsAlert;
++
++app(DiscordOpsAlert::class)->send(
++    'Asaas webhook exhausted retries',
++    'The payment webhook job failed after all attempts.',
++    [
++        'queue' => 'asaas-webhooks',
++        'entity_id' => 42,
++    ],
++);
++```
++
++The message is built as:
++
++```text
++<title>
++<message>
++key=value
++key=value
++```
++
++It is truncated to 1800 characters (multibyte-safe) to stay under Discord's
++2000-character limit. Context values are redacted before sending:
++
++- keys containing `password`, `token`, `secret`, `authorization`,
++  `api_key`/`api-key`/`apikey` or `webhook` become `[redacted]`;
++- any string containing a `Bearer <credential>` value becomes `[redacted]`;
++- nested arrays are redacted recursively and rendered as JSON.
++
++Configuration (`.env`):
++
++| Key | Default | Meaning |
++| --- | --- | --- |
++| `DISCORD_WEBHOOK_URL` | empty (disabled) | Discord incoming webhook URL. When empty, `send()` is a silent no-op and makes no HTTP request. |
++
++The notifier is deliberately soft-fail: a non-2xx response or a transport
++error is logged at `error` level and the caller continues. The webhook URL is
++scrubbed from those logs because it embeds the webhook token.
++
++Treat `DISCORD_WEBHOOK_URL` as a secret: it belongs in the environment/secret
++store, never in code, docs or committed `.env` files.
++
++## Local and test environments
++
++- `.env.example` ships the keys with safe defaults.
++- `phpunit.xml` pins `LOG_STACK=daily` so tests do not depend on a local `.env`.
++- Leaving `DISCORD_WEBHOOK_URL` blank keeps tests and local development from
++  paging anyone; tests that exercise the notifier should use `Http::fake()`.
+diff --git a/phpunit.xml b/phpunit.xml
+index e7f0a48..ba64271 100644
+--- a/phpunit.xml
++++ b/phpunit.xml
+@@ -26,6 +26,7 @@
+         <env name="DB_CONNECTION" value="sqlite"/>
+         <env name="DB_DATABASE" value=":memory:"/>
+         <env name="DB_URL" value=""/>
++        <env name="LOG_STACK" value="daily"/>
+         <env name="MAIL_MAILER" value="array"/>
+         <env name="QUEUE_CONNECTION" value="sync"/>
+         <env name="SESSION_DRIVER" value="array"/>
+diff --git a/tests/Feature/Ops/DiscordOpsAlertTest.php b/tests/Feature/Ops/DiscordOpsAlertTest.php
+new file mode 100644
+index 0000000..7b2ba5f
+--- /dev/null
++++ b/tests/Feature/Ops/DiscordOpsAlertTest.php
+@@ -0,0 +1,122 @@
++<?php
++
++use App\Ops\DiscordOpsAlert;
++use Illuminate\Http\Client\ConnectionException;
++use Illuminate\Http\Client\Request;
++use Illuminate\Support\Facades\Http;
++use Illuminate\Support\Facades\Log;
++
++beforeEach(function () {
++    config()->set('services.discord.webhook_url', 'https://discord.example/api/webhooks/123/secret-token');
++});
++
++test('it does nothing when the webhook is not configured', function (?string $webhook) {
++    config()->set('services.discord.webhook_url', $webhook);
++
++    Http::fake();
++
++    (new DiscordOpsAlert)->send('Title', 'Message');
++
++    Http::assertNothingSent();
++})->with([
++    'null' => [null],
++    'empty string' => [''],
++]);
++
++test('it posts the title, message and context to the configured webhook', function () {
++    Http::fake();
++
++    (new DiscordOpsAlert)->send('Job failed', 'The webhook job exhausted its retries.', [
++        'queue' => 'asaas-webhooks',
++        'entity_id' => 42,
++    ]);
++
++    Http::assertSent(function (Request $request) {
++        return $request->method() === 'POST'
++            && $request->url() === 'https://discord.example/api/webhooks/123/secret-token'
++            && $request->data() === [
++                'content' => "Job failed\nThe webhook job exhausted its retries.\nqueue=asaas-webhooks\nentity_id=42",
++            ];
++    });
++});
++
++test('it truncates the content to 1800 multibyte characters', function () {
++    Http::fake();
++
++    (new DiscordOpsAlert)->send('Title', str_repeat('é', 3000));
++
++    Http::assertSent(function (Request $request) {
++        return mb_strlen($request->data()['content']) === 1800;
++    });
++});
++
++test('it redacts sensitive context values', function () {
++    Http::fake();
++
++    (new DiscordOpsAlert)->send('Title', 'Message', [
++        'password' => 'super-secret',
++        'API_KEY' => 'key-value',
++        'webhook_url' => 'https://example.test/hook',
++        'note' => 'Authorization: Bearer abc123',
++        'queue' => 'asaas-webhooks',
++        'payload' => [
++            'token' => 'nested-secret',
++            'queue' => 'asaas-webhooks',
++            'header' => 'Bearer nested-token',
++        ],
++    ]);
++
++    Http::assertSent(function (Request $request) {
++        $lines = explode("\n", $request->data()['content']);
++
++        expect($lines)->toContain(
++            'password=[redacted]',
++            'API_KEY=[redacted]',
++            'webhook_url=[redacted]',
++            'note=[redacted]',
++            'queue=asaas-webhooks',
++        );
++
++        $payloadLine = collect($lines)->first(fn (string $line) => str_starts_with($line, 'payload='));
++
++        $payload = json_decode(substr($payloadLine, strlen('payload=')), true);
++
++        expect($payload)->toBe([
++            'token' => '[redacted]',
++            'queue' => 'asaas-webhooks',
++            'header' => '[redacted]',
++        ]);
++
++        return true;
++    });
++});
++
++test('it logs an error without leaking the webhook when discord answers with a failure', function () {
++    Log::spy();
++    Http::fake(['*' => Http::response('nope', 500)]);
++
++    (new DiscordOpsAlert)->send('Title', 'Message');
++
++    Log::shouldHaveReceived('error')
++        ->once()
++        ->withArgs(fn (string $message, array $context = []) => str_contains($message, 'Discord ops alert failed')
++            && str_contains(json_encode($context), '500')
++            && ! str_contains($message, 'secret-token')
++            && ! str_contains(json_encode($context), 'secret-token'));
++});
++
++test('it logs an error without leaking the webhook when the transport throws', function () {
++    Log::spy();
++
++    Http::fake(function () {
++        throw new ConnectionException('Connection to https://discord.example/api/webhooks/123/secret-token failed');
++    });
++
++    (new DiscordOpsAlert)->send('Title', 'Message');
++
++    Log::shouldHaveReceived('error')
++        ->once()
++        ->withArgs(fn (string $message, array $context = []) => str_contains($message, 'Discord ops alert failed')
++            && ! str_contains($message, 'secret-token')
++            && ! str_contains(json_encode($context), 'secret-token'));
++});
+diff --git a/tests/Feature/Ops/LoggingChannelsTest.php b/tests/Feature/Ops/LoggingChannelsTest.php
+new file mode 100644
+index 0000000..84ec043
+--- /dev/null
++++ b/tests/Feature/Ops/LoggingChannelsTest.php
+@@ -0,0 +1,34 @@
++<?php
++
++use Illuminate\Support\Facades\Log;
++
++test('the daily channel is the archive lane', function () {
++    $daily = config('logging.channels.daily');
++
++    expect($daily['driver'])->toBe('daily')
++        ->and($daily['path'])->toEndWith('logs/laravel.log')
++        ->and($daily['days'])->toBe(14);
++});
++
++test('the audit channel writes to its own rotated file', function () {
++    $audit = config('logging.channels.audit');
++
++    expect($audit['driver'])->toBe('daily')
++        ->and($audit['path'])->toEndWith('logs/audit.log')
++        ->and($audit['days'])->toBe(90)
++        ->and($audit['level'])->toBe('info');
++});
++
++test('the stack logs to the archive channel', function () {
++    expect(config('logging.channels.stack.channels'))->toContain('daily');
++});
++
++test('there is no discord logging channel', function () {
++    expect(config('logging.channels'))->not->toHaveKey('discord');
++});
++
++test('the audit channel accepts writes', function () {
++    Log::channel('audit')->info('Subscription status changed', ['entity_id' => 42]);
++
++    expect(true)->toBeTrue();
++});

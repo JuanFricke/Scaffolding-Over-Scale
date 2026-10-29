@@ -1,0 +1,1111 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 075fd17..1f10295 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -19,6 +19,7 @@ ### Added
+ - CI: Pest test gate on PRs/push via `bin/pf shell` ([#21](https://github.com/PegaFila/PegaFilaWeb/pull/21)).
+ - Queue management domain slice: `CreateQueue`/`UpdateQueue` (no delete — deactivation preserves tickets), `queue_access` grants (`QueuePermission::call` only), `SetQueueAccess` with audit trail, `QueuePolicy` as the centralized authorization source, and the same call rule enforced by both `CallNextTicket` and `Ticket::call`.
+ - Editor/agent LSP support: Intelephense (general PHP) and first-party Laravel LSP (routes, views/Blade, config, Livewire) wired via `opencode.json`, shared `.claude/settings.json`, and `.vscode/` workspace settings ([#25](https://github.com/PegaFila/PegaFilaWeb/pull/25)).
++- Daily priority-prefixed ticket codes: default `N`/`P`/`E` letters by priority, optional per-queue `priority_prefix_map` override (validated by the `Queue` model, managed through `UpdateQueue`), and separate per-day/per-prefix sequences backed by `tickets.issue_date` and the `(queue_id, code, issue_date)` unique index.
+ 
+ ### Changed
+ 
+diff --git a/app/Actions/IssueTicket.php b/app/Actions/IssueTicket.php
+index 2feb3b3..2405b94 100644
+--- a/app/Actions/IssueTicket.php
++++ b/app/Actions/IssueTicket.php
+@@ -22,12 +22,18 @@ public function __invoke(
+             throw new InvalidArgumentException('Priority must be zero or greater.');
+         }
+ 
++        // Read the clock once: the code day, issued_at and issue_date must all
++        // describe the same instant even when issuance straddles midnight.
++        $issuedAt = now();
++        $issueDate = $issuedAt->toDateString();
++
+         // Queue-row lock serializes issuance + deactivation on MariaDB.
+         // lockForUpdate() is a no-op on SQLite (tests), so retry the
+-        // transaction on unique(queue_id, code) collision as a safety net.
++        // transaction on unique(queue_id, code, issue_date) collision as a
++        // safety net.
+         for ($attempt = 1; ; $attempt++) {
+             try {
+-                return DB::transaction(function () use ($queue, $priority, $channel): Ticket {
++                return DB::transaction(function () use ($queue, $priority, $channel, $issuedAt, $issueDate): Ticket {
+                     // Lock the queue row before checking state and allocating a number so
+                     // concurrent issuances and queue deactivation are serialized.
+                     $lockedQueue = Queue::query()
+@@ -39,17 +45,20 @@ public function __invoke(
+                         throw new InactiveQueueException('Cannot issue a ticket into an inactive queue.');
+                     }
+ 
+-                    $code = Ticket::nextCode($lockedQueue->id);
++                    $prefix = $lockedQueue->prefixForPriority($priority);
++                    $code = Ticket::nextCode($lockedQueue->id, $prefix, $issueDate);
+ 
+-                    // System-set fields (code/status/issued_at) are not fillable by
+-                    // design, so bypass mass-assignment here with trusted data.
++                    // System-set fields (code/status/issued_at/issue_date) are not
++                    // fillable by design, so bypass mass-assignment here with
++                    // trusted data.
+                     return Ticket::query()->forceCreate([
+                         'queue_id' => $lockedQueue->id,
+                         'code' => $code,
+                         'priority' => $priority,
+                         'channel' => $channel,
+                         'status' => TicketStatus::Waiting,
+-                        'issued_at' => now(),
++                        'issued_at' => $issuedAt,
++                        'issue_date' => $issueDate,
+                     ]);
+                 });
+             } catch (QueryException $e) {
+diff --git a/app/Actions/UpdateQueue.php b/app/Actions/UpdateQueue.php
+index 75b3abb..4de90c1 100644
+--- a/app/Actions/UpdateQueue.php
++++ b/app/Actions/UpdateQueue.php
+@@ -8,6 +8,7 @@
+ use Illuminate\Support\Facades\Gate;
+ use Illuminate\Support\Str;
+ use Illuminate\Validation\ValidationException;
++use InvalidArgumentException;
+ 
+ class UpdateQueue
+ {
+@@ -17,9 +18,25 @@ public function __invoke(
+         ?string $name = null,
+         ?string $slug = null,
+         ?bool $isActive = null,
++        ?array $priorityPrefixMap = null,
+     ): Queue {
+         Gate::forUser($actor)->authorize('update', $queue);
+ 
++        // Normalize before touching any other field so an invalid map leaves
++        // both the database row and this instance unchanged. null = unchanged,
++        // [] = clear back to the default map.
++        $priorityPrefixMapProvided = $priorityPrefixMap !== null;
++
++        if ($priorityPrefixMapProvided) {
++            try {
++                $priorityPrefixMap = Queue::normalizePriorityPrefixMap($priorityPrefixMap);
++            } catch (InvalidArgumentException $e) {
++                throw ValidationException::withMessages([
++                    'priority_prefix_map' => $e->getMessage(),
++                ]);
++            }
++        }
++
+         if ($name !== null) {
+             $name = trim($name);
+ 
+@@ -53,8 +70,16 @@ public function __invoke(
+             $queue->is_active = $isActive;
+         }
+ 
++        if ($priorityPrefixMapProvided) {
++            $queue->priority_prefix_map = $priorityPrefixMap;
++        }
++
+         try {
+             $queue->save();
++        } catch (InvalidArgumentException $e) {
++            throw ValidationException::withMessages([
++                'priority_prefix_map' => $e->getMessage(),
++            ]);
+         } catch (QueryException $e) {
+             if (! self::isUniqueViolation($e)) {
+                 throw $e;
+diff --git a/app/Models/Queue.php b/app/Models/Queue.php
+index c4c5272..3a4c82a 100644
+--- a/app/Models/Queue.php
++++ b/app/Models/Queue.php
+@@ -8,6 +8,7 @@
+ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Database\Eloquent\Relations\BelongsTo;
+ use Illuminate\Database\Eloquent\Relations\HasMany;
++use InvalidArgumentException;
+ 
+ #[Fillable(['entity_id', 'name', 'slug', 'is_active', 'labels_i18n'])]
+ class Queue extends Model
+@@ -15,6 +16,24 @@ class Queue extends Model
+     /** @use HasFactory<QueueFactory> */
+     use HasFactory;
+ 
++    /**
++     * Default display-code prefix for the named priority levels.
++     *
++     * @var array<int, string>
++     */
++    public const DEFAULT_PREFIX_MAP = [
++        0 => 'N',
++        10 => 'P',
++        20 => 'E',
++    ];
++
++    protected static function booted(): void
++    {
++        static::saving(function (Queue $queue): void {
++            $queue->priority_prefix_map = self::normalizePriorityPrefixMap($queue->priority_prefix_map);
++        });
++    }
++
+     /**
+      * @return array<string, string>
+      */
+@@ -23,9 +42,118 @@ protected function casts(): array
+         return [
+             'is_active' => 'boolean',
+             'labels_i18n' => 'array',
++            'priority_prefix_map' => 'array',
+         ];
+     }
+ 
++    /**
++     * Resolve the display-code prefix for a priority: custom map first, then
++     * the default map, then a range fallback for unknown values.
++     */
++    public function prefixForPriority(int $priority): string
++    {
++        $map = $this->priority_prefix_map;
++
++        if (is_array($map)) {
++            if (array_key_exists($priority, $map)) {
++                return (string) $map[$priority];
++            }
++
++            if (array_key_exists((string) $priority, $map)) {
++                return (string) $map[(string) $priority];
++            }
++        }
++
++        return self::defaultPrefixFor($priority);
++    }
++
++    public static function defaultPrefixFor(int $priority): string
++    {
++        if (array_key_exists($priority, self::DEFAULT_PREFIX_MAP)) {
++            return self::DEFAULT_PREFIX_MAP[$priority];
++        }
++
++        if ($priority <= 0) {
++            return 'N';
++        }
++
++        if ($priority >= 20) {
++            return 'E';
++        }
++
++        return 'P';
++    }
++
++    /**
++     * Validate and canonicalize a priority -> letter map.
++     *
++     * An empty map is stored as null. Keys must be non-negative canonical
++     * integers and values a single uppercase A-Z letter. The effective
++     * prefixes (custom entries plus defaults for the uncovered named levels)
++     * must not repeat, so a map can never merge two priority buckets.
++     *
++     * @param  array<array-key, mixed>|null  $map
++     * @return array<int, string>|null
++     *
++     * @throws InvalidArgumentException
++     */
++    public static function normalizePriorityPrefixMap(?array $map): ?array
++    {
++        if ($map === null || $map === []) {
++            return null;
++        }
++
++        $normalized = [];
++
++        foreach ($map as $key => $value) {
++            if (is_int($key)) {
++                if ($key < 0) {
++                    throw new InvalidArgumentException('Priority prefix map keys must be non-negative integers in canonical form.');
++                }
++
++                $priority = $key;
++            } elseif (is_string($key) && preg_match('/\A(0|[1-9][0-9]*)\z/', $key) === 1) {
++                $priority = (int) $key;
++            } else {
++                throw new InvalidArgumentException('Priority prefix map keys must be non-negative integers in canonical form.');
++            }
++
++            if (! is_string($value) || preg_match('/\A[A-Z]\z/', $value) !== 1) {
++                throw new InvalidArgumentException('Priority prefix map values must be a single uppercase letter A-Z.');
++            }
++
++            $normalized[$priority] = $value;
++        }
++
++        ksort($normalized);
++
++        $usedPrefixes = [];
++
++        foreach ($normalized as $priority => $prefix) {
++            if (isset($usedPrefixes[$prefix]) && $usedPrefixes[$prefix] !== $priority) {
++                throw new InvalidArgumentException('Priority prefixes must be unique across priority levels.');
++            }
++
++            $usedPrefixes[$prefix] = $priority;
++        }
++
++        foreach (array_keys(self::DEFAULT_PREFIX_MAP) as $level) {
++            if (array_key_exists($level, $normalized)) {
++                continue;
++            }
++
++            $prefix = self::defaultPrefixFor($level);
++
++            if (isset($usedPrefixes[$prefix]) && $usedPrefixes[$prefix] !== $level) {
++                throw new InvalidArgumentException('Priority prefixes must be unique across priority levels.');
++            }
++
++            $usedPrefixes[$prefix] = $level;
++        }
++
++        return $normalized;
++    }
++
+     /**
+      * @return BelongsTo<Entity, $this>
+      */
+diff --git a/app/Models/Ticket.php b/app/Models/Ticket.php
+index 7dc89ba..811d78c 100644
+--- a/app/Models/Ticket.php
++++ b/app/Models/Ticket.php
+@@ -6,10 +6,13 @@
+ use App\Enums\TicketStatus;
+ use App\Exceptions\InactiveQueueException;
+ use Database\Factories\TicketFactory;
++use DateTimeInterface;
+ use Illuminate\Database\Eloquent\Attributes\Fillable;
++use Illuminate\Database\Eloquent\Casts\Attribute;
+ use Illuminate\Database\Eloquent\Factories\HasFactory;
+ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Database\Eloquent\Relations\BelongsTo;
++use Illuminate\Support\Carbon;
+ use Illuminate\Support\Facades\DB;
+ use Illuminate\Support\Facades\Gate;
+ use LogicException;
+@@ -25,28 +28,38 @@ class Ticket extends Model
+     use HasFactory;
+ 
+     /**
+-     * Next display code for a queue (monotonic max+1, gap-tolerant).
++     * Next display code for a queue, prefix and issue day (max+1, gap-tolerant).
+      *
+-     * Ordered by id (insertion order), not by code string, so A999 -> A1000
+-     * keeps working where lexicographic ordering would return A999 again.
+-     * Skips malformed legacy codes (outside A<number>) by scanning for the
+-     * most recent valid code, so A001 then A-X yields A002 instead of a
+-     * duplicate A001 colliding on unique(queue_id, code).
++     * Ordered by id (insertion order), not by code string, so N999 -> N1000
++     * keeps working where lexicographic ordering would return N999 again.
++     * Skips malformed codes (outside <prefix><at least 3 digits>) by scanning
++     * for the most recent valid code, so N001 then N-X yields N002 instead of
++     * a duplicate N001. Legacy A codes simply do not belong to the N sequence.
+      */
+-    public static function nextCode(int $queueId): string
+-    {
++    public static function nextCode(
++        int $queueId,
++        string $prefix = 'N',
++        DateTimeInterface|string|null $issueDate = null,
++    ): string {
++        $issueDate = $issueDate === null
++            ? now()->toDateString()
++            : Carbon::parse($issueDate)->toDateString();
++
+         $codes = self::query()
+             ->where('queue_id', $queueId)
++            ->whereDate('issue_date', $issueDate)
+             ->orderByDesc('id')
+             ->pluck('code');
+ 
++        $pattern = '/\A'.preg_quote($prefix, '/').'([0-9]{3,})\z/';
++
+         foreach ($codes as $code) {
+-            if (preg_match('/^A(\d+)$/', (string) $code, $m)) {
+-                return 'A'.str_pad((string) ((int) $m[1] + 1), 3, '0', STR_PAD_LEFT);
++            if (preg_match($pattern, (string) $code, $m) === 1) {
++                return $prefix.str_pad((string) ((int) $m[1] + 1), 3, '0', STR_PAD_LEFT);
+             }
+         }
+ 
+-        return 'A001';
++        return $prefix.'001';
+     }
+ 
+     /**
+@@ -123,10 +136,29 @@ protected function casts(): array
+             'channel' => TicketChannel::class,
+             'status' => TicketStatus::class,
+             'issued_at' => 'datetime',
++            'issue_date' => 'date',
+             'called_at' => 'datetime',
+         ];
+     }
+ 
++    /**
++     * Store the calendar day consistently as Y-m-d, even though Eloquent's
++     * date cast would otherwise serialize it as a datetime string.
++     *
++     * @return Attribute<string|null, string|null>
++     */
++    protected function issueDate(): Attribute
++    {
++        return Attribute::make(
++            set: fn (mixed $value): ?string => match (true) {
++                $value === null => null,
++                $value instanceof DateTimeInterface => $value->format('Y-m-d'),
++                is_string($value) => Carbon::parse($value)->toDateString(),
++                default => Carbon::parse($value)->toDateString(),
++            },
++        );
++    }
++
+     /**
+      * @return BelongsTo<Queue, $this>
+      */
+diff --git a/database/factories/QueueFactory.php b/database/factories/QueueFactory.php
+index a09886e..0c7afea 100644
+--- a/database/factories/QueueFactory.php
++++ b/database/factories/QueueFactory.php
+@@ -27,6 +27,7 @@ public function definition(): array
+             'slug' => Str::slug($name).'-'.fake()->unique()->numerify('###'),
+             'is_active' => true,
+             'labels_i18n' => null,
++            'priority_prefix_map' => null,
+         ];
+     }
+ }
+diff --git a/database/factories/TicketFactory.php b/database/factories/TicketFactory.php
+index 4b74483..abb9543 100644
+--- a/database/factories/TicketFactory.php
++++ b/database/factories/TicketFactory.php
+@@ -16,9 +16,10 @@ class TicketFactory extends Factory
+     /**
+      * Define the model's default state.
+      *
+-     * Code is a null sentinel here and is allocated in afterMaking, once
+-     * queue_id is resolved to a persisted queue. Explicit codes (e.g.
+-     * ['code' => 'A999']) are preserved.
++     * Code and issued_at are null sentinels here. afterMaking() aligns
++     * issue_date with issued_at (defaulting to today) and allocates the code
++     * from the ticket's priority/day once queue_id is resolved. Explicit codes
++     * (e.g. ['code' => 'N999']) are preserved.
+      *
+      * @return array<string, mixed>
+      */
+@@ -30,7 +31,8 @@ public function definition(): array
+             'priority' => 0,
+             'channel' => TicketChannel::Virtual,
+             'status' => TicketStatus::Waiting,
+-            'issued_at' => now(),
++            'issued_at' => null,
++            'issue_date' => null,
+             'called_at' => null,
+             'called_by_user_id' => null,
+         ];
+@@ -39,19 +41,40 @@ public function definition(): array
+     public function configure(): static
+     {
+         return $this->afterMaking(function (Ticket $ticket): void {
++            $issuedAt = $ticket->issued_at;
++            $issueDate = $ticket->issue_date;
++
++            if ($issuedAt === null && $issueDate === null) {
++                $issuedAt = now();
++                $issueDate = $issuedAt->copy()->startOfDay();
++            } elseif ($issueDate === null) {
++                $issueDate = $issuedAt->copy()->startOfDay();
++            } elseif ($issuedAt === null) {
++                $issuedAt = $issueDate->copy()->startOfDay();
++            } elseif ($issueDate->toDateString() !== $issuedAt->toDateString()) {
++                // issued_at is the source of truth for factory-created rows.
++                $issueDate = $issuedAt->copy()->startOfDay();
++            }
++
++            $ticket->issue_date = $issueDate;
++            $ticket->issued_at = $issuedAt;
++
+             if ($ticket->code !== null) {
+                 return;
+             }
+ 
+             $queueId = $ticket->queue_id ?? $ticket->queue?->getKey();
++            $queue = $ticket->queue;
++            $prefix = $queue?->prefixForPriority((int) $ticket->priority)
++                ?? Queue::defaultPrefixFor((int) $ticket->priority);
+ 
+             if ($queueId === null) {
+-                $ticket->code = 'A001';
++                $ticket->code = $prefix.'001';
+ 
+                 return;
+             }
+ 
+-            $ticket->code = Ticket::nextCode((int) $queueId);
++            $ticket->code = Ticket::nextCode((int) $queueId, $prefix, $issueDate->toDateString());
+         });
+     }
+ 
+diff --git a/database/migrations/2026_10_29_055636_add_priority_prefix_map_to_queues_table.php b/database/migrations/2026_10_29_055636_add_priority_prefix_map_to_queues_table.php
+new file mode 100644
+index 0000000..9287258
+--- /dev/null
++++ b/database/migrations/2026_10_29_055636_add_priority_prefix_map_to_queues_table.php
+@@ -0,0 +1,28 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    /**
++     * Run the migrations.
++     */
++    public function up(): void
++    {
++        Schema::table('queues', function (Blueprint $table) {
++            $table->json('priority_prefix_map')->nullable()->after('labels_i18n');
++        });
++    }
++
++    /**
++     * Reverse the migrations.
++     */
++    public function down(): void
++    {
++        Schema::table('queues', function (Blueprint $table) {
++            $table->dropColumn('priority_prefix_map');
++        });
++    }
++};
+diff --git a/database/migrations/2026_10_29_055637_add_issue_date_to_tickets_table.php b/database/migrations/2026_10_29_055637_add_issue_date_to_tickets_table.php
+new file mode 100644
+index 0000000..d408e6e
+--- /dev/null
++++ b/database/migrations/2026_10_29_055637_add_issue_date_to_tickets_table.php
+@@ -0,0 +1,50 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    /**
++     * Run the migrations.
++     */
++    public function up(): void
++    {
++        Schema::table('tickets', function (Blueprint $table) {
++            $table->date('issue_date')->nullable()->after('issued_at');
++        });
++
++        DB::table('tickets')->update([
++            'issue_date' => DB::raw('DATE(issued_at)'),
++        ]);
++
++        Schema::table('tickets', function (Blueprint $table) {
++            $table->date('issue_date')->nullable(false)->change();
++        });
++
++        Schema::table('tickets', function (Blueprint $table) {
++            $table->dropUnique(['queue_id', 'code']);
++            $table->unique(['queue_id', 'code', 'issue_date']);
++        });
++    }
++
++    /**
++     * Reverse the migrations.
++     */
++    public function down(): void
++    {
++        Schema::table('tickets', function (Blueprint $table) {
++            $table->dropUnique(['queue_id', 'code', 'issue_date']);
++        });
++
++        Schema::table('tickets', function (Blueprint $table) {
++            $table->dropColumn('issue_date');
++        });
++
++        Schema::table('tickets', function (Blueprint $table) {
++            $table->unique(['queue_id', 'code']);
++        });
++    }
++};
+diff --git a/docs/api/totem.md b/docs/api/totem.md
+index 07faf7c..8f896aa 100644
+--- a/docs/api/totem.md
++++ b/docs/api/totem.md
+@@ -248,7 +248,7 @@ ## Write: issue ticket
+ 
+ ```json
+ {
+-  "slug": "A012",
++  "slug": "P012",
+   "queue": { "slug": "geral", "label": "Geral" },
+   "priority": { "value": 10, "label": "Prioritário" },
+   "issued_at": "2026-09-07T12:00:00Z"
+@@ -257,9 +257,10 @@ ## Write: issue ticket
+ 
+ `slug` is the code shown to the user on pegafila_totem (maps to
+ `tickets.code`). The client renders/prints it; it defines no ordering.
+-Codes are sequential per queue issuance window (`tickets (queue_id, code)`
+-unique per window, scope/format per queue/entity) — not globally
+-unpredictable.
++Codes are one uppercase priority prefix (`N` normal, `P` priority, `E` 80+,
++or the queue's custom map) plus at least three digits, sequential per queue,
++prefix and `issue_date` (`tickets (queue_id, code, issue_date)` unique) —
++not globally unpredictable.
+ 
+ Rules:
+ 
+diff --git a/docs/business-rules.md b/docs/business-rules.md
+index 9059895..010eb0a 100644
+--- a/docs/business-rules.md
++++ b/docs/business-rules.md
+@@ -75,7 +75,9 @@ ### Ticket
+ - Priority (numeric, see below).
+ - Issuance timestamp (ordering "oldest first" within same priority).
+ - Issuance channel: totem, virtual, printed copy, etc.
+-- Display code: per-queue sequential `A001`, `A002`, … (prefix `A`, 3 digits); unique per `(queue_id, code)`.
++- Display code: one uppercase priority prefix followed by at least three digits (`N001`, `P002`, `E001`, … `N1000`); sequential per queue, prefix and issuance day; unique per `(queue_id, code, issue_date)`.
++- Priority prefix: defaults are `0 -> N` (Normal), `10 -> P` (Priority) and `20 -> E` (80+); other values fall back by range (`<= 0 -> N`, `>= 20 -> E`, otherwise `P`). A queue may store a nullable custom map (`queues.priority_prefix_map`, priority value -> letter) that overrides exact values. The map is validated on every save: keys are canonical non-negative integers, values are a single uppercase `A-Z`, and effective prefixes must not repeat across custom entries plus the default fallbacks for uncovered `0`/`10`/`20` levels; an empty map is stored as `null`. It is changed only through `UpdateQueue`, never mass assignment.
++- Daily sequence: the next code is the latest valid code of the same prefix on the same `issue_date` (by insertion order) + 1, otherwise `<prefix>001`. Malformed codes are skipped, legacy `A...` codes do not belong to the `N` sequence, and gaps from deleted tickets are not reused.
+ 
+ **`tickets.status` (enum):**
+ 
+@@ -94,9 +96,9 @@ ### Ticket
+ | `virtual` | Issued without physical presence at a totem |
+ | `printed` | Printed copy / ESC/POS path |
+ 
+-**Issuance:** domain action `App\Actions\IssueTicket` rejects inactive queues (`is_active = false`), requires `priority >= 0`, allocates the next code, and creates a ticket with `status=waiting` and `issued_at` set.
++**Issuance:** domain action `App\Actions\IssueTicket` rejects inactive queues (`is_active = false`), requires `priority >= 0`, reads the clock once, and allocates the next code using the queue's prefix for that priority and that same instant's day. It creates a ticket with `status=waiting`, `issued_at` and `issue_date` all from that instant, so issuance cannot split across midnight.
+ 
+-**Queue lifecycle:** queues are managed by `App\Actions\CreateQueue` (owner/admin only, slug defaults to `Str::slug($name)`, unique per `(entity_id, slug)`) and `App\Actions\UpdateQueue` (owner/admin only, rename with the same uniqueness rule, toggle `is_active`). There is **no delete surface** — removal = `is_active = false`; tickets are history and remain intact, while `IssueTicket` / `CallNextTicket` reject inactive queues via `InactiveQueueException`.
++**Queue lifecycle:** queues are managed by `App\Actions\CreateQueue` (owner/admin only, slug defaults to `Str::slug($name)`, unique per `(entity_id, slug)`) and `App\Actions\UpdateQueue` (owner/admin only, rename with the same uniqueness rule, toggle `is_active`, set/clear the optional `priority_prefix_map`). There is **no delete surface** — removal = `is_active = false`; tickets are history and remain intact, while `IssueTicket` / `CallNextTicket` reject inactive queues via `InactiveQueueException`.
+ 
+ **Queue access:** employees operate only queues with a `queue_access` grant row (`permissions` JSON, MVP vocabulary `call` only via `App\Enums\QueuePermission`). Grants are managed by `App\Actions\SetQueueAccess` (owner/admin only, target membership and queue must share the entity, empty list revokes, audited to the `audit` channel). Owner/admin call without a grant row; non-members are denied everywhere. Authorization lives in `App\Policies\QueuePolicy` (`create`/`update`/`manageAccess`/`call`) and is enforced server-side inside the domain actions, not only at future HTTP/Livewire callers.
+ 
+diff --git a/docs/database-schema.md b/docs/database-schema.md
+index acaf3b6..6a9c81a 100644
+--- a/docs/database-schema.md
++++ b/docs/database-schema.md
+@@ -98,6 +98,7 @@ ## ER Diagram
+         string slug
+         bool is_active
+         json labels_i18n
++        json priority_prefix_map
+     }
+     queue_access {
+         bigint id PK
+@@ -113,6 +114,7 @@ ## ER Diagram
+         string channel
+         string status
+         datetime issued_at
++        date issue_date
+         datetime called_at
+         bigint called_by_user_id FK
+     }
+@@ -151,7 +153,8 @@ ## Modeling Notes
+ - **Numeric priority:** `tickets.priority` is an integer — **higher value, more prioritized**. Named levels (normal/priority/80+) are configurable presets per entity mapping to values; sorting uses the number.
+ - **Ticket write-once:** ticket is **single-use** and receives **one single call**. All fields are immutable after issuance, **except** `called_at` and `called_by_user_id`, filled at call time. No call history table.
+ - **Ticket ↔ totem:** ticket knows only its **queue** (`queue_id`). `channel` records origin type; no FK to `totems`.
+-- **Ticket `code`:** displayable password (e.g., `A012`) shown on totem/TV; scope and format per queue/entity.
++- **Ticket `code`:** displayable code shown on totem/TV, formed from the queue's priority prefix plus at least three digits (e.g., `N012`, `P003`, `E001`). The sequence restarts daily per queue and prefix; `issue_date` stores that day (backfilled from `issued_at` for existing rows).
++- **Priority prefix map:** `queues.priority_prefix_map` is a nullable JSON map of priority value -> single uppercase letter (`{"0":"X","10":"Y","20":"Z"}`). Defaults are `0 -> N`, `10 -> P`, `20 -> E`, with range fallbacks for other values. Empty is normalized to `null`; the model validates keys, values and effective-prefix uniqueness on every save.
+ - **Fairness:** 3-ticket priority fairness rule calculated in domain (queue state), no extra table.
+ - **Separated finance:** `billing_accounts` (1:0..1 with entity) + `subscriptions` + `plans` isolate financial model. Entity without billing can be created and tested without payment configuration. `payment_options` defines cycle (MONTHLY/ANNUAL), method (PIX/CARD/BOLETO), discount and refund window. `payments` tracks individual charges with `due_date`, `paid_at`, `refund_deadline`. Asaas webhooks update `status` idempotently. `asaas_customer_id` in `billing_accounts`; `asaas_subscription_id` in `subscriptions`; `asaas_payment_id` in `payments`.
+ - **Active subscription unique:** `billing_account_id` is UK in `subscriptions` (1:1); payment history in `payments`.
+@@ -159,5 +162,5 @@ ## Modeling Notes
+ - **Payments:** `payments` tracks each charge generated by subscription; status synced with Asaas (PENDING, RECEIVED, REFUNDED, CANCELED, OVERDUE).
+ - **Billing account:** `cpf_cnpj` stores fiscal data for invoice generation.
+ - **Enums:** `role` (`admin`, `owner`, `employee`); `tickets.channel` (`totem`, `virtual`, `printed`); `tickets.status` (`waiting`, `called`); `subscriptions.status` — remaining values in business rules.
+-- **Unique constraints:** `billing_accounts (entity_id)`; `entity_memberships (entity_id, user_id)`; `queues (entity_id, slug)`; `queue_access (entity_membership_id, queue_id)`; `tickets (queue_id, code)` per issuance window; `payments (asaas_payment_id)`; `subscriptions (billing_account_id)` (1:1).
++- **Unique constraints:** `billing_accounts (entity_id)`; `entity_memberships (entity_id, user_id)`; `queues (entity_id, slug)`; `queue_access (entity_membership_id, queue_id)`; `tickets (queue_id, code, issue_date)`; `payments (asaas_payment_id)`; `subscriptions (billing_account_id)` (1:1).
+ - **Suggested indexes:** `(queue_id, status, priority, issued_at)` on `tickets`.
+\ No newline at end of file
+diff --git a/tests/Feature/IssueTicketTest.php b/tests/Feature/IssueTicketTest.php
+index e9492cc..df54633 100644
+--- a/tests/Feature/IssueTicketTest.php
++++ b/tests/Feature/IssueTicketTest.php
+@@ -11,6 +11,7 @@
+ use App\Models\User;
+ use Illuminate\Auth\Access\AuthorizationException;
+ use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Carbon;
+ 
+ uses(RefreshDatabase::class);
+ 
+@@ -23,11 +24,14 @@
+     expect($ticket)
+         ->toBeInstanceOf(Ticket::class)
+         ->queue_id->toBe($queue->id)
+-        ->code->toBe('A001')
++        ->code->toBe('N001')
+         ->status->toBe(TicketStatus::Waiting)
+         ->channel->toBe(TicketChannel::Virtual)
+         ->priority->toBe(0)
+-        ->issued_at->not->toBeNull();
++        ->issued_at->not->toBeNull()
++        ->issue_date->not->toBeNull();
++
++    expect($ticket->issue_date->toDateString())->toBe($ticket->issued_at->toDateString());
+ });
+ 
+ it('allocates sequential codes on the same queue', function () {
+@@ -36,8 +40,8 @@
+     $first = (new IssueTicket)($queue);
+     $second = (new IssueTicket)($queue);
+ 
+-    expect($first->code)->toBe('A001');
+-    expect($second->code)->toBe('A002');
++    expect($first->code)->toBe('N001');
++    expect($second->code)->toBe('N002');
+ });
+ 
+ it('continues the sequence after a ticket is deleted', function () {
+@@ -51,7 +55,7 @@
+ 
+     $next = (new IssueTicket)($queue);
+ 
+-    expect($next->code)->toBe('A004');
++    expect($next->code)->toBe('N004');
+ });
+ 
+ it('rejects issuing into an inactive queue', function () {
+@@ -75,22 +79,43 @@
+ it('restarts the sequence after a malformed code', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+ 
+-    Ticket::factory()->for($queue)->create(['code' => 'A-X']);
++    Ticket::factory()->for($queue)->create(['code' => 'N-X']);
+ 
+     $next = (new IssueTicket)($queue);
+ 
+-    expect($next->code)->toBe('A001');
++    expect($next->code)->toBe('N001');
+ });
+ 
+-it('skips a malformed latest code instead of colliding on A001', function () {
++it('skips a malformed latest code instead of colliding on N001', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++
++    Ticket::factory()->for($queue)->create(['code' => 'N001']);
++    Ticket::factory()->for($queue)->create(['code' => 'N-X']);
++
++    $next = (new IssueTicket)($queue);
++
++    expect($next->code)->toBe('N002');
++});
++
++it('keeps legacy A codes out of the N sequence', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+ 
+     Ticket::factory()->for($queue)->create(['code' => 'A001']);
+-    Ticket::factory()->for($queue)->create(['code' => 'A-X']);
+ 
+     $next = (new IssueTicket)($queue);
+ 
+-    expect($next->code)->toBe('A002');
++    expect($next->code)->toBe('N001');
++});
++
++it('continues from the most recently inserted valid code', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++
++    Ticket::factory()->forQueue($queue)->create(['code' => 'N005']);
++    Ticket::factory()->forQueue($queue)->create(['code' => 'N002']);
++
++    $next = (new IssueTicket)($queue);
++
++    expect($next->code)->toBe('N003');
+ });
+ 
+ it('rejects issuing with a stale active instance after deactivation', function () {
+@@ -111,8 +136,63 @@
+     $first = Ticket::factory()->forQueue($queue)->create();
+     $second = Ticket::factory()->forQueue($queue)->create();
+ 
+-    expect($first->code)->toBe('A001');
+-    expect($second->code)->toBe('A002');
++    expect($first->code)->toBe('N001');
++    expect($second->code)->toBe('N002');
++});
++
++it('sequences each priority prefix independently', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++
++    $codes = [
++        (new IssueTicket)($queue, 0)->code,
++        (new IssueTicket)($queue, 0)->code,
++        (new IssueTicket)($queue, 10)->code,
++        (new IssueTicket)($queue, 10)->code,
++        (new IssueTicket)($queue, 20)->code,
++    ];
++
++    expect($codes)->toBe(['N001', 'N002', 'P001', 'P002', 'E001']);
++});
++
++it('falls back by range for priorities outside the default map', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++
++    expect((new IssueTicket)($queue, 5)->code)->toBe('P001')
++        ->and((new IssueTicket)($queue, 15)->code)->toBe('P002')
++        ->and((new IssueTicket)($queue, 25)->code)->toBe('E001');
++});
++
++it('uses the queue priority prefix map', function () {
++    $queue = Queue::factory()->create([
++        'is_active' => true,
++        'priority_prefix_map' => ['0' => 'X', '10' => 'Y', '20' => 'Z'],
++    ]);
++
++    expect((new IssueTicket)($queue, 0)->code)->toBe('X001')
++        ->and((new IssueTicket)($queue, 10)->code)->toBe('Y001')
++        ->and((new IssueTicket)($queue, 20)->code)->toBe('Z001');
++});
++
++it('restarts the daily sequence per prefix and keeps one instant for the day', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++
++    $this->travelTo(Carbon::parse('2026-09-28 23:59:59'));
++    $dayOneNormal = (new IssueTicket)($queue, 0);
++    $dayOnePriority = (new IssueTicket)($queue, 10);
++
++    $this->travelTo(Carbon::parse('2026-09-29 00:00:01'));
++    $dayTwoNormal = (new IssueTicket)($queue, 0);
++    $dayTwoPriority = (new IssueTicket)($queue, 10);
++
++    expect($dayOneNormal->code)->toBe('N001')
++        ->and($dayOnePriority->code)->toBe('P001')
++        ->and($dayTwoNormal->code)->toBe('N001')
++        ->and($dayTwoPriority->code)->toBe('P001');
++
++    expect($dayOneNormal->issue_date->toDateString())->toBe('2026-09-28')
++        ->and($dayOneNormal->issued_at->toDateString())->toBe('2026-09-28')
++        ->and($dayTwoNormal->issue_date->toDateString())->toBe('2026-09-29')
++        ->and($dayTwoNormal->issued_at->toDateString())->toBe('2026-09-29');
+ });
+ 
+ it('calls a waiting ticket exactly once', function () {
+@@ -144,22 +224,22 @@
+     expect($ticket->fresh()->status)->toBe(TicketStatus::Waiting);
+ });
+ 
+-it('continues the sequence past A999', function () {
++it('continues the sequence past N999', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+ 
+-    Ticket::factory()->for($queue)->create(['code' => 'A999']);
+-    Ticket::factory()->for($queue)->create(['code' => 'A1000']);
++    Ticket::factory()->for($queue)->create(['code' => 'N999']);
++    Ticket::factory()->for($queue)->create(['code' => 'N1000']);
+ 
+     $next = (new IssueTicket)($queue);
+ 
+-    expect($next->code)->toBe('A1001');
++    expect($next->code)->toBe('N1001');
+ });
+ 
+ it('rejects mutating immutable ticket fields after issuance', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+     $ticket = (new IssueTicket)($queue);
+ 
+-    expect(fn () => $ticket->forceFill(['code' => 'A999'])->save())
++    expect(fn () => $ticket->forceFill(['code' => 'N999'])->save())
+         ->toThrow(LogicException::class);
+ 
+     expect(fn () => $ticket->fresh()->update(['priority' => 5]))
+diff --git a/tests/Feature/QueuePrefixMapTest.php b/tests/Feature/QueuePrefixMapTest.php
+new file mode 100644
+index 0000000..e491690
+--- /dev/null
++++ b/tests/Feature/QueuePrefixMapTest.php
+@@ -0,0 +1,148 @@
++<?php
++
++use App\Actions\UpdateQueue;
++use App\Models\Entity;
++use App\Models\EntityMembership;
++use App\Models\Queue;
++use App\Models\User;
++use Illuminate\Auth\Access\AuthorizationException;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Validation\ValidationException;
++
++uses(RefreshDatabase::class);
++
++function prefixMapOwner(Entity $entity): User
++{
++    $owner = User::factory()->create();
++    EntityMembership::factory()->for($entity)->for($owner)->owner()->create();
++
++    return $owner;
++}
++
++it('resolves the default prefix by named level and range', function () {
++    $queue = Queue::factory()->make();
++
++    expect(Queue::DEFAULT_PREFIX_MAP)->toBe([0 => 'N', 10 => 'P', 20 => 'E'])
++        ->and($queue->prefixForPriority(0))->toBe('N')
++        ->and($queue->prefixForPriority(10))->toBe('P')
++        ->and($queue->prefixForPriority(20))->toBe('E')
++        ->and($queue->prefixForPriority(-1))->toBe('N')
++        ->and($queue->prefixForPriority(5))->toBe('P')
++        ->and($queue->prefixForPriority(15))->toBe('P')
++        ->and($queue->prefixForPriority(25))->toBe('E')
++        ->and(Queue::defaultPrefixFor(30))->toBe('E');
++});
++
++it('prefers custom map entries and falls back to defaults for the rest', function () {
++    $queue = Queue::factory()->create([
++        'priority_prefix_map' => ['0' => 'X', '10' => 'Y'],
++    ]);
++
++    expect($queue->priority_prefix_map)->toBe([0 => 'X', 10 => 'Y'])
++        ->and($queue->prefixForPriority(0))->toBe('X')
++        ->and($queue->prefixForPriority(10))->toBe('Y')
++        ->and($queue->prefixForPriority(20))->toBe('E')
++        ->and($queue->prefixForPriority(5))->toBe('P');
++});
++
++it('normalizes an empty map to null', function () {
++    $queue = Queue::factory()->create(['priority_prefix_map' => []]);
++
++    expect($queue->fresh()->priority_prefix_map)->toBeNull();
++});
++
++it('does not mass-assign the priority prefix map', function () {
++    $queue = Queue::factory()->make();
++    $queue->fill(['priority_prefix_map' => ['0' => 'X']]);
++
++    expect($queue->priority_prefix_map)->toBeNull();
++});
++
++it('accepts custom entries for levels outside the default map', function () {
++    $queue = Queue::factory()->create([
++        'priority_prefix_map' => ['5' => 'A', '10' => 'B'],
++    ]);
++
++    expect($queue->prefixForPriority(5))->toBe('A')
++        ->and($queue->prefixForPriority(10))->toBe('B')
++        ->and($queue->prefixForPriority(0))->toBe('N');
++});
++
++it('rejects invalid priority prefix maps', function (array $map) {
++    expect(fn () => Queue::factory()->create(['priority_prefix_map' => $map]))
++        ->toThrow(InvalidArgumentException::class);
++})->with([
++    'non numeric key' => [['foo' => 'X']],
++    'negative key' => [['-1' => 'X']],
++    'non canonical key' => [['010' => 'X']],
++    'key with trailing newline' => [["0\n" => 'X']],
++    'multi letter value' => [['0' => 'XX']],
++    'lowercase value' => [['0' => 'x']],
++    'value with trailing newline' => [['0' => "X\n"]],
++    'non string value' => [['0' => 1]],
++    'duplicate custom prefixes' => [['0' => 'N', '10' => 'N']],
++    'custom merged with normal default' => [['10' => 'N']],
++    'custom merged with 80+ default' => [['0' => 'E']],
++    'custom merged with priority default' => [['0' => 'P']],
++]);
++
++it('validates the map on every model save', function () {
++    $queue = Queue::factory()->create();
++
++    $queue->priority_prefix_map = ['0' => 'xx'];
++
++    expect(fn () => $queue->save())->toThrow(InvalidArgumentException::class)
++        ->and($queue->fresh()->priority_prefix_map)->toBeNull();
++});
++
++it('updates, leaves unchanged and clears the map through UpdateQueue', function () {
++    $entity = Entity::factory()->create();
++    $owner = prefixMapOwner($entity);
++    $queue = Queue::factory()->for($entity)->create();
++
++    $updated = (new UpdateQueue)($queue, $owner, priorityPrefixMap: [
++        '0' => 'X',
++        '10' => 'Y',
++        '20' => 'Z',
++    ]);
++
++    expect($updated->fresh()->priority_prefix_map)->toBe([0 => 'X', 10 => 'Y', 20 => 'Z']);
++
++    $unchanged = (new UpdateQueue)($updated->fresh(), $owner, name: 'Renamed');
++
++    expect($unchanged->fresh()->priority_prefix_map)->toBe([0 => 'X', 10 => 'Y', 20 => 'Z']);
++
++    $cleared = (new UpdateQueue)($updated->fresh(), $owner, priorityPrefixMap: []);
++
++    expect($cleared->fresh()->priority_prefix_map)->toBeNull();
++});
++
++it('raises a validation error and leaves the queue unchanged for an invalid map', function () {
++    $entity = Entity::factory()->create();
++    $owner = prefixMapOwner($entity);
++    $queue = Queue::factory()->for($entity)->create(['name' => 'Geral']);
++
++    try {
++        (new UpdateQueue)($queue, $owner, name: 'Changed', priorityPrefixMap: ['0' => 'N', '10' => 'N']);
++        $this->fail('Expected a ValidationException.');
++    } catch (ValidationException $e) {
++        expect(array_keys($e->errors()))->toBe(['priority_prefix_map']);
++    }
++
++    expect($queue->fresh()->name)->toBe('Geral')
++        ->and($queue->fresh()->priority_prefix_map)->toBeNull();
++});
++
++it('denies map changes to employees without changing the map', function () {
++    $entity = Entity::factory()->create();
++    $owner = prefixMapOwner($entity);
++    $queue = (new UpdateQueue)(Queue::factory()->for($entity)->create(), $owner, priorityPrefixMap: ['0' => 'X']);
++
++    $employee = User::factory()->create();
++    EntityMembership::factory()->for($entity)->for($employee)->employee()->create();
++
++    expect(fn () => (new UpdateQueue)($queue, $employee, priorityPrefixMap: ['0' => 'Y']))
++        ->toThrow(AuthorizationException::class);
++
++    expect($queue->fresh()->priority_prefix_map)->toBe([0 => 'X']);
++});
+diff --git a/tests/Feature/TicketFactoryTest.php b/tests/Feature/TicketFactoryTest.php
+new file mode 100644
+index 0000000..c80be87
+--- /dev/null
++++ b/tests/Feature/TicketFactoryTest.php
+@@ -0,0 +1,72 @@
++<?php
++
++use App\Models\Queue;
++use App\Models\Ticket;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++
++uses(RefreshDatabase::class);
++
++it('allocates a normal code and today issue date by default', function () {
++    $ticket = Ticket::factory()->create();
++
++    expect($ticket->code)->toBe('N001')
++        ->and($ticket->issue_date->toDateString())->toBe(now()->toDateString())
++        ->and($ticket->issued_at->toDateString())->toBe(now()->toDateString());
++});
++
++it('allocates the code from the ticket priority', function () {
++    $queue = Queue::factory()->create();
++
++    $normal = Ticket::factory()->forQueue($queue)->create(['priority' => 0]);
++    $priority = Ticket::factory()->forQueue($queue)->create(['priority' => 10]);
++    $expanded = Ticket::factory()->forQueue($queue)->create(['priority' => 20]);
++
++    expect($normal->code)->toBe('N001')
++        ->and($priority->code)->toBe('P001')
++        ->and($expanded->code)->toBe('E001');
++});
++
++it('uses a custom queue prefix map', function () {
++    $queue = Queue::factory()->create(['priority_prefix_map' => ['0' => 'X']]);
++
++    $ticket = Ticket::factory()->forQueue($queue)->create(['priority' => 0]);
++
++    expect($ticket->code)->toBe('X001');
++});
++
++it('allocates the historical day code even when the same code exists today', function () {
++    $queue = Queue::factory()->create();
++    $historicalDate = now()->subDay()->toDateString();
++
++    $today = Ticket::factory()->forQueue($queue)->create();
++    $historical = Ticket::factory()->forQueue($queue)->create([
++        'issued_at' => $historicalDate.' 12:00:00',
++    ]);
++
++    expect($today->code)->toBe('N001')
++        ->and($historical->code)->toBe('N001')
++        ->and($historical->issue_date->toDateString())->toBe($historicalDate)
++        ->and($historical->issued_at->toDateString())->toBe($historicalDate);
++});
++
++it('keeps explicit codes and aligns issue_date with issued_at', function () {
++    $queue = Queue::factory()->create();
++
++    $ticket = Ticket::factory()->forQueue($queue)->create([
++        'code' => 'P777',
++        'priority' => 10,
++        'issued_at' => '2026-09-28 14:30:00',
++    ]);
++
++    expect($ticket->code)->toBe('P777')
++        ->and($ticket->issue_date->toDateString())->toBe('2026-09-28')
++        ->and($ticket->issued_at->toDateString())->toBe('2026-09-28');
++});
++
++it('derives issued_at from an explicitly supplied issue_date', function () {
++    $ticket = Ticket::factory()->create(['issue_date' => '2026-09-28']);
++
++    expect($ticket->code)->toBe('N001')
++        ->and($ticket->issue_date->toDateString())->toBe('2026-09-28')
++        ->and($ticket->issued_at->toDateString())->toBe('2026-09-28');
++});
+diff --git a/tests/Feature/TicketSchemaTest.php b/tests/Feature/TicketSchemaTest.php
+new file mode 100644
+index 0000000..3a12b42
+--- /dev/null
++++ b/tests/Feature/TicketSchemaTest.php
+@@ -0,0 +1,45 @@
++<?php
++
++use App\Models\Queue;
++use App\Models\Ticket;
++use Illuminate\Database\QueryException;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Facades\Schema;
++
++uses(RefreshDatabase::class);
++
++it('adds the queue priority map and ticket issue date columns', function () {
++    expect(Schema::hasColumn('queues', 'priority_prefix_map'))->toBeTrue()
++        ->and(Schema::hasColumn('tickets', 'issue_date'))->toBeTrue();
++
++    $queueColumns = collect(Schema::getColumns('queues'))->keyBy('name');
++    $ticketColumns = collect(Schema::getColumns('tickets'))->keyBy('name');
++
++    expect($queueColumns['priority_prefix_map']['nullable'])->toBeTrue()
++        ->and($ticketColumns['issue_date']['nullable'])->toBeFalse()
++        ->and($ticketColumns['issue_date']['type'])->toBe('date');
++});
++
++it('scopes ticket codes uniquely by queue, code and issue date', function () {
++    expect(Schema::hasIndex('tickets', 'tickets_queue_id_code_issue_date_unique'))->toBeTrue()
++        ->and(Schema::hasIndex('tickets', 'tickets_queue_id_code_unique'))->toBeFalse();
++
++    $queue = Queue::factory()->create();
++
++    Ticket::factory()->forQueue($queue)->create([
++        'code' => 'N001',
++        'issue_date' => '2026-09-28',
++    ]);
++
++    expect(fn () => Ticket::factory()->forQueue($queue)->create([
++        'code' => 'N001',
++        'issue_date' => '2026-09-28',
++    ]))->toThrow(QueryException::class);
++
++    $nextDay = Ticket::factory()->forQueue($queue)->create([
++        'code' => 'N001',
++        'issue_date' => '2026-09-29',
++    ]);
++
++    expect($nextDay->code)->toBe('N001');
++});

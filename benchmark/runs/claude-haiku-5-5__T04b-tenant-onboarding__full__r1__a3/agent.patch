@@ -1,0 +1,1999 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9806b52..dcb4a08 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,9 @@ ## [Unreleased]
+ 
+ ### Added
+ 
++- Entities and memberships: `entities` (soft deletes, slug routing) and `entity_memberships` (roles owner/admin/employee), with a database-enforced single owner per entity (`owner_seq` generated column and unique index), `EntityPolicy`/`EntityMembershipPolicy`, and factories.
++- Tenant session: the `current_entity` middleware resolves the session's entity and returns 403 for non-members. `/home` routes users to onboarding, their only entity, or the switcher.
++- Entity onboarding (`/onboarding`): creates an entity with a unique slug and makes the creator its owner. Entity switcher (`/e/switcher`) and switch action (`POST /e/{entity}/pick`), with an audit line on each switch. Minimal entity dashboard (`/e/{entity}`).
+ - Database schema and Mermaid diagram in [`docs/database-schema.md`](docs/database-schema.md).
+ - Business rules documentation in [`docs/business-rules.md`](docs/business-rules.md): MVP queue management, entity/subscription, roles (admin, owner, employee), tickets, priorities, fairness (3-ticket rule), deterministic call panel, and channels (Flutter totem, web TV, attendant).
+ - This changelog (Keep a Changelog).
+@@ -21,6 +24,7 @@ ### Added
+ 
+ ### Changed
+ 
++- `/home` no longer renders the placeholder page; it sends users to onboarding, their only entity's dashboard, or the switcher. The business rule that the first account in an entity is its admin is replaced: the creator is its owner.
+ - Documented architecture: PegaFilaWeb is a single repository for frontend, backend and totem API; Flutter remains only as a separate client.
+ - Simplified model: ticket is single-use (one call; write-once except `called_at`/`called_by`) — removed `ticket_calls` table; ticket knows only its queue (no `totem_id`). `tickets.priority` is now an integer (higher = more prioritized).
+ - Expanded financial model: `billing_accounts` (1:0..1 with entity) + `subscriptions` + `plans` isolate financial data. New tables: `payment_options` (cycle, method, discount, refund window) and `payments` (individual charges). `billing_accounts` has `cpf_cnpj`. Subscription 1:1 with `billing_account_id` (UK); history in `payments`. Added `tickets.code`, explicit unique constraints, and circular FK note for owner. Removed per-queue user access limit.
+diff --git a/app/Actions/CreateEntityWithOwner.php b/app/Actions/CreateEntityWithOwner.php
+new file mode 100644
+index 0000000..35d8c36
+--- /dev/null
++++ b/app/Actions/CreateEntityWithOwner.php
+@@ -0,0 +1,36 @@
++<?php
++
++namespace App\Actions;
++
++use App\Models\Entity;
++use App\Models\EntityMembership;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Gate;
++
++class CreateEntityWithOwner
++{
++    /**
++     * Create an entity and make the creator its owner, in one transaction.
++     *
++     * Throws UniqueConstraintViolationException when another request took the slug after the
++     * caller checked it; the caller then picks a fresh slug and calls again.
++     */
++    public function handle(User $creator, string $name, string $slug): Entity
++    {
++        Gate::forUser($creator)->authorize('create', Entity::class);
++
++        return DB::transaction(function () use ($creator, $name, $slug) {
++            $entity = Entity::create(['name' => $name, 'slug' => $slug]);
++
++            EntityMembership::create([
++                'entity_id' => $entity->id,
++                'user_id' => $creator->id,
++                'role' => UserRole::Owner,
++            ]);
++
++            return $entity;
++        });
++    }
++}
+diff --git a/app/Http/Controllers/EntityController.php b/app/Http/Controllers/EntityController.php
+new file mode 100644
+index 0000000..3726d68
+--- /dev/null
++++ b/app/Http/Controllers/EntityController.php
+@@ -0,0 +1,41 @@
++<?php
++
++namespace App\Http\Controllers;
++
++use App\Models\Entity;
++use Illuminate\Http\RedirectResponse;
++use Illuminate\Http\Request;
++use Illuminate\Support\Facades\Gate;
++use Illuminate\Support\Facades\Log;
++use Illuminate\View\View;
++
++class EntityController extends Controller
++{
++    /**
++     * Lists the user's entities. Not behind current_entity, which redirects here.
++     */
++    public function switcher(Request $request): View
++    {
++        return view('entity.switcher', [
++            'entities' => $request->user()->entities()->orderBy('name')->get(),
++            'currentEntityId' => (int) $request->session()->get('current_entity_id'),
++        ]);
++    }
++
++    /**
++     * Makes an entity the session's current one. Gate::authorize() rejects non-members with 403.
++     */
++    public function pick(Request $request, Entity $entity): RedirectResponse
++    {
++        Gate::authorize('view', $entity);
++
++        $request->session()->put('current_entity_id', $entity->id);
++
++        Log::channel('audit')->info('Entity switched', [
++            'entity_id' => $entity->id,
++            'actor_id' => $request->user()->id,
++        ]);
++
++        return redirect()->route('entity.dashboard', $entity);
++    }
++}
+diff --git a/app/Http/Controllers/HomeController.php b/app/Http/Controllers/HomeController.php
+new file mode 100644
+index 0000000..443bf8e
+--- /dev/null
++++ b/app/Http/Controllers/HomeController.php
+@@ -0,0 +1,17 @@
++<?php
++
++namespace App\Http\Controllers;
++
++use App\Tenancy\CurrentEntity;
++use Illuminate\Http\RedirectResponse;
++
++class HomeController extends Controller
++{
++    /**
++     * The current_entity middleware has already chosen the entity, so this only opens its dashboard.
++     */
++    public function __invoke(): RedirectResponse
++    {
++        return redirect()->route('entity.dashboard', app(CurrentEntity::class)->entity());
++    }
++}
+diff --git a/app/Http/Middleware/ResolveCurrentEntity.php b/app/Http/Middleware/ResolveCurrentEntity.php
+new file mode 100644
+index 0000000..a6aa40c
+--- /dev/null
++++ b/app/Http/Middleware/ResolveCurrentEntity.php
+@@ -0,0 +1,43 @@
++<?php
++
++namespace App\Http\Middleware;
++
++use App\Tenancy\CurrentEntity;
++use Closure;
++use Illuminate\Http\Request;
++use Symfony\Component\HttpFoundation\Response;
++
++class ResolveCurrentEntity
++{
++    /**
++     * Resolve the session's entity into the request's tenant context.
++     *
++     * With no entity in the session, the user's entities decide where they go: none means
++     * onboarding, several means the switcher, and exactly one is chosen for them.
++     */
++    public function handle(Request $request, Closure $next): Response
++    {
++        $user = $request->user();
++
++        if ($request->session()->get('current_entity_id') === null) {
++            $entities = $user->entities()->get();
++
++            if ($entities->isEmpty()) {
++                return redirect()->route('onboarding');
++            }
++
++            if ($entities->count() > 1) {
++                return redirect()->route('entity.switcher');
++            }
++
++            $request->session()->put('current_entity_id', $entities->first()->id);
++        }
++
++        $membership = $user->membershipFor((int) $request->session()->get('current_entity_id'));
++        abort_if($membership === null, 403);
++
++        app(CurrentEntity::class)->set($membership);
++
++        return $next($request);
++    }
++}
+diff --git a/app/Livewire/Entity/CreateEntity.php b/app/Livewire/Entity/CreateEntity.php
+new file mode 100644
+index 0000000..71f634d
+--- /dev/null
++++ b/app/Livewire/Entity/CreateEntity.php
+@@ -0,0 +1,94 @@
++<?php
++
++namespace App\Livewire\Entity;
++
++use App\Actions\CreateEntityWithOwner;
++use App\Models\Entity;
++use Illuminate\Contracts\View\View;
++use Illuminate\Database\UniqueConstraintViolationException;
++use Illuminate\Support\Facades\Log;
++use Illuminate\Support\Facades\RateLimiter;
++use Illuminate\Support\Str;
++use Illuminate\Validation\ValidationException;
++use Livewire\Attributes\Layout;
++use Livewire\Attributes\Validate;
++use Livewire\Component;
++
++#[Layout('layouts::default-page')]
++class CreateEntity extends Component
++{
++    /** How many times to look for a free slug when concurrent requests keep taking them. */
++    private const MAX_SLUG_ATTEMPTS = 5;
++
++    /** Slugs that are routes (/e/switcher), so no entity may take them. */
++    private const RESERVED_SLUGS = ['switcher'];
++
++    #[Validate('required|string|max:255')]
++    public string $name = '';
++
++    public function submit(): void
++    {
++        $validated = $this->validate();
++
++        $throttleKey = 'create-entity|'.auth()->id();
++
++        if (RateLimiter::tooManyAttempts($throttleKey, 10)) {
++            throw ValidationException::withMessages(['name' => __('ui.too_many_entities')]);
++        }
++
++        RateLimiter::hit($throttleKey, 60);
++
++        for ($attempt = 1; ; $attempt++) {
++            try {
++                $entity = app(CreateEntityWithOwner::class)->handle(
++                    auth()->user(),
++                    $validated['name'],
++                    $this->uniqueSlug($validated['name']),
++                );
++
++                break;
++            } catch (UniqueConstraintViolationException $exception) {
++                // Another request inserted this slug after uniqueSlug() checked it. Ask again.
++                if ($attempt === self::MAX_SLUG_ATTEMPTS) {
++                    throw $exception;
++                }
++            }
++        }
++
++        Log::channel('audit')->info('Entity created', [
++            'entity_id' => $entity->id,
++            'actor_id' => auth()->id(),
++        ]);
++
++        session()->put('current_entity_id', $entity->id);
++
++        $this->redirect(route('entity.dashboard', $entity));
++    }
++
++    public function render(): View
++    {
++        return view('livewire.entity.create-entity')->title(__('ui.onboarding_title'));
++    }
++
++    /**
++     * A slug from the name that no entity uses, soft-deleted ones included (their slugs stay
++     * reserved). Overridable so tests can simulate a slug taken between check and insert.
++     */
++    protected function uniqueSlug(string $name): string
++    {
++        $base = Str::slug($name) ?: 'entity';
++        $slug = $base;
++
++        for ($suffix = 2; $this->slugTaken($slug); $suffix++) {
++            $slug = "{$base}-{$suffix}";
++        }
++
++        return $slug;
++    }
++
++    private function slugTaken(string $slug): bool
++    {
++        return in_array($slug, self::RESERVED_SLUGS, true)
++            || Entity::withTrashed()->where('slug', $slug)->exists();
++    }
++}
+diff --git a/app/Livewire/Entity/Dashboard.php b/app/Livewire/Entity/Dashboard.php
+new file mode 100644
+index 0000000..3b0a9bd
+--- /dev/null
++++ b/app/Livewire/Entity/Dashboard.php
+@@ -0,0 +1,29 @@
++<?php
++
++namespace App\Livewire\Entity;
++
++use App\Models\Entity;
++use Illuminate\Contracts\View\View;
++use Illuminate\Support\Facades\Gate;
++use Livewire\Attributes\Layout;
++use Livewire\Attributes\Locked;
++use Livewire\Component;
++
++#[Layout('layouts::default-page')]
++class Dashboard extends Component
++{
++    #[Locked]
++    public Entity $entity;
++
++    public function mount(Entity $entity): void
++    {
++        Gate::authorize('view', $entity);
++
++        $this->entity = $entity;
++    }
++
++    public function render(): View
++    {
++        return view('livewire.entity.dashboard')->title($this->entity->name);
++    }
++}
+diff --git a/app/Models/Entity.php b/app/Models/Entity.php
+new file mode 100644
+index 0000000..0dd8d24
+--- /dev/null
++++ b/app/Models/Entity.php
+@@ -0,0 +1,57 @@
++<?php
++
++namespace App\Models;
++
++use Database\Factories\EntityFactory;
++use Illuminate\Database\Eloquent\Attributes\Fillable;
++use Illuminate\Database\Eloquent\Factories\HasFactory;
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsToMany;
++use Illuminate\Database\Eloquent\Relations\HasMany;
++use Illuminate\Database\Eloquent\Relations\HasOne;
++use Illuminate\Database\Eloquent\SoftDeletes;
++
++#[Fillable(['name', 'slug'])]
++class Entity extends Model
++{
++    /** @use HasFactory<EntityFactory> */
++    use HasFactory, SoftDeletes;
++
++    /**
++     * Route entities by their slug (e.g. /e/acme-corp).
++     */
++    public function getRouteKeyName(): string
++    {
++        return 'slug';
++    }
++
++    /**
++     * @return HasMany<EntityMembership, $this>
++     */
++    public function memberships(): HasMany
++    {
++        return $this->hasMany(EntityMembership::class);
++    }
++
++    /**
++     * The members of this entity, with their role on the pivot.
++     *
++     * @return BelongsToMany<User, $this>
++     */
++    public function users(): BelongsToMany
++    {
++        return $this->belongsToMany(User::class, 'entity_memberships')
++            ->withPivot('role')
++            ->withTimestamps();
++    }
++
++    /**
++     * The owner's membership. The database guarantees there is at most one.
++     *
++     * @return HasOne<EntityMembership, $this>
++     */
++    public function owner(): HasOne
++    {
++        return $this->hasOne(EntityMembership::class)->owner();
++    }
++}
+diff --git a/app/Models/EntityMembership.php b/app/Models/EntityMembership.php
+new file mode 100644
+index 0000000..e5996a0
+--- /dev/null
++++ b/app/Models/EntityMembership.php
+@@ -0,0 +1,71 @@
++<?php
++
++namespace App\Models;
++
++use Database\Factories\EntityMembershipFactory;
++use Illuminate\Database\Eloquent\Attributes\Fillable;
++use Illuminate\Database\Eloquent\Builder;
++use Illuminate\Database\Eloquent\Factories\HasFactory;
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++
++#[Fillable(['entity_id', 'user_id', 'role'])]
++class EntityMembership extends Model
++{
++    /** @use HasFactory<EntityMembershipFactory> */
++    use HasFactory;
++
++    /**
++     * Get the attributes that should be cast.
++     *
++     * @return array<string, string>
++     */
++    protected function casts(): array
++    {
++        return [
++            'entity_id' => 'integer',
++            'user_id' => 'integer',
++            'role' => UserRole::class,
++        ];
++    }
++
++    /**
++     * @return BelongsTo<Entity, $this>
++     */
++    public function entity(): BelongsTo
++    {
++        return $this->belongsTo(Entity::class);
++    }
++
++    /**
++     * @return BelongsTo<User, $this>
++     */
++    public function user(): BelongsTo
++    {
++        return $this->belongsTo(User::class);
++    }
++
++    /**
++     * @param  Builder<static>  $query
++     */
++    public function scopeOwner(Builder $query): void
++    {
++        $query->where('role', UserRole::Owner);
++    }
++
++    /**
++     * @param  Builder<static>  $query
++     */
++    public function scopeAdmin(Builder $query): void
++    {
++        $query->where('role', UserRole::Admin);
++    }
++
++    /**
++     * @param  Builder<static>  $query
++     */
++    public function scopeEmployee(Builder $query): void
++    {
++        $query->where('role', UserRole::Employee);
++    }
++}
+diff --git a/app/Models/User.php b/app/Models/User.php
+index 72e3572..36f2fa0 100644
+--- a/app/Models/User.php
++++ b/app/Models/User.php
+@@ -7,6 +7,8 @@
+ use Illuminate\Database\Eloquent\Attributes\Fillable;
+ use Illuminate\Database\Eloquent\Attributes\Hidden;
+ use Illuminate\Database\Eloquent\Factories\HasFactory;
++use Illuminate\Database\Eloquent\Relations\BelongsToMany;
++use Illuminate\Database\Eloquent\Relations\HasMany;
+ use Illuminate\Foundation\Auth\User as Authenticatable;
+ use Illuminate\Notifications\Notifiable;
+ 
+@@ -29,4 +31,36 @@ protected function casts(): array
+             'password' => 'hashed',
+         ];
+     }
++
++    /**
++     * @return HasMany<EntityMembership, $this>
++     */
++    public function memberships(): HasMany
++    {
++        return $this->hasMany(EntityMembership::class);
++    }
++
++    /**
++     * The live (not soft-deleted) entities this user belongs to.
++     *
++     * @return BelongsToMany<Entity, $this>
++     */
++    public function entities(): BelongsToMany
++    {
++        return $this->belongsToMany(Entity::class, 'entity_memberships')
++            ->withPivot('role')
++            ->withTimestamps();
++    }
++
++    /**
++     * The user's membership in the given entity, or null when they are not a member
++     * or the entity has been deleted.
++     */
++    public function membershipFor(int $entityId): ?EntityMembership
++    {
++        return $this->memberships()
++            ->where('entity_id', $entityId)
++            ->whereHas('entity')
++            ->first();
++    }
+ }
+diff --git a/app/Models/UserRole.php b/app/Models/UserRole.php
+new file mode 100644
+index 0000000..ae339b3
+--- /dev/null
++++ b/app/Models/UserRole.php
+@@ -0,0 +1,20 @@
++<?php
++
++namespace App\Models;
++
++enum UserRole: string
++{
++    case Owner = 'owner';
++    case Admin = 'admin';
++    case Employee = 'employee';
++
++    /**
++     * Roles an owner or admin may hand out. The owner role is never assigned this way.
++     *
++     * @return list<self>
++     */
++    public static function manageable(): array
++    {
++        return [self::Admin, self::Employee];
++    }
++}
+diff --git a/app/Policies/EntityMembershipPolicy.php b/app/Policies/EntityMembershipPolicy.php
+new file mode 100644
+index 0000000..88aefee
+--- /dev/null
++++ b/app/Policies/EntityMembershipPolicy.php
+@@ -0,0 +1,52 @@
++<?php
++
++namespace App\Policies;
++
++use App\Models\EntityMembership;
++use App\Models\User;
++use App\Models\UserRole;
++
++class EntityMembershipPolicy
++{
++    public function view(User $user, EntityMembership $membership): bool
++    {
++        return $user->membershipFor($membership->entity_id) !== null;
++    }
++
++    /**
++     * Owners and admins assign roles, but never to the owner membership: ownership
++     * moves only through a transfer, not through a role change.
++     */
++    public function assignRole(User $user, EntityMembership $membership): bool
++    {
++        return $this->actorHasRole($user, $membership, [UserRole::Owner, UserRole::Admin])
++            && in_array($membership->role, UserRole::manageable(), true);
++    }
++
++    /**
++     * The owner membership can never be deleted. Anyone may remove their own
++     * membership, and owners and admins may remove the others.
++     */
++    public function delete(User $user, EntityMembership $membership): bool
++    {
++        if ($membership->role === UserRole::Owner) {
++            return false;
++        }
++
++        if ($membership->user_id === $user->id) {
++            return true;
++        }
++
++        return $this->actorHasRole($user, $membership, [UserRole::Owner, UserRole::Admin]);
++    }
++
++    /**
++     * @param  list<UserRole>  $roles
++     */
++    private function actorHasRole(User $user, EntityMembership $membership, array $roles): bool
++    {
++        $actor = $user->membershipFor($membership->entity_id);
++
++        return $actor !== null && in_array($actor->role, $roles, true);
++    }
++}
+diff --git a/app/Policies/EntityPolicy.php b/app/Policies/EntityPolicy.php
+new file mode 100644
+index 0000000..49e3334
+--- /dev/null
++++ b/app/Policies/EntityPolicy.php
+@@ -0,0 +1,48 @@
++<?php
++
++namespace App\Policies;
++
++use App\Models\Entity;
++use App\Models\User;
++use App\Models\UserRole;
++
++class EntityPolicy
++{
++    /**
++     * Any authenticated user may open a new entity; they become its owner.
++     */
++    public function create(User $user): bool
++    {
++        return true;
++    }
++
++    public function view(User $user, Entity $entity): bool
++    {
++        return $user->membershipFor($entity->id) !== null;
++    }
++
++    public function update(User $user, Entity $entity): bool
++    {
++        return $this->hasRole($user, $entity, [UserRole::Owner, UserRole::Admin]);
++    }
++
++    public function delete(User $user, Entity $entity): bool
++    {
++        return $this->hasRole($user, $entity, [UserRole::Owner, UserRole::Admin]);
++    }
++
++    public function manageSettings(User $user, Entity $entity): bool
++    {
++        return $this->hasRole($user, $entity, [UserRole::Owner]);
++    }
++
++    /**
++     * @param  list<UserRole>  $roles
++     */
++    private function hasRole(User $user, Entity $entity, array $roles): bool
++    {
++        $membership = $user->membershipFor($entity->id);
++
++        return $membership !== null && in_array($membership->role, $roles, true);
++    }
++}
+diff --git a/app/Providers/AppServiceProvider.php b/app/Providers/AppServiceProvider.php
+index 59d9240..3964638 100644
+--- a/app/Providers/AppServiceProvider.php
++++ b/app/Providers/AppServiceProvider.php
+@@ -2,6 +2,7 @@
+ 
+ namespace App\Providers;
+ 
++use App\Tenancy\CurrentEntity;
+ use Illuminate\Support\Facades\Blade;
+ use Illuminate\Support\Facades\URL;
+ use Illuminate\Support\ServiceProvider;
+@@ -14,7 +15,8 @@ class AppServiceProvider extends ServiceProvider
+      */
+     public function register(): void
+     {
+-        //
++        // One tenant context per request (and per Octane request), never shared between them.
++        $this->app->scoped(CurrentEntity::class);
+     }
+ 
+     /**
+diff --git a/app/Tenancy/CurrentEntity.php b/app/Tenancy/CurrentEntity.php
+new file mode 100644
+index 0000000..fb63423
+--- /dev/null
++++ b/app/Tenancy/CurrentEntity.php
+@@ -0,0 +1,30 @@
++<?php
++
++namespace App\Tenancy;
++
++use App\Models\Entity;
++use App\Models\EntityMembership;
++
++/**
++ * The entity this request works in. The current_entity middleware resolves it from the
++ * session; code below the HTTP layer asks this object instead of reading the session.
++ */
++class CurrentEntity
++{
++    private ?EntityMembership $membership = null;
++
++    public function set(EntityMembership $membership): void
++    {
++        $this->membership = $membership;
++    }
++
++    public function membership(): ?EntityMembership
++    {
++        return $this->membership;
++    }
++
++    public function entity(): ?Entity
++    {
++        return $this->membership?->entity;
++    }
++}
+diff --git a/bootstrap/app.php b/bootstrap/app.php
+index 23eceab..81006ea 100644
+--- a/bootstrap/app.php
++++ b/bootstrap/app.php
+@@ -1,5 +1,6 @@
+ <?php
+ 
++use App\Http\Middleware\ResolveCurrentEntity;
+ use Illuminate\Foundation\Application;
+ use Illuminate\Foundation\Configuration\Exceptions;
+ use Illuminate\Foundation\Configuration\Middleware;
+@@ -14,6 +15,10 @@
+     ->withMiddleware(function (Middleware $middleware): void {
+         // Honor X-Forwarded-* from the edge reverse proxy (Caddy on the VPS).
+         $middleware->trustProxies(at: '*');
++
++        $middleware->alias([
++            'current_entity' => ResolveCurrentEntity::class,
++        ]);
+     })
+     ->withExceptions(function (Exceptions $exceptions): void {
+         $exceptions->shouldRenderJsonWhen(
+diff --git a/database/factories/EntityFactory.php b/database/factories/EntityFactory.php
+new file mode 100644
+index 0000000..1d1386a
+--- /dev/null
++++ b/database/factories/EntityFactory.php
+@@ -0,0 +1,25 @@
++<?php
++
++namespace Database\Factories;
++
++use App\Models\Entity;
++use Illuminate\Database\Eloquent\Factories\Factory;
++
++/**
++ * @extends Factory<Entity>
++ */
++class EntityFactory extends Factory
++{
++    /**
++     * Define the model's default state.
++     *
++     * @return array<string, mixed>
++     */
++    public function definition(): array
++    {
++        return [
++            'name' => fake()->company(),
++            'slug' => fake()->unique()->slug(),
++        ];
++    }
++}
+diff --git a/database/factories/EntityMembershipFactory.php b/database/factories/EntityMembershipFactory.php
+new file mode 100644
+index 0000000..6094330
+--- /dev/null
++++ b/database/factories/EntityMembershipFactory.php
+@@ -0,0 +1,44 @@
++<?php
++
++namespace Database\Factories;
++
++use App\Models\Entity;
++use App\Models\EntityMembership;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Database\Eloquent\Factories\Factory;
++
++/**
++ * @extends Factory<EntityMembership>
++ */
++class EntityMembershipFactory extends Factory
++{
++    /**
++     * Define the model's default state.
++     *
++     * @return array<string, mixed>
++     */
++    public function definition(): array
++    {
++        return [
++            'entity_id' => Entity::factory(),
++            'user_id' => User::factory(),
++            'role' => UserRole::Employee,
++        ];
++    }
++
++    public function owner(): static
++    {
++        return $this->state(fn () => ['role' => UserRole::Owner]);
++    }
++
++    public function admin(): static
++    {
++        return $this->state(fn () => ['role' => UserRole::Admin]);
++    }
++
++    public function employee(): static
++    {
++        return $this->state(fn () => ['role' => UserRole::Employee]);
++    }
++}
+diff --git a/database/migrations/2026_10_29_044040_create_entities_table.php b/database/migrations/2026_10_29_044040_create_entities_table.php
+new file mode 100644
+index 0000000..b6e6db7
+--- /dev/null
++++ b/database/migrations/2026_10_29_044040_create_entities_table.php
+@@ -0,0 +1,32 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    /**
++     * Run the migrations.
++     */
++    public function up(): void
++    {
++        Schema::create('entities', function (Blueprint $table) {
++            $table->id();
++            $table->string('name');
++            $table->string('slug');
++            $table->timestamps();
++            $table->softDeletes();
++
++            $table->unique('slug', 'entities_slug_unique');
++        });
++    }
++
++    /**
++     * Reverse the migrations.
++     */
++    public function down(): void
++    {
++        Schema::dropIfExists('entities');
++    }
++};
+diff --git a/database/migrations/2026_10_29_044041_create_entity_memberships_table.php b/database/migrations/2026_10_29_044041_create_entity_memberships_table.php
+new file mode 100644
+index 0000000..21f23df
+--- /dev/null
++++ b/database/migrations/2026_10_29_044041_create_entity_memberships_table.php
+@@ -0,0 +1,37 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    /**
++     * Run the migrations.
++     */
++    public function up(): void
++    {
++        Schema::create('entity_memberships', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('entity_id')->constrained('entities')->cascadeOnDelete();
++            $table->foreignId('user_id')->constrained('users')->cascadeOnDelete();
++            $table->string('role')->default('employee');
++            // 1 for the owner, NULL otherwise. Unique indexes ignore NULLs, so this
++            // allows exactly one owner per entity and any number of other members.
++            // Generated columns and unique indexes behave the same on SQLite and MariaDB.
++            $table->unsignedTinyInteger('owner_seq')->nullable()->storedAs("case when role = 'owner' then 1 else null end");
++            $table->timestamps();
++
++            $table->unique(['entity_id', 'user_id'], 'entity_memberships_entity_user_unique');
++            $table->unique(['entity_id', 'owner_seq'], 'entity_memberships_one_owner');
++        });
++    }
++
++    /**
++     * Reverse the migrations.
++     */
++    public function down(): void
++    {
++        Schema::dropIfExists('entity_memberships');
++    }
++};
+diff --git a/docs/architecture.md b/docs/architecture.md
+index a2550af..9ade155 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -132,8 +132,12 @@ ## Authorization boundary
+ Authorization is enforced server-side at every state-changing operation. In
+ particular:
+ 
+-- entity membership determines tenant scope;
+-- owner/admin/employee roles determine role-level access;
++- entity membership determines tenant scope. The web session's
++  `current_entity_id` is resolved by the `current_entity` middleware into the
++  request's tenant context (`App\Tenancy\CurrentEntity`), which returns 403 when
++  the user is not a member of that entity. Code below the HTTP layer reads the
++  tenant context, not the session;
++- owner/admin/employee roles determine role-level access (`app/Policies/`);
+ - employee queue permissions determine queue-level access;
+ - billing operations are owner-only;
+ - subscription limits are enforced before creating users or queues;
+diff --git a/docs/business-rules.md b/docs/business-rules.md
+index 7a3126a..62eb1f1 100644
+--- a/docs/business-rules.md
++++ b/docs/business-rules.md
+@@ -45,16 +45,24 @@ ### User Roles
+ 
+ | Role | Scope | Rules |
+ | ---- | ----- | ----- |
+-| **Admin** | Entity | Explicit access to everything in the entity. First account created in the entity is admin. |
++| **Admin** | Entity | Explicit access to everything in the entity. Granted by the owner or another admin. The account that creates an entity becomes its owner, not an admin. |
+ | **Owner** | Entity | Same operational access as admin, **except**: cannot be removed; every entity has **necessarily one** owner; ownership transfer only between admins; **only the owner** manages payment and subscription (Asaas). |
+ | **Employee** | Entity | **Limited and granular** access (queues, screens and actions per assigned permissions). |
+ 
+ **Invariants:**
+ 
+-- Every entity has exactly one owner.
++- Every entity has exactly one owner. The database enforces "at most one" (see [`database-schema.md`](database-schema.md)).
+ - Owner cannot be removed while being owner; transfer ownership before downgrading or deleting.
++- The owner membership is never deleted and never given another role by role assignment; only a transfer changes the owner.
+ - Only owner accesses billing, plan and payment data.
+ 
++### Tenant session and onboarding
++
++- A user works inside **one entity at a time**. The session holds the current entity; the user can switch to any entity they belong to, and only to those.
++- A user with **no entity** is sent to onboarding. Creating an entity there makes them its owner. A user with **one** entity goes straight into it; a user with **several** chooses one in the entity switcher.
++- A request for an entity the user does not belong to is forbidden (403), whatever entity the session holds.
++- A deleted entity stops being accessible at once. Its slug stays reserved, so it is never reused.
++
+ ## User Administration
+ 
+ | Action | Who can | Rules |
+diff --git a/docs/database-schema.md b/docs/database-schema.md
+index dc42ac2..0dcf7b0 100644
+--- a/docs/database-schema.md
++++ b/docs/database-schema.md
+@@ -1,6 +1,6 @@
+ # Database Schema — PegaFila
+ 
+-Relational model derived from [`business-rules.md`](business-rules.md). Domain proposal — no migrations in this repository yet.
++Relational model derived from [`business-rules.md`](business-rules.md). Only `entities` and `entity_memberships` are implemented (migrations in `database/migrations/`, models in `app/Models/`); the rest of the diagram is still a proposal.
+ 
+ ## ER Diagram
+ 
+@@ -31,9 +31,9 @@ ## ER Diagram
+         bigint id PK
+         string name
+         string slug UK
+-        bigint owner_membership_id FK
+         string locale_default
+         datetime created_at
++        datetime deleted_at
+     }
+     billing_accounts {
+         bigint id PK
+@@ -87,7 +87,8 @@ ## ER Diagram
+         bigint id PK
+         bigint entity_id FK
+         bigint user_id FK
+-        string role
++        string role "[owner, admin, employee]"
++        int owner_seq "generated: 1 when owner, else NULL"
+         datetime created_at
+     }
+     queues {
+@@ -133,8 +134,8 @@ ## Main Relationships
+ | `billing_accounts` → `subscriptions` | 1 : 1 | One subscription per entity; history in `payments` |
+ | `payment_options` → `subscriptions` | 1 : 1 | Defines payment method (cycle, method, discount) |
+ | `subscriptions` → `payments` | 1 : N | Individual charges; status synced with Asaas |
+-| `entities` → `entity_memberships` | 1 : N | User operates within one entity (see cardinality note) |
+-| `entities` → `owner` (`entity_memberships`) | 1 : 1 | Invariant: exactly one owner per entity (via `owner_membership_id`) |
++| `entities` → `entity_memberships` | 1 : N | A user holds one membership per entity (see cardinality note) |
++| `entities` → `owner` (`entity_memberships`) | 1 : 1 | Invariant: exactly one owner per entity, enforced by unique `(entity_id, owner_seq)` |
+ | `entity_memberships.role` | enum | `admin`, `owner`, `employee` — billing only for owner |
+ | `plans` → limits | — | `max_users`, `max_queues` |
+ | `queue_access` | join 1:N/1:N | Employee: granular permissions per queue |
+@@ -145,8 +146,9 @@ ## Main Relationships
+ ## Modeling Notes
+ 
+ - **Account vs member:** `users` is the login account (Laravel Auth); `entity_memberships` is the user's link to the entity with role.
+-- **User↔entity cardinality:** `entity_memberships` is N:N by design (allows future multi-entity). In MVP, "one user per entity" rule is enforced in application; no global UK on `user_id`.
+-- **Owner and circular FK:** `entities.owner_membership_id` points to the membership with `role = owner`. Since `entity_memberships.entity_id` references `entities`, the FK is circular — on bootstrap, create entity with `owner_membership_id` null, create owner membership, then fill the FK (or use deferrable constraint). Ownership transfer updates this FK and involved roles.
++- **User↔entity cardinality:** `entity_memberships` is N:N by design (allows future multi-entity). "One membership per user per entity" is the unique `(entity_id, user_id)` index (`entity_memberships_entity_user_unique`); there is no global UK on `user_id`.
++- **Owner without a circular FK:** there is no `owner_membership_id` column. The owner is the membership with `role = owner`. The stored generated column `owner_seq` is `1` for the owner and `NULL` otherwise, and the unique index `entity_memberships_one_owner (entity_id, owner_seq)` rejects a second owner. Unique indexes ignore `NULL`s, so any number of admins and employees is allowed. The same expression works on SQLite and MariaDB. An ownership transfer must demote the current owner before promoting another member, in one transaction; the index enforces that order.
++- **Soft deletes:** `entities` are soft-deleted. Their slugs stay reserved (the unique index covers deleted rows), and their memberships do not count as access.
+ - **Numeric priority:** `tickets.priority` is an integer — **higher value, more prioritized**. Named levels (normal/priority/80+) are configurable presets per entity mapping to values; sorting uses the number.
+ - **Ticket write-once:** ticket is **single-use** and receives **one single call**. All fields are immutable after issuance, **except** `called_at` and `called_by_user_id`, filled at call time. No call history table.
+ - **Ticket ↔ totem:** ticket knows only its **queue** (`queue_id`). `channel` records origin type; no FK to `totems`.
+@@ -158,5 +160,5 @@ ## Modeling Notes
+ - **Payments:** `payments` tracks each charge generated by subscription; status synced with Asaas (PENDING, RECEIVED, REFUNDED, CANCELED, OVERDUE).
+ - **Billing account:** `cpf_cnpj` stores fiscal data for invoice generation.
+ - **Enums:** `role` (`admin`, `owner`, `employee`); `subscriptions.status`; `tickets.channel`; `tickets.status` — values in business rules.
+-- **Unique constraints:** `billing_accounts (entity_id)`; `entity_memberships (entity_id, user_id)`; `queues (entity_id, slug)`; `queue_access (entity_membership_id, queue_id)`; `tickets (queue_id, code)` per issuance window; `payments (asaas_payment_id)`; `subscriptions (billing_account_id)` (1:1).
++- **Unique constraints:** `entities (slug)` (`entities_slug_unique`); `billing_accounts (entity_id)`; `entity_memberships (entity_id, user_id)` (`entity_memberships_entity_user_unique`); `entity_memberships (entity_id, owner_seq)` (`entity_memberships_one_owner`); `queues (entity_id, slug)`; `queue_access (entity_membership_id, queue_id)`; `tickets (queue_id, code)` per issuance window; `payments (asaas_payment_id)`; `subscriptions (billing_account_id)` (1:1).
+ - **Suggested indexes:** `(queue_id, status, priority, issued_at)` on `tickets`.
+\ No newline at end of file
+diff --git a/lang/en/ui.php b/lang/en/ui.php
+index 715351d..3ddaaea 100644
+--- a/lang/en/ui.php
++++ b/lang/en/ui.php
+@@ -47,4 +47,12 @@
+     'email_verified' => 'E-mail verified',
+     'email_not_verified' => 'E-mail not verified',
+ 
++    'onboarding_title' => 'Create your entity',
++    'onboarding_heading' => 'Create your company',
++    'entity_name' => 'Company name',
++    'create_entity' => 'Create entity',
++    'too_many_entities' => 'Too many entities created in a short time. Try again in a few minutes.',
++    'entity_dashboard' => 'Entity dashboard',
++    'switch_entity' => 'Switch entity',
++
+ ];
+diff --git a/lang/pt_BR/ui.php b/lang/pt_BR/ui.php
+index a1d646a..51c6706 100644
+--- a/lang/pt_BR/ui.php
++++ b/lang/pt_BR/ui.php
+@@ -47,4 +47,12 @@
+     'email_verified' => 'E-mail verificado',
+     'email_not_verified' => 'E-mail não verificado',
+ 
++    'onboarding_title' => 'Crie sua entidade',
++    'onboarding_heading' => 'Crie sua empresa',
++    'entity_name' => 'Nome da empresa',
++    'create_entity' => 'Criar entidade',
++    'too_many_entities' => 'Muitas entidades criadas em pouco tempo. Tente novamente em alguns minutos.',
++    'entity_dashboard' => 'Painel da entidade',
++    'switch_entity' => 'Trocar de entidade',
++
+ ];
+diff --git a/resources/views/entity/switcher.blade.php b/resources/views/entity/switcher.blade.php
+new file mode 100644
+index 0000000..2e5a4a8
+--- /dev/null
++++ b/resources/views/entity/switcher.blade.php
+@@ -0,0 +1,19 @@
++<x-layouts::default-page :title="__('ui.switch_entity')">
++    <div class="columns is-centered">
++        <div class="column is-half">
++            <h2 class="title is-4 has-text-centered mb-4">{{ __('ui.switch_entity') }}</h2>
++
++            @foreach ($entities as $entity)
++                <form method="POST" action="{{ route('entity.pick', $entity) }}" class="mb-3">
++                    @csrf
++                    @php($isCurrent = $entity->id === $currentEntityId)
++                    <button
++                        type="submit"
++                        class="button is-fullwidth {{ $isCurrent ? 'is-link' : 'is-light' }}"
++                        @if ($isCurrent) data-current="1" @endif
++                    >{{ $entity->name }}</button>
++                </form>
++            @endforeach
++        </div>
++    </div>
++</x-layouts::default-page>
+diff --git a/resources/views/home.blade.php b/resources/views/home.blade.php
+deleted file mode 100644
+index 3cc3634..0000000
+--- a/resources/views/home.blade.php
++++ /dev/null
+@@ -1,15 +0,0 @@
+-<x-layouts::default-page>
+-    <div class="columns is-centered">
+-        <div class="column is-4">
+-            <div class="box has-text-centered">
+-                <h2 class="title is-4">{{ __('ui.welcome', ['name' => auth()->user()->name]) }}</h2>
+-                <p class="subtitle">{{ __('ui.logged_in') }}</p>
+-                @if (auth()->user()->hasVerifiedEmail())
+-                    <p class="has-text-success">{{ __('ui.email_verified') }}</p>
+-                @else
+-                    <p class="has-text-warning">{{ __('ui.email_not_verified') }}</p>
+-                @endif
+-            </div>
+-        </div>
+-    </div>
+-</x-layouts::default-page>
+\ No newline at end of file
+diff --git a/resources/views/layouts/default-page.blade.php b/resources/views/layouts/default-page.blade.php
+index 3411b62..b82dc2d 100644
+--- a/resources/views/layouts/default-page.blade.php
++++ b/resources/views/layouts/default-page.blade.php
+@@ -11,6 +11,9 @@
+                 <div class="navbar-item">
+                     <span class="has-text-weight-semibold">{{ auth()->user()->name }}</span>
+                 </div>
++                @if (auth()->user()->entities()->count() > 1)
++                    <a href="{{ route('entity.switcher') }}" class="navbar-item">{{ __('ui.switch_entity') }}</a>
++                @endif
+                 <form method="POST" action="{{ route('logout') }}">
+                     @csrf
+                     <button type="submit" class="navbar-item button is-ghost">{{ __('ui.logout') }}</button>
+diff --git a/resources/views/livewire/entity/create-entity.blade.php b/resources/views/livewire/entity/create-entity.blade.php
+new file mode 100644
+index 0000000..91e7f4a
+--- /dev/null
++++ b/resources/views/livewire/entity/create-entity.blade.php
+@@ -0,0 +1,11 @@
++<div>
++    <h2 class="title is-4 has-text-centered mb-4">{{ __('ui.onboarding_heading') }}</h2>
++
++    <form wire:submit="submit">
++        <x-form-field :label="__('ui.entity_name')" name="name" type="text" :required="true" wire:model="name" />
++
++        <div class="field mt-4">
++            <x-button type="submit" variant="is-primary" size="fullwidth">{{ __('ui.create_entity') }}</x-button>
++        </div>
++    </form>
++</div>
+diff --git a/resources/views/livewire/entity/dashboard.blade.php b/resources/views/livewire/entity/dashboard.blade.php
+new file mode 100644
+index 0000000..5cc1303
+--- /dev/null
++++ b/resources/views/livewire/entity/dashboard.blade.php
+@@ -0,0 +1,4 @@
++<div>
++    <h2 class="title is-4 has-text-centered mb-2">{{ $entity->name }}</h2>
++    <p class="subtitle has-text-centered">{{ __('ui.entity_dashboard') }}</p>
++</div>
+diff --git a/routes/web.php b/routes/web.php
+index 25a89cc..7ee9ec2 100644
+--- a/routes/web.php
++++ b/routes/web.php
+@@ -2,9 +2,13 @@
+ 
+ use App\Http\Controllers\Auth\VerifyEmailController;
+ use App\Http\Controllers\AuthController;
++use App\Http\Controllers\EntityController;
++use App\Http\Controllers\HomeController;
+ use App\Http\Controllers\PasswordResetController;
+ use App\Livewire\Auth\Login;
+ use App\Livewire\Auth\Register;
++use App\Livewire\Entity\CreateEntity;
++use App\Livewire\Entity\Dashboard;
+ use Illuminate\Support\Facades\Route;
+ 
+ Route::get('/', function () {
+@@ -15,9 +19,25 @@
+     return view('bulma-test');
+ });
+ 
+-Route::get('/home', function () {
+-    return view('home');
+-})->middleware(['auth', 'verified'])->name('home');
++Route::get('/home', HomeController::class)
++    ->middleware(['auth', 'verified', 'current_entity'])
++    ->name('home');
++
++Route::livewire('/onboarding', CreateEntity::class)
++    ->middleware(['auth', 'verified'])
++    ->name('onboarding');
++
++// The switcher is declared before the dashboard so /e/switcher is never read as an entity slug.
++Route::controller(EntityController::class)
++    ->middleware(['auth', 'verified'])
++    ->group(function () {
++        Route::get('/e/switcher', 'switcher')->name('entity.switcher');
++        Route::post('/e/{entity:slug}/pick', 'pick')->name('entity.pick');
++    });
++
++Route::livewire('/e/{entity:slug}', Dashboard::class)
++    ->middleware(['auth', 'verified', 'current_entity'])
++    ->name('entity.dashboard');
+ 
+ Route::livewire('/login', Login::class)->name('login')->middleware('guest');
+ Route::livewire('/register', Register::class)->name('register')->middleware('guest');
+diff --git a/tests/Feature/CreateEntityTest.php b/tests/Feature/CreateEntityTest.php
+new file mode 100644
+index 0000000..54214ac
+--- /dev/null
++++ b/tests/Feature/CreateEntityTest.php
+@@ -0,0 +1,181 @@
++<?php
++
++use App\Livewire\Entity\CreateEntity;
++use App\Models\Entity;
++use App\Models\EntityMembership;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Database\UniqueConstraintViolationException;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Facades\Log;
++use Livewire\Exceptions\PublicPropertyNotFoundException;
++use Livewire\Livewire;
++
++uses(RefreshDatabase::class);
++
++/** Simulates a concurrent insert: the first slug handed out is one another request already took. */
++class CollidingSlugCreateEntity extends CreateEntity
++{
++    public static int $calls = 0;
++
++    protected function uniqueSlug(string $name): string
++    {
++        return ++static::$calls === 1 ? 'acme-corp' : parent::uniqueSlug($name);
++    }
++}
++
++/** Every attempt collides, so the component must give up instead of looping forever. */
++class AlwaysCollidingSlugCreateEntity extends CreateEntity
++{
++    protected function uniqueSlug(string $name): string
++    {
++        return 'acme-corp';
++    }
++}
++
++beforeEach(function () {
++    $this->user = User::factory()->create();
++});
++
++test('the onboarding page renders its title, heading and a labelled name field', function () {
++    $this->actingAs($this->user)
++        ->get(route('onboarding'))
++        ->assertOk()
++        ->assertSee('Crie sua entidade')
++        ->assertSee('Crie sua empresa')
++        ->assertSee('for="name"', false)
++        ->assertSee('wire:model="name"', false);
++});
++
++test('the onboarding page is in English when the locale is English', function () {
++    app()->setLocale('en');
++
++    $this->actingAs($this->user)
++        ->get(route('onboarding'))
++        ->assertSee('Create your entity')
++        ->assertSee('Create your company');
++});
++
++test('creating an entity makes the creator its owner, opens its dashboard and is audited', function () {
++    $audit = Mockery::spy();
++    Log::shouldReceive('channel')->with('audit')->andReturn($audit);
++
++    Livewire::actingAs($this->user)
++        ->test(CreateEntity::class)
++        ->set('name', 'Acme Corp')
++        ->call('submit')
++        ->assertHasNoErrors()
++        ->assertRedirect(route('entity.dashboard', 'acme-corp'));
++
++    $entity = Entity::query()->sole();
++    $membership = EntityMembership::query()->sole();
++
++    expect($entity->name)->toBe('Acme Corp')
++        ->and($entity->slug)->toBe('acme-corp')
++        ->and($membership->entity_id)->toBe($entity->id)
++        ->and($membership->user_id)->toBe($this->user->id)
++        ->and($membership->role)->toBe(UserRole::Owner)
++        ->and(session('current_entity_id'))->toBe($entity->id);
++
++    $audit->shouldHaveReceived('info')->with('Entity created', [
++        'entity_id' => $entity->id,
++        'actor_id' => $this->user->id,
++    ])->once();
++});
++
++test('the name is required', function () {
++    Livewire::actingAs($this->user)
++        ->test(CreateEntity::class)
++        ->set('name', '   ')
++        ->call('submit')
++        ->assertHasErrors(['name' => 'required']);
++
++    expect(Entity::query()->count())->toBe(0)
++        ->and(EntityMembership::query()->count())->toBe(0);
++});
++
++test('a taken slug gets the next free numeric suffix', function () {
++    Entity::factory()->create(['slug' => 'acme-corp']);
++    Entity::factory()->create(['slug' => 'acme-corp-2']);
++
++    Livewire::actingAs($this->user)
++        ->test(CreateEntity::class)
++        ->set('name', 'Acme Corp')
++        ->call('submit')
++        ->assertRedirect(route('entity.dashboard', 'acme-corp-3'));
++});
++
++test('a soft-deleted entity keeps its slug reserved', function () {
++    Entity::factory()->create(['slug' => 'acme-corp'])->delete();
++
++    Livewire::actingAs($this->user)
++        ->test(CreateEntity::class)
++        ->set('name', 'Acme Corp')
++        ->call('submit')
++        ->assertRedirect(route('entity.dashboard', 'acme-corp-2'));
++});
++
++test('a name that would take the reserved switcher path gets a suffix', function () {
++    // /e/switcher is the switcher page, so an entity may not use that slug.
++    Livewire::actingAs($this->user)
++        ->test(CreateEntity::class)
++        ->set('name', 'Switcher')
++        ->call('submit')
++        ->assertRedirect(route('entity.dashboard', 'switcher-2'));
++});
++
++test('a name with no letters or digits still gets a usable slug', function () {
++    Livewire::actingAs($this->user)
++        ->test(CreateEntity::class)
++        ->set('name', '!!!')
++        ->call('submit')
++        ->assertRedirect(route('entity.dashboard', 'entity'));
++});
++
++test('a slug that collides at insert time is retried with a fresh slug', function () {
++    Entity::factory()->create(['slug' => 'acme-corp']);
++    CollidingSlugCreateEntity::$calls = 0;
++
++    Livewire::actingAs($this->user)
++        ->test(CollidingSlugCreateEntity::class)
++        ->set('name', 'Acme Corp')
++        ->call('submit')
++        ->assertHasNoErrors()
++        ->assertRedirect(route('entity.dashboard', 'acme-corp-2'));
++
++    expect(CollidingSlugCreateEntity::$calls)->toBe(2)
++        ->and(Entity::query()->count())->toBe(2)
++        ->and(EntityMembership::query()->where('user_id', $this->user->id)->count())->toBe(1);
++});
++
++test('a slug that keeps colliding stops after a bounded number of attempts and writes nothing', function () {
++    Entity::factory()->create(['slug' => 'acme-corp']);
++
++    expect(fn () => Livewire::actingAs($this->user)
++        ->test(AlwaysCollidingSlugCreateEntity::class)
++        ->set('name', 'Acme Corp')
++        ->call('submit'))->toThrow(UniqueConstraintViolationException::class);
++
++    expect(Entity::query()->count())->toBe(1)
++        ->and(EntityMembership::query()->count())->toBe(0);
++});
++
++test('a client cannot set the role or owner of the new entity', function () {
++    expect(fn () => Livewire::actingAs($this->user)
++        ->test(CreateEntity::class)
++        ->set('role', 'employee'))->toThrow(PublicPropertyNotFoundException::class);
++});
++
++test('a user creating entities in a burst is throttled', function () {
++    $component = Livewire::actingAs($this->user)->test(CreateEntity::class);
++
++    foreach (range(1, 10) as $i) {
++        $component->set('name', "Empresa {$i}")->call('submit')->assertHasNoErrors();
++    }
++
++    $component->set('name', 'Empresa 11')
++        ->call('submit')
++        ->assertHasErrors(['name']);
++
++    expect(Entity::query()->count())->toBe(10);
++});
+diff --git a/tests/Feature/EntityDashboardTest.php b/tests/Feature/EntityDashboardTest.php
+new file mode 100644
+index 0000000..1147b92
+--- /dev/null
++++ b/tests/Feature/EntityDashboardTest.php
+@@ -0,0 +1,61 @@
++<?php
++
++use App\Livewire\Entity\Dashboard;
++use App\Models\Entity;
++use App\Models\EntityMembership;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Livewire\Features\SupportLockedProperties\CannotUpdateLockedPropertyException;
++use Livewire\Livewire;
++
++uses(RefreshDatabase::class);
++
++function memberOf(User $user, Entity $entity, UserRole $role = UserRole::Employee): void
++{
++    EntityMembership::factory()->create(['user_id' => $user->id, 'entity_id' => $entity->id, 'role' => $role]);
++}
++
++beforeEach(function () {
++    $this->user = User::factory()->create();
++    $this->entity = Entity::factory()->create(['name' => 'Acme Corp']);
++    memberOf($this->user, $this->entity, UserRole::Owner);
++});
++
++test('a member sees the entity name on its dashboard', function () {
++    $this->actingAs($this->user)
++        ->withSession(['current_entity_id' => $this->entity->id])
++        ->get(route('entity.dashboard', $this->entity))
++        ->assertOk()
++        ->assertSee('Acme Corp')
++        ->assertSee('wire:id', false);
++});
++
++test('a member may open a dashboard other than the one in their session', function () {
++    $second = Entity::factory()->create(['name' => 'Second Co']);
++    memberOf($this->user, $second);
++
++    $this->actingAs($this->user)
++        ->withSession(['current_entity_id' => $this->entity->id])
++        ->get(route('entity.dashboard', $second))
++        ->assertOk()
++        ->assertSee('Second Co');
++});
++
++test('a user who is not a member of the requested entity gets 403, even with a valid session for another entity', function () {
++    $stranger = Entity::factory()->create(['name' => 'Stranger Ltd']);
++
++    $this->actingAs($this->user)
++        ->withSession(['current_entity_id' => $this->entity->id])
++        ->get(route('entity.dashboard', $stranger))
++        ->assertForbidden()
++        ->assertDontSee('Stranger Ltd');
++});
++
++test('the dashboard entity is locked against tampering in a Livewire request', function () {
++    $stranger = Entity::factory()->create(['name' => 'Stranger Ltd']);
++
++    expect(fn () => Livewire::actingAs($this->user)
++        ->test(Dashboard::class, ['entity' => $this->entity])
++        ->set('entity', $stranger))->toThrow(CannotUpdateLockedPropertyException::class);
++});
+diff --git a/tests/Feature/EntityModelTest.php b/tests/Feature/EntityModelTest.php
+new file mode 100644
+index 0000000..3713a1c
+--- /dev/null
++++ b/tests/Feature/EntityModelTest.php
+@@ -0,0 +1,154 @@
++<?php
++
++use App\Models\Entity;
++use App\Models\EntityMembership;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Database\UniqueConstraintViolationException;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Schema;
++
++uses(RefreshDatabase::class);
++
++test('entity slugs are unique at the database level, including soft-deleted entities', function () {
++    $entity = Entity::factory()->create(['slug' => 'acme-corp']);
++
++    expect(fn () => Entity::factory()->create(['slug' => 'acme-corp']))
++        ->toThrow(UniqueConstraintViolationException::class);
++
++    $entity->delete();
++
++    expect(fn () => Entity::factory()->create(['slug' => 'acme-corp']))
++        ->toThrow(UniqueConstraintViolationException::class);
++    expect(collect(Schema::getIndexes('entities'))->pluck('name'))->toContain('entities_slug_unique');
++});
++
++test('entities are routed by slug', function () {
++    $entity = Entity::factory()->create(['slug' => 'acme-corp']);
++
++    expect($entity->getRouteKeyName())->toBe('slug')
++        ->and($entity->getRouteKey())->toBe('acme-corp');
++});
++
++test('a membership defaults to the employee role when none is given', function () {
++    $entity = Entity::factory()->create();
++    $user = User::factory()->create();
++
++    DB::table('entity_memberships')->insert(['entity_id' => $entity->id, 'user_id' => $user->id]);
++
++    expect(EntityMembership::query()->sole()->role)->toBe(UserRole::Employee);
++});
++
++test('a user holds at most one membership per entity', function () {
++    $membership = EntityMembership::factory()->create();
++
++    expect(fn () => EntityMembership::factory()->create([
++        'entity_id' => $membership->entity_id,
++        'user_id' => $membership->user_id,
++    ]))->toThrow(UniqueConstraintViolationException::class);
++    expect(collect(Schema::getIndexes('entity_memberships'))->pluck('name'))
++        ->toContain('entity_memberships_entity_user_unique');
++});
++
++test('the database rejects a second owner for the same entity', function () {
++    $owner = EntityMembership::factory()->owner()->create();
++
++    expect(fn () => EntityMembership::factory()->owner()->create(['entity_id' => $owner->entity_id]))
++        ->toThrow(UniqueConstraintViolationException::class);
++    expect(collect(Schema::getIndexes('entity_memberships'))->pluck('name'))
++        ->toContain('entity_memberships_one_owner');
++});
++
++test('the database rejects promoting a member to owner while the entity has one', function () {
++    $owner = EntityMembership::factory()->owner()->create();
++    $admin = EntityMembership::factory()->admin()->create(['entity_id' => $owner->entity_id]);
++
++    expect(fn () => $admin->update(['role' => UserRole::Owner]))
++        ->toThrow(UniqueConstraintViolationException::class);
++});
++
++test('owner_seq is 1 for the owner and NULL for everyone else', function () {
++    $owner = EntityMembership::factory()->owner()->create();
++    $admin = EntityMembership::factory()->admin()->create(['entity_id' => $owner->entity_id]);
++    $employee = EntityMembership::factory()->employee()->create(['entity_id' => $owner->entity_id]);
++
++    expect(DB::table('entity_memberships')->where('id', $owner->id)->value('owner_seq'))->toBe(1)
++        ->and(DB::table('entity_memberships')->where('id', $admin->id)->value('owner_seq'))->toBeNull()
++        ->and(DB::table('entity_memberships')->where('id', $employee->id)->value('owner_seq'))->toBeNull();
++});
++
++test('an entity may have any number of admins and employees besides its owner', function () {
++    $owner = EntityMembership::factory()->owner()->create();
++
++    EntityMembership::factory()->admin()->count(2)->create(['entity_id' => $owner->entity_id]);
++    EntityMembership::factory()->employee()->count(3)->create(['entity_id' => $owner->entity_id]);
++
++    expect(EntityMembership::query()->where('entity_id', $owner->entity_id)->count())->toBe(6);
++});
++
++test('deleting an entity or a user removes its memberships', function () {
++    $membership = EntityMembership::factory()->create();
++    $other = EntityMembership::factory()->create();
++
++    $membership->entity->forceDelete();
++    $other->user->delete();
++
++    expect(EntityMembership::query()->whereKey([$membership->id, $other->id])->count())->toBe(0);
++});
++
++test('an entity exposes its owner, memberships and users', function () {
++    $entity = Entity::factory()->create();
++    $owner = EntityMembership::factory()->owner()->create(['entity_id' => $entity->id]);
++    EntityMembership::factory()->admin()->create(['entity_id' => $entity->id]);
++
++    expect($entity->owner()->first()->is($owner))->toBeTrue()
++        ->and($entity->memberships)->toHaveCount(2)
++        ->and($entity->users)->toHaveCount(2);
++});
++
++test('a user lists only the live entities they belong to', function () {
++    $user = User::factory()->create();
++    $live = EntityMembership::factory()->create(['user_id' => $user->id])->entity;
++    $deleted = EntityMembership::factory()->create(['user_id' => $user->id])->entity;
++    $deleted->delete();
++
++    expect($user->entities)->toHaveCount(1)
++        ->and($user->entities->first()->is($live))->toBeTrue();
++});
++
++test('membershipFor finds the membership only for a live entity the user belongs to', function () {
++    $user = User::factory()->create();
++    $membership = EntityMembership::factory()->admin()->create(['user_id' => $user->id]);
++    $stranger = Entity::factory()->create();
++
++    expect($user->membershipFor($membership->entity_id)->is($membership))->toBeTrue()
++        ->and($user->membershipFor($stranger->id))->toBeNull();
++
++    $membership->entity->delete();
++
++    expect($user->membershipFor($membership->entity_id))->toBeNull();
++});
++
++test('membership scopes filter by role', function () {
++    EntityMembership::factory()->owner()->create();
++    EntityMembership::factory()->admin()->count(2)->create();
++    EntityMembership::factory()->employee()->count(3)->create();
++
++    expect(EntityMembership::owner()->count())->toBe(1)
++        ->and(EntityMembership::admin()->count())->toBe(2)
++        ->and(EntityMembership::employee()->count())->toBe(3);
++});
++
++test('the membership factory creates its entity and user as an employee by default', function () {
++    $membership = EntityMembership::factory()->create();
++
++    expect($membership->role)->toBe(UserRole::Employee)
++        ->and($membership->entity)->toBeInstanceOf(Entity::class)
++        ->and($membership->user)->toBeInstanceOf(User::class);
++});
++
++test('only admins and employees are manageable roles', function () {
++    expect(UserRole::manageable())->toBe([UserRole::Admin, UserRole::Employee])
++        ->and(UserRole::from('owner'))->toBe(UserRole::Owner);
++});
+diff --git a/tests/Feature/EntityPolicyTest.php b/tests/Feature/EntityPolicyTest.php
+new file mode 100644
+index 0000000..94b4879
+--- /dev/null
++++ b/tests/Feature/EntityPolicyTest.php
+@@ -0,0 +1,126 @@
++<?php
++
++use App\Models\Entity;
++use App\Models\EntityMembership;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Facades\Gate;
++
++uses(RefreshDatabase::class);
++
++function memberWithRole(Entity $entity, UserRole $role): User
++{
++    $user = User::factory()->create();
++    EntityMembership::factory()->create(['entity_id' => $entity->id, 'user_id' => $user->id, 'role' => $role]);
++
++    return $user;
++}
++
++function membershipOf(User $user, Entity $entity): EntityMembership
++{
++    return $user->membershipFor($entity->id);
++}
++
++beforeEach(function () {
++    $this->entity = Entity::factory()->create();
++    $this->owner = memberWithRole($this->entity, UserRole::Owner);
++    $this->admin = memberWithRole($this->entity, UserRole::Admin);
++    $this->employee = memberWithRole($this->entity, UserRole::Employee);
++    $this->outsider = User::factory()->create();
++});
++
++test('any authenticated user may create an entity', function () {
++    expect(Gate::forUser($this->outsider)->allows('create', Entity::class))->toBeTrue();
++});
++
++test('any member may view the entity, outsiders may not', function (string $who, bool $expected) {
++    expect(Gate::forUser($this->{$who})->allows('view', $this->entity))->toBe($expected);
++})->with([
++    'owner' => ['owner', true],
++    'admin' => ['admin', true],
++    'employee' => ['employee', true],
++    'outsider' => ['outsider', false],
++]);
++
++test('owner and admin may update and delete the entity', function (string $who, bool $expected) {
++    expect(Gate::forUser($this->{$who})->allows('update', $this->entity))->toBe($expected)
++        ->and(Gate::forUser($this->{$who})->allows('delete', $this->entity))->toBe($expected);
++})->with([
++    'owner' => ['owner', true],
++    'admin' => ['admin', true],
++    'employee' => ['employee', false],
++    'outsider' => ['outsider', false],
++]);
++
++test('only the owner may manage the entity settings', function (string $who, bool $expected) {
++    expect(Gate::forUser($this->{$who})->allows('manageSettings', $this->entity))->toBe($expected);
++})->with([
++    'owner' => ['owner', true],
++    'admin' => ['admin', false],
++    'employee' => ['employee', false],
++    'outsider' => ['outsider', false],
++]);
++
++test('any member may view memberships of their entity, outsiders and other entities may not', function () {
++    $other = Entity::factory()->create();
++    $otherAdmin = memberWithRole($other, UserRole::Admin);
++    $target = membershipOf($this->employee, $this->entity);
++
++    expect(Gate::forUser($this->employee)->allows('view', $target))->toBeTrue()
++        ->and(Gate::forUser($this->outsider)->allows('view', $target))->toBeFalse()
++        ->and(Gate::forUser($otherAdmin)->allows('view', $target))->toBeFalse();
++});
++
++test('owner and admin may assign roles to managed memberships', function (string $who, string $targetRole, bool $expected) {
++    $target = membershipOf(memberWithRole($this->entity, UserRole::from($targetRole)), $this->entity);
++
++    expect(Gate::forUser($this->{$who})->allows('assignRole', $target))->toBe($expected);
++})->with([
++    'owner assigns employee' => ['owner', 'employee', true],
++    'owner assigns admin' => ['owner', 'admin', true],
++    'admin assigns employee' => ['admin', 'employee', true],
++    'admin assigns admin' => ['admin', 'admin', true],
++    'employee cannot assign' => ['employee', 'employee', false],
++]);
++
++test('nobody assigns a role to the owner membership, not even the owner', function () {
++    $ownerMembership = membershipOf($this->owner, $this->entity);
++
++    expect(Gate::forUser($this->owner)->allows('assignRole', $ownerMembership))->toBeFalse()
++        ->and(Gate::forUser($this->admin)->allows('assignRole', $ownerMembership))->toBeFalse();
++});
++
++test('a role cannot be assigned across entities', function () {
++    $other = Entity::factory()->create();
++    $otherEmployee = membershipOf(memberWithRole($other, UserRole::Employee), $other);
++
++    expect(Gate::forUser($this->admin)->allows('assignRole', $otherEmployee))->toBeFalse()
++        ->and(Gate::forUser($this->outsider)->allows('assignRole', $otherEmployee))->toBeFalse();
++});
++
++test('the owner membership is never deletable', function () {
++    $ownerMembership = membershipOf($this->owner, $this->entity);
++
++    expect(Gate::forUser($this->owner)->allows('delete', $ownerMembership))->toBeFalse()
++        ->and(Gate::forUser($this->admin)->allows('delete', $ownerMembership))->toBeFalse();
++});
++
++test('anyone may remove their own membership, unless they are the owner', function () {
++    $adminMembership = membershipOf($this->admin, $this->entity);
++    $employeeMembership = membershipOf($this->employee, $this->entity);
++
++    expect(Gate::forUser($this->employee)->allows('delete', $employeeMembership))->toBeTrue()
++        ->and(Gate::forUser($this->admin)->allows('delete', $adminMembership))->toBeTrue();
++});
++
++test('owner and admin may remove other memberships, employees may not', function () {
++    $employeeMembership = membershipOf($this->employee, $this->entity);
++    $adminMembership = membershipOf($this->admin, $this->entity);
++
++    expect(Gate::forUser($this->owner)->allows('delete', $employeeMembership))->toBeTrue()
++        ->and(Gate::forUser($this->admin)->allows('delete', $employeeMembership))->toBeTrue()
++        ->and(Gate::forUser($this->owner)->allows('delete', $adminMembership))->toBeTrue()
++        ->and(Gate::forUser($this->employee)->allows('delete', $adminMembership))->toBeFalse()
++        ->and(Gate::forUser($this->outsider)->allows('delete', $employeeMembership))->toBeFalse();
++});
+diff --git a/tests/Feature/EntitySwitcherTest.php b/tests/Feature/EntitySwitcherTest.php
+new file mode 100644
+index 0000000..24c1fa9
+--- /dev/null
++++ b/tests/Feature/EntitySwitcherTest.php
+@@ -0,0 +1,101 @@
++<?php
++
++use App\Models\Entity;
++use App\Models\EntityMembership;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++
++uses(RefreshDatabase::class);
++
++function joinNamedEntity(User $user, string $name, UserRole $role = UserRole::Employee): Entity
++{
++    $entity = Entity::factory()->create(['name' => $name]);
++    EntityMembership::factory()->create(['user_id' => $user->id, 'entity_id' => $entity->id, 'role' => $role]);
++
++    return $entity;
++}
++
++function htmlXPath(string $html): DOMXPath
++{
++    libxml_use_internal_errors(true);
++    $dom = new DOMDocument;
++    $dom->loadHTML($html);
++    libxml_clear_errors();
++
++    return new DOMXPath($dom);
++}
++
++test('the switcher lists only the user entities as pick forms and marks the current one', function () {
++    $user = User::factory()->create();
++    $acme = joinNamedEntity($user, 'Acme Corp', UserRole::Owner);
++    $beta = joinNamedEntity($user, 'Beta Ltd', UserRole::Employee);
++    $stranger = Entity::factory()->create(['name' => 'Stranger Ltd']);
++
++    $html = $this->actingAs($user)
++        ->withSession(['current_entity_id' => $beta->id])
++        ->get(route('entity.switcher'))
++        ->assertOk()
++        ->assertSee('Trocar de entidade')
++        ->assertDontSee('Stranger Ltd')
++        ->getContent();
++
++    $xpath = htmlXPath($html);
++    $pickForm = fn (Entity $entity) => $xpath->query('//form[@method="POST"][@action="'.route('entity.pick', $entity).'"]');
++
++    expect($pickForm($acme))->toHaveCount(1)
++        ->and($pickForm($beta))->toHaveCount(1)
++        ->and($pickForm($stranger))->toHaveCount(0);
++
++    $current = $xpath->query('//button[@data-current="1"]');
++    expect($current)->toHaveCount(1)
++        ->and($current->item(0)->getAttribute('class'))->toBe('button is-fullwidth is-link')
++        ->and($current->item(0)->parentNode->getAttribute('action'))->toBe(route('entity.pick', $beta));
++
++    $others = $xpath->query('//button[@class="button is-fullwidth is-light"]');
++    expect($others)->toHaveCount(1)
++        ->and($others->item(0)->hasAttribute('data-current'))->toBeFalse()
++        ->and($others->item(0)->textContent)->toBe('Acme Corp');
++});
++
++test('the switcher marks nothing as current when the session holds no entity', function () {
++    $user = User::factory()->create();
++    joinNamedEntity($user, 'Acme Corp');
++    joinNamedEntity($user, 'Beta Ltd');
++
++    $xpath = htmlXPath($this->actingAs($user)->get(route('entity.switcher'))->getContent());
++
++    expect($xpath->query('//button[@data-current="1"]'))->toHaveCount(0)
++        ->and($xpath->query('//button[@class="button is-fullwidth is-light"]'))->toHaveCount(2);
++});
++
++test('the switcher title is translated', function () {
++    $user = User::factory()->create();
++    joinNamedEntity($user, 'Acme Corp');
++
++    $this->actingAs($user)->get(route('entity.switcher'))->assertSee('Trocar de entidade');
++
++    app()->setLocale('en');
++    $this->actingAs($user)->get(route('entity.switcher'))->assertSee('Switch entity');
++});
++
++test('the navbar links to the switcher only for users with more than one entity', function () {
++    $user = User::factory()->create();
++    joinNamedEntity($user, 'Acme Corp');
++
++    $this->actingAs($user)
++        ->get(route('onboarding'))
++        ->assertSee($user->name)
++        ->assertDontSee('href="'.route('entity.switcher').'"', false);
++
++    joinNamedEntity($user, 'Beta Ltd');
++
++    $this->actingAs($user)
++        ->get(route('onboarding'))
++        ->assertSee('href="'.route('entity.switcher').'"', false)
++        ->assertSee('Trocar de entidade');
++});
++
++test('the navbar offers no switcher link to guests', function () {
++    $this->get(route('login'))->assertDontSee('href="'.route('entity.switcher').'"', false);
++});
+diff --git a/tests/Feature/TenantSessionTest.php b/tests/Feature/TenantSessionTest.php
+new file mode 100644
+index 0000000..d856f88
+--- /dev/null
++++ b/tests/Feature/TenantSessionTest.php
+@@ -0,0 +1,169 @@
++<?php
++
++use App\Http\Middleware\ResolveCurrentEntity;
++use App\Models\Entity;
++use App\Models\EntityMembership;
++use App\Models\User;
++use App\Models\UserRole;
++use App\Tenancy\CurrentEntity;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Http\Request;
++use Illuminate\Support\Facades\Log;
++
++uses(RefreshDatabase::class);
++
++function verifiedUser(): User
++{
++    return User::factory()->create();
++}
++
++function joinEntity(User $user, UserRole $role = UserRole::Employee): Entity
++{
++    return EntityMembership::factory()->create(['user_id' => $user->id, 'role' => $role])->entity;
++}
++
++test('guests are redirected to login from home and the entity pages', function () {
++    $entity = Entity::factory()->create();
++
++    $this->get(route('home'))->assertRedirect(route('login'));
++    $this->get(route('entity.switcher'))->assertRedirect(route('login'));
++    $this->get(route('entity.dashboard', $entity))->assertRedirect(route('login'));
++    $this->post(route('entity.pick', $entity))->assertRedirect(route('login'));
++    $this->get(route('onboarding'))->assertRedirect(route('login'));
++});
++
++test('unverified users are sent to email verification instead of the entity pages', function () {
++    $user = User::factory()->unverified()->create();
++    $entity = joinEntity($user);
++
++    $this->actingAs($user)->get(route('home'))->assertRedirect(route('verification.notice'));
++    $this->actingAs($user)->get(route('entity.dashboard', $entity))->assertRedirect(route('verification.notice'));
++    $this->actingAs($user)->get(route('entity.switcher'))->assertRedirect(route('verification.notice'));
++});
++
++test('home sends a user with no entity to onboarding', function () {
++    $user = verifiedUser();
++
++    $this->actingAs($user)->get(route('home'))->assertRedirect(route('onboarding'));
++    expect(session('current_entity_id'))->toBeNull();
++});
++
++test('home with exactly one entity sets the session and opens that dashboard', function (UserRole $role) {
++    $user = verifiedUser();
++    $entity = joinEntity($user, $role);
++
++    $this->actingAs($user)
++        ->get(route('home'))
++        ->assertRedirect(route('entity.dashboard', $entity));
++})->with([
++    'owner' => [UserRole::Owner],
++    'admin' => [UserRole::Admin],
++    'employee' => [UserRole::Employee],
++]);
++
++test('home with exactly one entity remembers it in the session', function () {
++    $user = verifiedUser();
++    $entity = joinEntity($user);
++
++    $this->actingAs($user)->get(route('home'));
++
++    $this->assertSame($entity->id, session('current_entity_id'));
++});
++
++test('home with several entities sends the user to the switcher', function () {
++    $user = verifiedUser();
++    joinEntity($user);
++    joinEntity($user);
++
++    $this->actingAs($user)
++        ->get(route('home'))
++        ->assertRedirect(route('entity.switcher'));
++    expect(session('current_entity_id'))->toBeNull();
++});
++
++test('home keeps the entity already in the session', function () {
++    $user = verifiedUser();
++    joinEntity($user);
++    $chosen = joinEntity($user, UserRole::Admin);
++
++    $this->actingAs($user)->withSession(['current_entity_id' => $chosen->id])
++        ->get(route('home'))
++        ->assertRedirect(route('entity.dashboard', $chosen));
++});
++
++test('the entity dashboard without a session follows the same dispatch', function () {
++    $user = verifiedUser();
++    $entity = Entity::factory()->create();
++
++    $this->actingAs($user)->get(route('entity.dashboard', $entity))->assertRedirect(route('onboarding'));
++
++    joinEntity($user);
++    $this->actingAs($user)->get(route('entity.dashboard', $entity))->assertForbidden();
++});
++
++test('a session entity the user no longer belongs to aborts with 403', function () {
++    $user = verifiedUser();
++    joinEntity($user);
++    $stranger = Entity::factory()->create();
++
++    $this->actingAs($user)
++        ->withSession(['current_entity_id' => $stranger->id])
++        ->get(route('home'))
++        ->assertForbidden();
++});
++
++test('the current_entity middleware exposes the resolved membership in the request', function () {
++    $user = verifiedUser();
++    $entity = joinEntity($user, UserRole::Admin);
++    $request = Request::create('/', 'GET');
++    $request->setUserResolver(fn () => $user);
++    $request->setLaravelSession(app('session.store'));
++    $request->session()->put('current_entity_id', $entity->id);
++
++    app(ResolveCurrentEntity::class)->handle($request, function () use ($entity) {
++        $tenant = app(CurrentEntity::class);
++
++        expect($tenant->entity()->is($entity))->toBeTrue()
++            ->and($tenant->membership()->role)->toBe(UserRole::Admin);
++
++        return response('ok');
++    });
++});
++
++test('picking an entity the user belongs to sets the session, audits and redirects to its dashboard', function () {
++    $audit = Mockery::spy();
++    Log::shouldReceive('channel')->with('audit')->andReturn($audit);
++    $user = verifiedUser();
++    joinEntity($user);
++    $entity = joinEntity($user, UserRole::Owner);
++
++    $this->actingAs($user)
++        ->post(route('entity.pick', $entity))
++        ->assertRedirect(route('entity.dashboard', $entity));
++
++    $this->assertSame($entity->id, session('current_entity_id'));
++    $audit->shouldHaveReceived('info')->with('Entity switched', [
++        'entity_id' => $entity->id,
++        'actor_id' => $user->id,
++    ])->once();
++});
++
++test('picking an entity the user does not belong to is forbidden and leaves the session untouched', function () {
++    $user = verifiedUser();
++    $mine = joinEntity($user);
++    $stranger = Entity::factory()->create();
++
++    $this->actingAs($user)
++        ->withSession(['current_entity_id' => $mine->id])
++        ->post(route('entity.pick', $stranger))
++        ->assertForbidden();
++
++    $this->assertSame($mine->id, session('current_entity_id'));
++});
++
++test('picking requires a POST', function () {
++    $user = verifiedUser();
++    $entity = joinEntity($user);
++
++    $this->actingAs($user)->get("/e/{$entity->slug}/pick")->assertStatus(405);
++});

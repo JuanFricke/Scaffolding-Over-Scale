@@ -1,0 +1,262 @@
+diff --git a/app/Actions/IssueTicket.php b/app/Actions/IssueTicket.php
+index 2feb3b3..b34688d 100644
+--- a/app/Actions/IssueTicket.php
++++ b/app/Actions/IssueTicket.php
+@@ -39,7 +39,7 @@ public function __invoke(
+                         throw new InactiveQueueException('Cannot issue a ticket into an inactive queue.');
+                     }
+ 
+-                    $code = Ticket::nextCode($lockedQueue->id);
++                    $code = Ticket::nextCode($lockedQueue->id, $priority, now()->toDateString());
+ 
+                     // System-set fields (code/status/issued_at) are not fillable by
+                     // design, so bypass mass-assignment here with trusted data.
+@@ -50,6 +50,7 @@ public function __invoke(
+                         'channel' => $channel,
+                         'status' => TicketStatus::Waiting,
+                         'issued_at' => now(),
++            'issue_date' => now()->toDateString(),
+                     ]);
+                 });
+             } catch (QueryException $e) {
+diff --git a/app/Actions/UpdateQueue.php b/app/Actions/UpdateQueue.php
+index 75b3abb..09124d7 100644
+--- a/app/Actions/UpdateQueue.php
++++ b/app/Actions/UpdateQueue.php
+@@ -17,6 +17,7 @@ public function __invoke(
+         ?string $name = null,
+         ?string $slug = null,
+         ?bool $isActive = null,
++        ?array $priorityPrefixMap = null,
+     ): Queue {
+         Gate::forUser($actor)->authorize('update', $queue);
+ 
+@@ -53,6 +54,50 @@ public function __invoke(
+             $queue->is_active = $isActive;
+         }
+ 
++        if ($priorityPrefixMap !== null) {
++            // Handle map: null leave unchanged, [] clear to default.
++            if ($priorityPrefixMap === []) {
++                $queue->priority_prefix_map = null;
++            } else {
++                // validate map
++                if (!is_array($priorityPrefixMap)) {
++                    throw ValidationException::withMessages(['priority_prefix_map' => 'Priority prefix map must be an array.']);
++                }
++                $keys = array_keys($priorityPrefixMap);
++                $seen = [];
++                foreach ($keys as $key) {
++                    if (!ctype_digit((string)$key)) {
++                        throw ValidationException::withMessages(['priority_prefix_map' => 'All keys must be non‑negative integers.']);
++                    }
++                }
++                foreach ($priorityPrefixMap as $k => $v) {
++                    if (!preg_match('/^[A-Z]$/', $v)) {
++                        throw ValidationException::withMessages(['priority_prefix_map' => 'Values must be single uppercase letters.']);
++                    }
++                    if (isset($seen[$v])) {
++                        throw ValidationException::withMessages(['priority_prefix_map' => 'Letters must be unique across the map and defaults.']);
++                    }
++                    $seen[$v] = true;
++                }
++                // ensure uniqueness with defaults
++                // (handled in subsequent check)
++                $queue->priority_prefix_map = $priorityPrefixMap;
++            // Ensure uniqueness between custom letters and default letters for uncovered levels 0/10/20
++            $defaultMap = Queue::DEFAULT_PREFIX_MAP;
++            $letters = [];
++            foreach ($defaultMap as $key => $letter) {
++                if (!array_key_exists((string)$key, $priorityPrefixMap ?? [])) {
++                    $letters[] = $letter;
++                }
++            }
++            foreach ($priorityPrefixMap ?? [] as $v) {
++                $letters[] = $v;
++            }
++            if (count($letters) !== count(array_unique($letters))) {
++                throw ValidationException::withMessages(['priority_prefix_map' => 'Prefix letters must be unique across custom map and uncovered defaults.']);
++            }
++        }
++
+         try {
+             $queue->save();
+         } catch (QueryException $e) {
+diff --git a/app/Models/Queue.php b/app/Models/Queue.php
+index c4c5272..e23fdf0 100644
+--- a/app/Models/Queue.php
++++ b/app/Models/Queue.php
+@@ -9,20 +9,24 @@
+ use Illuminate\Database\Eloquent\Relations\BelongsTo;
+ use Illuminate\Database\Eloquent\Relations\HasMany;
+ 
+-#[Fillable(['entity_id', 'name', 'slug', 'is_active', 'labels_i18n'])]
++#[Fillable(['entity_id', 'name', 'slug', 'is_active', 'labels_i18n', 'priority_prefix_map'])]
+ class Queue extends Model
+ {
+     /** @use HasFactory<QueueFactory> */
+     use HasFactory;
+ 
++    /** Default prefix mapping for priorities */
++    public const DEFAULT_PREFIX_MAP = [0 => 'N', 10 => 'P', 20 => 'E'];
++
+     /**
+-     * @return array<string, string>
++     * @return array<string, string|
+      */
+     protected function casts(): array
+     {
+         return [
+             'is_active' => 'boolean',
+             'labels_i18n' => 'array',
++            'priority_prefix_map' => 'array',
+         ];
+     }
+ 
+@@ -41,4 +45,26 @@ public function tickets(): HasMany
+     {
+         return $this->hasMany(Ticket::class);
+     }
++
++    /**
++     * Resolve the code letter for a given priority.
++     */
++    public function prefixForPriority(int $priority): string
++    {
++        // Custom map overrides
++        $customMap = $this->priority_prefix_map ?? [];
++        $key = (string) $priority;
++        if (array_key_exists($key, $customMap)) {
++            return $customMap[$key];
++        }
++
++        // Default mapping based on range
++        if ($priority <= 0) {
++            return self::DEFAULT_PREFIX_MAP[0];
++        }
++        if ($priority >= 20) {
++            return self::DEFAULT_PREFIX_MAP[20];
++        }
++        return self::DEFAULT_PREFIX_MAP[10];
++    }
+ }
+diff --git a/app/Models/Ticket.php b/app/Models/Ticket.php
+index 7dc89ba..f071265 100644
+--- a/app/Models/Ticket.php
++++ b/app/Models/Ticket.php
+@@ -3,6 +3,7 @@
+ namespace App\Models;
+ 
+ use App\Enums\TicketChannel;
++use App\Models\Queue;
+ use App\Enums\TicketStatus;
+ use App\Exceptions\InactiveQueueException;
+ use Database\Factories\TicketFactory;
+@@ -25,28 +26,30 @@ class Ticket extends Model
+     use HasFactory;
+ 
+     /**
+-     * Next display code for a queue (monotonic max+1, gap-tolerant).
++     * Next display code for a queue, considering priority prefix and issue date.
+      *
+-     * Ordered by id (insertion order), not by code string, so A999 -> A1000
+-     * keeps working where lexicographic ordering would return A999 again.
+-     * Skips malformed legacy codes (outside A<number>) by scanning for the
+-     * most recent valid code, so A001 then A-X yields A002 instead of a
+-     * duplicate A001 colliding on unique(queue_id, code).
++     * The code letter is determined by the queue's prefix map and the priority.
++     * The numeric part is the last code for the same prefix and issue_date
++     * incremented by one. Malformed legacy codes are skipped.
+      */
+-    public static function nextCode(int $queueId): string
++    public static function nextCode(int $queueId, int $priority, string $issueDate): string
+     {
++        $queue = Queue::query()->whereKey($queueId)->firstOrFail();
++        $prefix = $queue->prefixForPriority($priority);
++
+         $codes = self::query()
+             ->where('queue_id', $queueId)
++            ->where('issue_date', $issueDate)
+             ->orderByDesc('id')
+             ->pluck('code');
+ 
+         foreach ($codes as $code) {
+-            if (preg_match('/^A(\d+)$/', (string) $code, $m)) {
+-                return 'A'.str_pad((string) ((int) $m[1] + 1), 3, '0', STR_PAD_LEFT);
++            if (preg_match('/^' . preg_quote($prefix, '/') . '(\d+)$/', (string) $code, $m)) {
++                return $prefix . str_pad((string) ((int) $m[1] + 1), 3, '0', STR_PAD_LEFT);
+             }
+         }
+ 
+-        return 'A001';
++        return $prefix . '001';
+     }
+ 
+     /**
+@@ -124,6 +127,7 @@ protected function casts(): array
+             'status' => TicketStatus::class,
+             'issued_at' => 'datetime',
+             'called_at' => 'datetime',
++            'issue_date' => 'date',
+         ];
+     }
+ 
+diff --git a/database/factories/TicketFactory.php b/database/factories/TicketFactory.php
+index 4b74483..41987c6 100644
+--- a/database/factories/TicketFactory.php
++++ b/database/factories/TicketFactory.php
+@@ -33,6 +33,7 @@ public function definition(): array
+             'issued_at' => now(),
+             'called_at' => null,
+             'called_by_user_id' => null,
++            'issue_date' => now()->toDateString(),
+         ];
+     }
+ 
+@@ -43,15 +44,19 @@ public function configure(): static
+                 return;
+             }
+ 
+-            $queueId = $ticket->queue_id ?? $ticket->queue?->getKey();
++            $queue = $ticket->queue ?? ($ticket->queue_id ? Queue::find($ticket->queue_id) : null);
+ 
+-            if ($queueId === null) {
++            if ($queue === null) {
+                 $ticket->code = 'A001';
+ 
+                 return;
+             }
+ 
+-            $ticket->code = Ticket::nextCode((int) $queueId);
++            $ticket->code = Ticket::nextCode(
++                (int) $queue->id,
++                $ticket->priority,
++                $ticket->issue_date,
++            );
+         });
+     }
+ 
+diff --git a/database/migrations/2026_09_06_203415_create_tickets_table.php b/database/migrations/2026_09_06_203415_create_tickets_table.php
+index 6687910..87d3114 100644
+--- a/database/migrations/2026_09_06_203415_create_tickets_table.php
++++ b/database/migrations/2026_09_06_203415_create_tickets_table.php
+@@ -15,6 +15,8 @@ public function up(): void
+             $table->id();
+             $table->foreignId('queue_id')->constrained()->cascadeOnDelete();
+             $table->string('code');
++            // Issue date is required for daily sequence logic.
++            $table->date('issue_date')->nullable();
+             $table->integer('priority')->default(0);
+             $table->string('channel');
+             $table->string('status');
+@@ -22,8 +24,8 @@ public function up(): void
+             $table->timestamp('called_at')->nullable();
+             $table->foreignId('called_by_user_id')->nullable()->constrained('users')->nullOnDelete();
+             $table->timestamps();
+-
+-            $table->unique(['queue_id', 'code']);
++            
++            $table->unique(['queue_id', 'code', 'issue_date']);
+             $table->index(['queue_id', 'status', 'priority', 'issued_at']);
+         });
+     }
