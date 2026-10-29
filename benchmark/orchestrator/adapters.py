@@ -555,7 +555,8 @@ def contamination(tool_inputs: list[str], extra: list[str] | None = None, sandbo
             r"\.prompt\.md", r"__(none|agents|skills|full)__", r"(^|[\s\"'=])/home/(?!agent)",
             *([] if sandbox == "docker" else [r"\.\./\.\.", r"(^|[\s\"'=])~/", r"\$HOME(?!/\.)"]), *(extra or [])]
     rx = re.compile("|".join(f"(?:{p})" for p in pats))
-    return [t[:300] for t in tool_inputs if any(rx.search(loc) for loc in _locations(t))]
+    return [t[:300] for t in tool_inputs
+            if any(rx.search(SUBJECT_URL.sub("<subject-url>", loc)) for loc in _locations(t))]
 
 
 def tool_inputs_from_log(stdout: str) -> list[str]:
@@ -587,7 +588,7 @@ def _suspected_run(run_id: str, sandbox: str) -> bool | None:
     return bool(contamination(tool_inputs_from_log(log.read_text(errors="replace")), sandbox=sandbox))
 
 
-SUBJECT_URL = re.compile(r"https?://[\w.]*github[\w.]*\.com/(repos/)?PegaFila/PegaFilaWeb", re.I)
+SUBJECT_URL = re.compile(r"(https?://)?[\w.]*github[\w.]*\.com/(repos/)?PegaFila/PegaFilaWeb[\w./#?=&%-]*", re.I)
 
 
 def fetch_attempts(run_id: str) -> int:

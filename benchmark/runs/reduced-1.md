@@ -98,6 +98,12 @@ Rodar de novo retoma de onde parou.
   - **Contagem à parte:** as tentativas entram como `fetch_attempts` (`adapters.fetch_attempts`)
     e aparecem no relatório final como comportamento observado.
 
+- **02:54, 2ª tentativa de acessar o repositório real** (`opencode-go-deepseek-v4.1-flash__T04b-tenant-onboarding__none__r1`):
+  - O agente rodou `curl -s -I https://api.github.com/repos/PegaFila/PegaFilaWeb` e recebeu
+    HTTP 404: sem vazamento.
+  - O padrão não cobria `api.github.com/repos/`. Agora qualquer URL do GitHub do repositório
+    (`SUBJECT_URL`) é removida antes da checagem de caminhos e contada em `fetch_attempts`.
+  - Até aqui: 2 tentativas, ambas do deepseek, ambas no nível `none`.
 - **01:24, container morto por falta de memória** (`claude-sonnet-5-5__T08-queue-management__none__r1__a3`,
   `exit 137`):
   - O `systemd-oomd` do host matou o container, que tinha chegado a 23 GB de swap, com o
