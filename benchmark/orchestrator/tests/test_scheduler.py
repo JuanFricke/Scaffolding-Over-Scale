@@ -195,6 +195,9 @@ class ContaminationTests(unittest.TestCase):
     def test_github_link_to_subject_repo_is_not_contamination(self):
         cmd = ['{"command": "php -r \'$s=\\"see [#25](https://github.com/PegaFila/PegaFilaWeb/pull/25)\\";\'"}']
         self.assertEqual(adapters.contamination(cmd, sandbox="docker"), [])
+        url = ['{"url": "https://raw.githubusercontent.com/PegaFila/PegaFilaWeb/main/app/Livewire/Auth/Login.php"}']
+        self.assertEqual(adapters.contamination(url, sandbox="docker"), [])
+        self.assertTrue(adapters.SUBJECT_URL.search(url[0]))
 
     def test_sandbox_home_is_not_contamination(self):
         cmd = ['{"command": "ls ~/.composer; cat $HOME/.cache/x"}']

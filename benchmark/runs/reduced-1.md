@@ -86,6 +86,16 @@ Rodar de novo retoma de onde parou.
   - **Sem reinício:** o processo em andamento ainda marca com o detector antigo, mas `status` e
     `report` usam o novo.
 
+- **00:44, tentativa de buscar o repositório real** (`opencode-go-deepseek-v4.1-flash__T03a-auth-core__none__r1`):
+  o agente usou `webfetch` em
+  `https://raw.githubusercontent.com/PegaFila/PegaFilaWeb/main/app/Livewire/Auth/Login.php`.
+  - **Sem vazamento:** a ferramenta retornou erro. O repositório é privado (`private: true` na
+    API do GitHub), a URL responde 404 sem autenticação e o sandbox não tem credencial do GitHub.
+  - **Decisão:** URLs do GitHub do PegaFilaWeb não contam como contaminação, porque não podem
+    vazar nada.
+  - **Contagem à parte:** as tentativas entram como `fetch_attempts` (`adapters.fetch_attempts`)
+    e aparecem no relatório final como comportamento observado.
+
 ## Ao terminar
 
 1. Rodar `python -m orchestrator regrade --models $M --reps 1` e depois

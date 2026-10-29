@@ -524,8 +524,11 @@ def contamination(tool_inputs: list[str], extra: list[str] | None = None, sandbo
 
     In the Docker sandbox `~` / `$HOME` is the run's own throwaway home and nothing of the host sits
     above /workspace, so only host paths count there (`../..` is routine inside vendor/)."""
-    # github.com/PegaFila/PegaFilaWeb (links in CHANGELOG/docs text) is not a path on this machine
-    pats = [r"(^|[/\s\"'])\.\./+PegaFilaWeb|(?<!github\.com/PegaFila)/PegaFilaWeb(\b|/)(?!\.git)", r"Scaffolding-Over-Scale", r"benchmark/(tasks|runs|work)",
+    # GitHub URLs of the subject repo (links in docs text, fetch attempts) are not paths here: the
+    # repo is private and the sandbox has no GitHub credentials, so they cannot leak anything.
+    # Attempts are counted apart (fetch_attempts) for the report.
+    pats = [r"(^|[/\s\"'])\.\./+PegaFilaWeb|(?<!github\.com/PegaFila)(?<!githubusercontent\.com/PegaFila)"
+            r"/PegaFilaWeb(\b|/)(?!\.git)", r"Scaffolding-Over-Scale", r"benchmark/(tasks|runs|work)",
             r"\.prompt\.md", r"__(none|agents|skills|full)__", r"(^|[\s\"'=])/home/(?!agent)",
             *([] if sandbox == "docker" else [r"\.\./\.\.", r"(^|[\s\"'=])~/", r"\$HOME(?!/\.)"]), *(extra or [])]
     rx = re.compile("|".join(f"(?:{p})" for p in pats))
@@ -559,6 +562,19 @@ def _suspected_run(run_id: str, sandbox: str) -> bool | None:
     if not log.exists():
         return None
     return bool(contamination(tool_inputs_from_log(log.read_text(errors="replace")), sandbox=sandbox))
+
+
+SUBJECT_URL = re.compile(r"https?://[\w.]*github[\w.]*\.com/(repos/)?PegaFila/PegaFilaWeb", re.I)
+
+
+def fetch_attempts(run_id: str) -> int:
+    """Tool calls that tried to reach the subject repo over the network (none can succeed)."""
+    log = BENCH_DIR / "runs" / run_id / "agent.stdout.log"
+    if not log.exists():
+        return 0
+    return sum(1 for t in tool_inputs_from_log(log.read_text(errors="replace"))
+               for loc in _locations(t) if SUBJECT_URL.search(loc)
+               and not re.search(r"\]\(https?://github\.com/PegaFila/PegaFilaWeb/(pull|issues)/", loc))
 
 
 def suspected(rec: dict) -> bool:
