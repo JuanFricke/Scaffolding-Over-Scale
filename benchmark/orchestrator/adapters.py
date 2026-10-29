@@ -515,6 +515,7 @@ def _locations(tool_input: str) -> list[str]:
     out = []
     for k, v in data.items():
         if k in LOCATION_KEYS and isinstance(v, str):
+            v = v.replace("\\/", "/")      # JSON/PHP-escaped slashes inside commands
             out.append(v.split("<<", 1)[0] if k == "command" else v)   # drop heredoc bodies
     return out
 

@@ -86,6 +86,8 @@ Rodar de novo retoma de onde parou.
   - **Sem reinício:** o processo em andamento ainda marca com o detector antigo, mas `status` e
     `report` usam o novo.
 
+- **00:56, mesmo link do `CHANGELOG`, com barras escapadas** (`github.com\/PegaFila\/PegaFilaWeb`,
+  beam-free T02 agents). Agora os locais são normalizados (`\/` → `/`) antes de comparar.
 - **00:44, tentativa de buscar o repositório real** (`opencode-go-deepseek-v4.1-flash__T03a-auth-core__none__r1`):
   o agente usou `webfetch` em
   `https://raw.githubusercontent.com/PegaFila/PegaFilaWeb/main/app/Livewire/Auth/Login.php`.
