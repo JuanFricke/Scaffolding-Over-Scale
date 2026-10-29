@@ -159,6 +159,14 @@ Rodar de novo retoma de onde parou.
     60 s; 18 travamentos detectados desde 02:38; 33 células pendentes.
 - **Desenho final desta rodada:** 6 modelos, 336 células.
 
+## Fechamento (05:30)
+
+- **Concluídos:** Sonnet, Haiku 5.5, Muse, DeepSeek e gpt-oss, 56/56 cada.
+- **Estado final:** 0 `failed_infra`, 0 contaminação, `regrade` sem pendências.
+- **Beam (free):** 23/56. O provedor está fora desde 01:12, e as 33 células restantes ficam
+  pendentes; o processo segue tentando.
+- **Relatório:** `runs/reduced-1-report.md`.
+
 ## Ao terminar
 
 1. Rodar `python -m orchestrator regrade --models $M --reps 1` e depois
