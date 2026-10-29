@@ -137,6 +137,18 @@ Rodar de novo retoma de onde parou.
   - Os 6 timeouts foram reenfileirados com `retry --cells` e a razão gravada no manifesto.
   - O processo foi reiniciado às 02:38 (log `...-023852.log`); os agentes em andamento recomeçaram.
   - O timeout do deepseek no T05 none (02:26) é legítimo: o agente trabalhou até o fim.
+- **03:22, OpenCode saiu com `exit 1` depois de o agente terminar**
+  (`opencode-go-deepseek-v4.1-flash__T09-queue-management-ui__none__r1__a4`):
+  - O último evento é o resumo final do agente e o stderr está vazio, então é uma falha do CLI
+    no encerramento.
+  - Pela regra, crash desconhecido do CLI conta como `infra`, e a célula foi refeita (a5).
+  - A decisão de descartar não dependeu do resultado (o run não foi avaliado), então não
+    enviesa o pass@1.
+- **03:35, beam-free ainda fora:**
+  - 12 travamentos detectados pelo watchdog desde 02:38, todos do beam-free; nenhum de outro
+    modelo.
+  - Pausas do pool: 68 s → 120 s → 261 s → 518 s.
+  - Um "pong" direto ficou 60 s sem resposta.
 - **Desenho final desta rodada:** 6 modelos, 336 células.
 
 ## Ao terminar
