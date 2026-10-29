@@ -249,6 +249,33 @@ O GLM e o mimo saíram (eram os mais lentos do Go: ~75 e ~45 tok/s nas sessões 
 entraram os 3 mais rápidos: Muse, beam-free e deepseek. Entraram também os dois modelos locais.
 Detalhes e medições de tok/s em `runs/reduced-1.md`; para disparar, `runs/reduced-1.sh`.
 
+## Análise de qualidade de código (decisão 12, 2026-10-29)
+
+O pass@1 ficou no teto, então a pergunta passou a ser se o harness muda *como* o código é escrito.
+O pacote `benchmark/quality/` (ver o README dele) trabalha sobre os patches e as árvores dos
+runs, sem rodar agentes de novo, em três camadas:
+1. Métricas estáticas: Larastan nível 5 (erros novos contra a base), complexidade, testes
+   escritos e distância da referência.
+2. Dez regras do `AGENTS.md`, verificadas no patch.
+3. Dois juízes LLM às cegas, como skill `code-review-judge`.
+
+Decisões do Juan:
+- **Juízes:** Opus 5.5, Muse e DeepSeek, nunca o autor nem a família dele (Sonnet e Haiku →
+  Muse + DeepSeek).
+- **Cegamento:** o juiz só vê o diff, sem a solução de referência.
+- **Escopo:** piloto primeiro, com T02 + T09 (46 runs, 92 revisões, 53 min).
+
+Resultado do piloto (`runs/quality/report-pilot.md`):
+- **Concordância entre juízes:** alta, κ ponderado 0,79–0,87.
+- **Validade:** a nota dos juízes acompanha o `hidden_ok` (ρ 0,48), a camada 2 (dimensão
+  conventions ρ 0,76) e o Larastan (ρ −0,53).
+- **Efeito do harness:** a nota de convenções sobe em todos os níveis contra o `none`
+  (+0,55 a +0,75; p 0,016–0,039, Wilcoxon, 10 pares).
+- **Testes:** mais casos de teste com o harness (+6 a +8; skills p 0,031).
+- **Sem efeito:** requisitos, segurança e simplicidade não mudam.
+- **Cautelas:** n = 10 pares e ~39 comparações sem correção. O sinal de convenções é
+  consistente nos três níveis.
+
 ## Estado em 2026-10-28 (fim da sessão)
 
 **Pronto e validado**
