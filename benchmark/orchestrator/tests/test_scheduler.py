@@ -192,6 +192,10 @@ class ContaminationTests(unittest.TestCase):
         ])
         self.assertEqual(len(hits), 3)
 
+    def test_github_link_to_subject_repo_is_not_contamination(self):
+        cmd = ['{"command": "php -r \'$s=\\"see [#25](https://github.com/PegaFila/PegaFilaWeb/pull/25)\\";\'"}']
+        self.assertEqual(adapters.contamination(cmd, sandbox="docker"), [])
+
     def test_sandbox_home_is_not_contamination(self):
         cmd = ['{"command": "ls ~/.composer; cat $HOME/.cache/x"}']
         self.assertEqual(adapters.contamination(cmd, sandbox="docker"), [])

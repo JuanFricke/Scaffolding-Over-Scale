@@ -9,6 +9,7 @@ Every adapter returns an AgentResult whose `outcome` drives the scheduler:
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import os
@@ -523,17 +524,52 @@ def contamination(tool_inputs: list[str], extra: list[str] | None = None, sandbo
 
     In the Docker sandbox `~` / `$HOME` is the run's own throwaway home and nothing of the host sits
     above /workspace, so only host paths count there (`../..` is routine inside vendor/)."""
-    pats = [r"(^|[/\s\"'])\.\./+PegaFilaWeb|/PegaFilaWeb(\b|/)(?!\.git)", r"Scaffolding-Over-Scale", r"benchmark/(tasks|runs|work)",
+    # github.com/PegaFila/PegaFilaWeb (links in CHANGELOG/docs text) is not a path on this machine
+    pats = [r"(^|[/\s\"'])\.\./+PegaFilaWeb|(?<!github\.com/PegaFila)/PegaFilaWeb(\b|/)(?!\.git)", r"Scaffolding-Over-Scale", r"benchmark/(tasks|runs|work)",
             r"\.prompt\.md", r"__(none|agents|skills|full)__", r"(^|[\s\"'=])/home/(?!agent)",
             *([] if sandbox == "docker" else [r"\.\./\.\.", r"(^|[\s\"'=])~/", r"\$HOME(?!/\.)"]), *(extra or [])]
     rx = re.compile("|".join(f"(?:{p})" for p in pats))
     return [t[:300] for t in tool_inputs if any(rx.search(loc) for loc in _locations(t))]
 
 
+def tool_inputs_from_log(stdout: str) -> list[str]:
+    """Tool-call inputs from a raw agent.stdout.log (OpenCode or Claude Code event stream)."""
+    out = []
+    for line in stdout.splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") == "tool_use":                                  # OpenCode
+            inp = ((ev.get("part") or {}).get("state") or {}).get("input")
+            if inp:
+                out.append(json.dumps(inp, ensure_ascii=False))
+        elif ev.get("type") == "assistant":                               # Claude Code
+            for c in (ev.get("message") or {}).get("content") or []:
+                if isinstance(c, dict) and c.get("type") == "tool_use":
+                    out.append(json.dumps(c.get("input"), ensure_ascii=False))
+    return out
+
+
+@functools.lru_cache(maxsize=4096)
+def _suspected_run(run_id: str, sandbox: str) -> bool | None:
+    log = BENCH_DIR / "runs" / run_id / "agent.stdout.log"
+    if not log.exists():
+        return None
+    return bool(contamination(tool_inputs_from_log(log.read_text(errors="replace")), sandbox=sandbox))
+
+
 def suspected(rec: dict) -> bool:
-    """Verdict for a manifest record, re-derived from its stored hits with the current detector
-    (a detector fix then applies to runs already recorded; the hits themselves are kept)."""
-    return bool(contamination(rec.get("contamination_hits") or [], sandbox=rec.get("sandbox") or "none"))
+    """Verdict for a manifest record, re-derived with the current detector (a detector fix then
+    applies to runs already recorded). From the full raw log when it is on disk: the hits kept in
+    the manifest are cut at 300 characters and may no longer contain what matched."""
+    sandbox = rec.get("sandbox") or "none"
+    verdict = _suspected_run(rec["run_id"], sandbox) if rec.get("run_id") else None
+    if verdict is None:
+        verdict = bool(contamination(rec.get("contamination_hits") or [], sandbox=sandbox))
+    return verdict
 
 
 # --- helpers ----------------------------------------------------------------------------

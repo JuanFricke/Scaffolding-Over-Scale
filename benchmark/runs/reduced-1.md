@@ -65,6 +65,27 @@ Rodar de novo retoma de onde parou.
 - **Reavaliações:** 3 `failed_infra` do gpt-oss, causados pela regra antiga do composer, foram
   reavaliados com `regrade` antes do cancelamento: os 3 deram `hidden_ok=False`.
 
+## Execução
+
+- **Início:** 2026-10-29 00:19. Log em `runs/_logs/reduced-1-20261029-001939.log`; verificações
+  de hora em hora em `runs/_logs/reduced-1-checks.md`.
+- **00:23, deepseek-v4.1-flash validado:** 1ª célula (T01 skills) em 183 s, 25 turnos, modelo
+  certo, `hidden_ok=True`.
+
+## Incidentes
+
+- **00:37, falso positivo de contaminação** (`opencode-go-beam-free__T06-issue-ticket__skills__r1`):
+  o agente editou o `CHANGELOG.md` via `php -r`, e o texto tinha o link
+  `https://github.com/PegaFila/PegaFilaWeb/pull/25`.
+  - **Detector:** links `github.com/PegaFila/PegaFilaWeb` deixaram de contar.
+  - **Bug em `suspected()`:** o veredito recalculado usava os hits gravados no manifesto, que
+    são cortados em 300 caracteres. Agora ele lê o log bruto completo do agente e só usa os
+    hits gravados se o log não existir.
+  - **Resultado:** os 2 runs marcados até aqui são falsos positivos e voltaram para os dados.
+    Nenhum run passou a ser marcado com a checagem completa.
+  - **Sem reinício:** o processo em andamento ainda marca com o detector antigo, mas `status` e
+    `report` usam o novo.
+
 ## Ao terminar
 
 1. Rodar `python -m orchestrator regrade --models $M --reps 1` e depois
