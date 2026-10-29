@@ -167,6 +167,20 @@ Rodar de novo retoma de onde parou.
   pendentes; o processo segue tentando.
 - **Relatório:** `runs/reduced-1-report.md`.
 
+## Beam pelo OpenCode Zen e encerramento (07:08–07:45)
+
+- **07:08:** as 33 células pendentes do Beam foram retomadas por `opencode/beam-free` (Zen),
+  porque o endpoint do Go seguia fora.
+  - O campo `serve_as` da matriz (commit `30d9b0b`) mantém as células sob `opencode-go/beam-free`.
+  - Cada run grava em `served_as` o endpoint usado.
+- **07:16:** a cota gratuita do Zen acabou (`FreeUsageLimitError`, HTTP 429), depois de 6
+  células (todas ✓).
+  - Com uma chave de API do Zen o erro é o mesmo (testado por `opencode run` e direto na API).
+  - A chave não foi gravada em nenhum arquivo.
+- **07:45:** o Beam foi encerrado em 29/56 (23 pelo Go, 6 pelo Zen), por decisão do autor.
+  - O orquestrador, o `llama-server` e as verificações foram parados.
+  - O relatório foi atualizado.
+
 ## Ao terminar
 
 1. Rodar `python -m orchestrator regrade --models $M --reps 1` e depois

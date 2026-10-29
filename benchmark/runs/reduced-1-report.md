@@ -1,7 +1,8 @@
 # Rodada reduzida 1: relatório
 
 **Benchmark Scaffolding Over Scale (TCC, UNIJUÍ)**
-- **Execução:** 2026-10-29, de 00:19 a 05:30.
+- **Execução:** 2026-10-29, de 00:19 a 05:30. O Beam foi tentado de novo das 07:08 às 07:45 e
+  encerrado parcial.
 - **Desenho:** 6 modelos × 14 tarefas × 4 níveis de harness × 1 repetição.
 - **Branch:** `data/full-matrix`.
 
@@ -15,12 +16,12 @@ As tabelas completas são geradas por `runs/reduced-1-analysis.py`, com saída e
   - Sonnet 5.5: 55/56.
   - DeepSeek v4.1 flash: 56/56.
   - Muse Spark 1.3: 53/56.
-  - Beam: 23/23 nas células que rodaram.
+  - Beam: 29/29 nas células que rodaram.
   - Com o teto tão perto, não sobra espaço para o harness melhorar o pass@1.
 - **Efeito do harness sobre o pass@1:** nenhum nível (`agents`, `skills`, `full`) mudou o
   pass@1 de forma detectável em nenhum modelo.
-  - Em 73 pares modelo × tarefa por nível, as discordâncias com o `none` foram 0–1 para cada
-    lado.
+  - Em 70 pares modelo × tarefa por nível (5 modelos completos × 14 tarefas), as discordâncias
+    com o `none` foram 0–1 para cada lado.
   - Δ agregado: agents −1,4 pp, skills 0,0 pp, full −1,4 pp. McNemar exato p = 1,0 em todos.
 - **Os dois modelos abaixo do teto não reagiram ao harness:**
   - **Haiku 5.5:** 11/14 em todos os níveis. Falhou sempre nas mesmas 3 tarefas e pelo mesmo
@@ -96,11 +97,15 @@ IC 95% de Wilson entre colchetes.
 | Muse Spark 1.3 | 13/14 [0.69, 0.99] | 13/14 [0.69, 0.99] | 14/14 [0.78, 1.00] | 13/14 [0.69, 0.99] | 53/56 (0.95) |
 | Haiku 5.5 | 11/14 [0.52, 0.92] | 11/14 [0.52, 0.92] | 11/14 [0.52, 0.92] | 11/14 [0.52, 0.92] | 44/56 (0.79) |
 | gpt-oss-20b | 2/14 [0.04, 0.40] | 1/14 [0.01, 0.31] | 1/14 [0.01, 0.31] | 2/14 [0.04, 0.40] | 6/56 (0.11) |
-| Beam (free)¹ | 8/8 | 6/6 | 4/4 | 5/5 | 23/23 (1.00) |
+| Beam (free)¹ | 10/10 | 7/7 | 5/5 | 7/7 | 29/29 (1.00) |
 
-¹ **Beam incompleto (23/56):** o provedor ficou fora do ar das 01:12 até pelo menos 05:30 (§6).
-As células concluídas não são uma amostra aleatória das tarefas, então o Beam fica fora das
-comparações entre níveis.
+¹ **Beam incompleto (29/56).** O endpoint do OpenCode Go (`opencode-go/beam-free`) ficou fora do
+ar desde 01:12. As células que faltavam foram retomadas às 07:08 pelo mesmo modelo servido pelo
+OpenCode Zen (`opencode/beam-free`, campo `served_as`, decisão do autor), até a cota gratuita do
+Zen acabar às 07:16 (§6).
+- **Origem das 29 células:** 23 vieram do endpoint Go e 6 do Zen.
+- **Fora das comparações entre níveis:** as células concluídas não são uma amostra aleatória
+  das tarefas.
 
 **Fração média de testes ocultos aprovados:**
 
@@ -126,7 +131,7 @@ As colunas *+* e *−* contam as tarefas em que só um lado passou: *+* = só o 
 | Muse Spark 1.3 | 0/0 | 1/0 (T05) | 0/0 |
 | Haiku 5.5 | 0/0 | 0/0 | 0/0 |
 | gpt-oss-20b | 0/1 (T07) | 0/1 (T07) | 0/0 |
-| **Agregado** (73 pares/nível) | **0/1**, Δ −1,4 pp, p = 1,0 | **1/1**, Δ 0,0 pp, p = 1,0 | **0/1**, Δ −1,4 pp, p = 1,0 (72 pares) |
+| **Agregado** (70 pares/nível; sem o Beam) | **0/1**, Δ −1,4 pp, p = 1,0 | **1/1**, Δ 0,0 pp, p = 1,0 | **0/1**, Δ −1,4 pp, p = 1,0 |
 
 Em 5 modelos × 3 níveis houve só 4 discordâncias, nas duas direções. Sem efeito detectável.
 
@@ -219,7 +224,7 @@ Totais da rodada:
 | Haiku 5.5 | 5/56 | 44/56 | 9/56 | 0 | 0 |
 | Muse Spark 1.3 | 1/56 | 40/56 | 0/56 | 0 | 0 |
 | DeepSeek v4.1 flash | 2/56 | 45/56 | 3/56 | 0 | 0 |
-| Beam (23 runs) | 0/23 | 14/23 | 2/23 | 0 | 0 |
+| Beam (29 runs) | 0/29 | 19/29 | 2/29 | 0 | 0 |
 | gpt-oss-20b | 35/56 | 3/56 | 0/56 | 0 | 0 |
 
 "Tocou em testes" quer dizer que o agente alterou testes existentes da árvore. Os testes
@@ -270,8 +275,15 @@ estão em `runs/_logs/reduced-1-checks.md`.
    - **Watchdog de silêncio:** 8 min sem saída fazem o run ser morto e tratado como 429 (o pool
      pausa e a célula não gasta tentativa).
    - Os 6 timeouts falsos foram reenfileirados.
-   - O provedor não voltou até 05:30. Às 05:30 as 33 células restantes seguiam pendentes, com o
-     processo ainda tentando.
+   - O endpoint do Go não voltou: às 06:59 ainda não respondia.
+   - Às 07:08 as 33 células restantes foram retomadas pelo mesmo modelo no OpenCode Zen.
+     - O campo `serve_as` da matriz faz a célula continuar sendo do `opencode-go/beam-free`, e
+       cada run grava em `served_as` o endpoint usado.
+     - A política de dados do Zen não foi verificada; o envio do código foi aceito pelo autor.
+   - Às 07:16 a cota gratuita do Zen acabou (`FreeUsageLimitError`, HTTP 429), depois de 6
+     células, todas ✓.
+     - Uma chave de API do Zen não muda esse limite: a API respondeu o mesmo erro com a chave.
+   - Às 07:45 o Beam foi encerrado em 29/56 (decisão do autor).
 5. **Classificação de falhas de avaliação.**
    - Um `composer install` que quebra no `artisan` por código do agente é resultado válido, não
      erro de avaliação (corrigido na rodada completa 1, com `regrade`).
@@ -310,7 +322,8 @@ estão em `runs/_logs/reduced-1-checks.md`.
 - **Modelo local.** O gpt-oss rodou quantizado (MXFP4), com o template e o parser do
   llama.cpp. Parte das falhas dele é de formato de saída (24/56), uma limitação do conjunto
   modelo + servidor e não só do modelo.
-- **Beam incompleto e Qwen retirado.** Sem dados suficientes para comparação entre níveis.
+- **Beam incompleto e Qwen retirado.** Sem dados suficientes para comparação entre níveis. As
+  29 células do Beam vêm de dois endpoints (23 Go, 6 Zen) do mesmo modelo.
 - **Ambiente.**
   - Internet liberada no sandbox: o detector e a natureza privada do repositório cobrem o risco
     de vazamento, e houve 0 vazamentos.
@@ -327,7 +340,7 @@ estão em `runs/_logs/reduced-1-checks.md`.
 | `runs/results.jsonl` | uma linha por avaliação (`evaluate.sh`); a última linha de cada `run_id` vale |
 | `runs/report.csv`, `runs/report.md` | `python -m orchestrator report` (todos os runs, todas as rodadas) |
 | `runs/reduced-1-analysis.py` | gera as tabelas deste relatório (`python runs/reduced-1-analysis.py`) |
-| `runs/_logs/reduced-1-tables.md` | saída do script acima no fechamento (05:30) |
+| `runs/_logs/reduced-1-tables.md` | saída do script acima no fechamento (07:45) |
 | `runs/reduced-1.md` | plano, execução e incidentes com horário |
 | `runs/_logs/reduced-1-checks.md` | verificações de hora em hora |
 | `runs/env-*.json` | versões, imagens, SHAs e seed de cada invocação |

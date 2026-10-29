@@ -22,6 +22,8 @@ SHORT = {"claude-sonnet-5-5": "Sonnet 5.5", "claude-haiku-5-5": "Haiku 5.5",
          "opencode-go/muse-spark-1.3-contributor": "Muse Spark 1.3", "opencode-go/deepseek-v4.1-flash":
          "DeepSeek v4.1 flash", "opencode-go/beam-free": "Beam (free)", "llama/gpt-oss-20b": "gpt-oss-20b"}
 LEVELS = matrix.LEVELS
+# incomplete in this round (provider outage): shown, but left out of the pooled comparison
+PARTIAL = {"opencode-go/beam-free"}
 
 
 def null_baseline() -> dict[str, int]:
@@ -130,11 +132,11 @@ def main() -> None:
                 a += X and Y; b += Y and not X; c += X and not Y; d += not X and not Y
             n = a + b + c + d
             for i, v in enumerate((a, b, c, d)):
-                pooled[lv][i] += v
+                pooled[lv][i] += 0 if m in PARTIAL else v
             out(f"| {SHORT[m]} | {lv} | {n} | {a} | {b} | {c} | {d} | "
                 f"{(b - c) / n * 100:+.1f} | {mcnemar_exact(b, c):.3f} |" if n else f"| {SHORT[m]} | {lv} | 0 | | | | | | |")
     out("")
-    out("Agregado (pares modelo × tarefa):\n")
+    out("Agregado (pares modelo × tarefa; sem os modelos incompletos: " + ", ".join(SHORT[m] for m in PARTIAL) + "):\n")
     out("| nível | pares | ambos ✓ | + | − | ambos ✗ | Δ pass@1 | p |")
     out("|---|---|---|---|---|---|---|---|")
     for lv, (a, b, c, d) in pooled.items():

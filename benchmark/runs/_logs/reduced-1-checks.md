@@ -9,3 +9,6 @@
 | 03:35 | 232/336 | beam-free segue fora (12 travamentos, pausas até 518 s); deepseek T09 none exit 1 após terminar → refeito como infra | ~05:30 para os 5 modelos; beam-free (33 células) depende do provedor |
 | 04:35 | 282/336 | Claude e gpt-oss completos; Muse+deepseek faltam 21; beam-free segue fora (18 travamentos, 33 células pendentes) | Muse/deepseek ~05:30; beam-free depende do provedor |
 | 05:30 | 303/336 | 5 modelos completos; beam-free 23/56 (provedor fora); relatório gerado | fim, exceto beam-free |
+| 05:35 | 303/336 | beam-free segue fora (ping sem resposta; último travamento 05:28); demais completos | beam-free depende do provedor |
+| 06:35 | 303/336 | beam-free segue fora (ping sem resposta; último travamento 06:06) | beam-free depende do provedor |
+| 07:45 | 309/336 | beam-free encerrado em 29/56 (Go fora; cota gratuita do Zen esgotada às 07:16); relatório atualizado | encerrada |
