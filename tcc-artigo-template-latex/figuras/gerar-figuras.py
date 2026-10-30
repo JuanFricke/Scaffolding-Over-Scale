@@ -9,6 +9,7 @@ Fontes de dados (somente leitura):
   - benchmark/quality (pacote Python)           seleção dos runs, par de juízes atribuído,
                                                 revisões, static.jsonl e conventions.jsonl
   - benchmark/runs/quality/self-family/         revisão do juiz da mesma família (juizes.py)
+  - benchmark/runs/<run>/agent.patch            linhas inseridas por categoria (linhas.py, F9)
 
 As notas dos juízes (F5, F6, F8) usam a média de TODOS os juízes de cada execução, incluindo o
 da mesma família do autor, como no artigo (ver calcular-tabelas.py); report-full.md usa só os
@@ -42,6 +43,7 @@ sys.path.insert(0, str(HERE))
 
 from quality import analysis, selection  # noqa: E402
 import juizes  # noqa: E402
+import linhas  # noqa: E402
 
 # --- paleta (dataviz: categórica em ordem fixa; status; sequencial azul) -----------------------
 CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
@@ -266,6 +268,37 @@ def fig_concordancia(data):
     save(fig, "fig-concordancia-juizes.pdf")
 
 
+# --- F9: linhas inseridas por categoria (produção / testes / outros) -----------------------------
+def fig_linhas(runs):
+    L = linhas.lines_by_run(list(runs.values()))
+    cm = linhas.cell_means(L, [m for m, _ in MODELS], LEVELS)
+    fig, axes = plt.subplots(2, 3, figsize=(6.3, 3.9), sharex=True, gridspec_kw={"wspace": 0.12, "hspace": 0.45})
+    for ax, (m, lab) in zip(axes.flat, MODELS):
+        ax.set_title(lab, pad=4)
+        for i, lv in enumerate(LEVELS):
+            a = cm.get((m, lv))
+            if not a:
+                continue
+            left = 0
+            for k, cat in enumerate(linhas.CATS):
+                ax.barh(i, a[cat], left=left, height=0.62, color=CAT[k], edgecolor="white", linewidth=0.8)
+                left += a[cat]
+            if a["test_share"] is not None:
+                ax.text(left + 18, i, f"{100 * a['test_share']:.0f} %", va="center", ha="left", fontsize=7, color=INK2)
+            print(f"F9 {lab:20s} {lv:6s} prod {a['prod']:.0f} test {a['test']:.0f} outros {a['other']:.0f} "
+                  f"%teste {100 * a['test_share']:.0f} n={a['n']}")
+        ax.set_yticks(range(4)); ax.set_yticklabels(LEVELS); ax.invert_yaxis()
+        ax.set_xlim(0, 1500); ax.set_xticks([0, 500, 1000, 1500])
+        ax.grid(axis="y", visible=False); despine(ax)
+    axes[1, 1].set_xlabel("linhas inseridas por execução (média)")
+    for ax in axes[:, 1:].flat:
+        ax.tick_params(labelleft=False)
+    fig.legend(handles=[Patch(color=CAT[k], label=linhas.PT[c]) for k, c in enumerate(linhas.CATS)]
+               + [Line2D([], [], lw=0, label="rótulo: parcela de testes no código")],
+               loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.07))
+    save(fig, "fig-linhas-categoria.pdf")
+
+
 if __name__ == "__main__":
     rows, runs = round_rows()
     print("runs da rodada:", len(rows))
@@ -276,3 +309,4 @@ if __name__ == "__main__":
     fig_efeito_dimensoes(data)
     fig_custo(rows)
     fig_concordancia(data)
+    fig_linhas(runs)

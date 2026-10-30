@@ -30,6 +30,7 @@ sys.path.insert(0, str(BENCH))
 
 from quality import analysis, judge, selection  # noqa: E402
 from juizes import DIMS, LEVELS, PT, FULL, load_all_judges, judge_mean, efeitos as calc_efeitos  # noqa: E402
+import linhas  # noqa: E402
 
 MODELS = ["claude-sonnet-5-5", "claude-haiku-5-5", "opencode-go/muse-spark-1.3-contributor",
           "opencode-go/deepseek-v4.1-flash", "opencode-go/beam-free", "llama/gpt-oss-20b"]
@@ -149,6 +150,36 @@ def main():
         ys = [fb(d) for d in data.values()]
         n = sum(1 for x, y in zip(xs, ys) if x is not None and y is not None)
         print(f"| {an} | {bn} | {fmt(analysis.spearman(xs, ys))} | {n} |")
+    print()
+
+    print("## Linhas inseridas por execução (média): produção / testes / outros, e parcela de testes\n")
+    L = linhas.lines_by_run(runs)
+    cm = linhas.cell_means(L, MODELS, LEVELS)
+    print("| modelo | " + " | ".join(LEVELS) + " |")
+    print("|---|" + "---|" * 4)
+    for m in MODELS:
+        cells = []
+        for lv in LEVELS:
+            a = cm.get((m, lv))
+            cells.append(f"{a['prod']:.0f} / {a['test']:.0f} / {a['other']:.0f} ({100 * a['test_share']:.0f}%; n={a['n']})" if a else "–")
+        print(f"| {SHORT[m]} | " + " | ".join(cells) + " |")
+    print()
+    print("Efeito vs `none` (pareado por tarefa; Wilcoxon exato; 5 modelos completos):\n")
+    print("| métrica | nível | pares | média em none | Δ médio | p |")
+    print("|---|---|---|---|---|---|")
+    byl = {}
+    for d in L.values():
+        byl.setdefault((d["run"].model, d["run"].level), {})[d["run"].task] = d
+    for metric in ["prod", "test", "other", "total", "test_share"]:
+        for lv in LEVELS[1:]:
+            diffs, base = [], []
+            for m in FULL:
+                for task, d in byl[(m, "none")].items():
+                    e = byl[(m, lv)].get(task)
+                    if e and d[metric] is not None and e[metric] is not None:
+                        diffs.append(e[metric] - d[metric]); base.append(d[metric])
+            _, p = analysis.wilcoxon_exact(diffs)
+            print(f"| {metric} | {lv} | {len(diffs)} | {statistics.mean(base):.2f} | {statistics.mean(diffs):+.2f} | {p:.3f} |")
     print()
 
     print("## Exemplo T07 Muse (notas de todos os juízes, none e skills)\n")
