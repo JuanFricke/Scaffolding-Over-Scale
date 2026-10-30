@@ -7,7 +7,6 @@ Este módulo é compartilhado por gerar-figuras.py e calcular-tabelas.py.
 """
 from __future__ import annotations
 
-import json
 import statistics
 import sys
 from pathlib import Path
@@ -17,7 +16,7 @@ BENCH = HERE.parent.parent / "benchmark"
 if str(BENCH) not in sys.path:
     sys.path.insert(0, str(BENCH))
 
-from quality import analysis, judge  # noqa: E402
+from quality import analysis  # noqa: E402
 
 LEVELS = ["none", "agents", "skills", "full"]
 DIMS = analysis.DIMS
@@ -28,21 +27,12 @@ FULL = [m for m in analysis.selection.ROUND_MODELS if m not in analysis.PARTIAL]
 
 
 def load_all_judges(runs):
-    """Dados do pacote (par de juízes atribuído) mais a revisão do juiz da família, se existir.
+    """Dados do pacote com todos os juízes (analysis.load(..., all_judges=True)).
 
-    d["cross"] guarda só os dois juízes de fora da família; d["reviews"] tem todos.
+    d["cross"] guarda só os dois juízes de fora da família; d["reviews"] tem todos. É a mesma
+    carga de `python -m quality analyze --all-judges` (runs/quality/report-full-all-judges.md).
     """
-    data = analysis.load(runs)
-    self_dir = judge.paths(None, self_family=True)["reviews"]
-    for rid, d in data.items():
-        d["cross"] = dict(d["reviews"])
-        j = judge.self_judge(d["run"])
-        d["self_judge"] = j
-        f = self_dir / f"{rid}__{j}.json" if j else None
-        if f and f.exists():
-            rv = json.loads(f.read_text())
-            d["reviews"][rv["judge"]] = rv["review"]
-    return data
+    return analysis.load(runs, all_judges=True)
 
 
 def score(review, dim):

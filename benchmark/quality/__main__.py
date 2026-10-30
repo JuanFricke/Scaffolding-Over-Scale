@@ -4,7 +4,7 @@
   conventions  layer 2 (runs/<run_id>/quality/conventions.json + runs/quality/conventions.jsonl)
   static       layer 1 (runs/<run_id>/quality/static.json + runs/quality/static.jsonl)
   judge        layer 3 (runs/quality/reviews/, runs/quality/judge-manifest.jsonl)
-  analyze      tables (runs/quality/report-<name>.md)
+  analyze      tables (runs/quality/report-<name>.md; --all-judges: report-<name>-all-judges.md)
   status       progress per layer
 """
 from __future__ import annotations
@@ -70,7 +70,7 @@ def cmd_judge(args):
 
 def cmd_analyze(args):
     from . import analysis
-    print(analysis.build(_runs(args), args.name))
+    print(analysis.build(_runs(args), args.name, args.all_judges))
 
 
 def cmd_status(args):
@@ -107,6 +107,8 @@ def main() -> None:
                            help="the excluded same-family judge only (separate manifest, self-preference check)")
         if name == "analyze":
             p.add_argument("--name", default="pilot")
+            p.add_argument("--all-judges", action="store_true",
+                           help="average the same-family judge too (the article's rule)")
     args = ap.parse_args()
     args.fn(args)
 

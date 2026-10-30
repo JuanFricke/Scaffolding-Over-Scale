@@ -1,6 +1,8 @@
 # Qualidade de código (full)
 
-309 runs; 309 com convenções, 309 com métricas estáticas, 615 revisões de juízes (306 runs com as 2).
+309 runs; 309 com convenções, 309 com métricas estáticas, 615 revisões de juízes (306 runs com 2 ou mais).
+
+Notas dos juízes: média dos dois juízes de famílias distintas da do autor; o juiz da mesma família fica fora das médias e só entra na seção de autopreferência.
 
 ## Médias por modelo × nível
 
@@ -201,7 +203,7 @@
 | opus × deepseek | 87 | 0.81 | 0.84 | 0.84 |
 | muse × deepseek | 137 | 0.71 | 0.68 | 0.79 |
 
-Viés de cada juiz (média da nota geral que dá − média das duas notas do mesmo run):
+Viés de cada juiz (média da nota geral que dá − média das notas de todos os juízes do mesmo run):
 
 - opus: -0.17 (n=169)
 - muse: +0.22 (n=219)

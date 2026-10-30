@@ -231,7 +231,7 @@ Redaction never touches a name a hidden test depends on, so task semantics
   plus five scoped subtasks of the two composites) at four levels is enough
   for effect direction, not for fine-grained significance; repeat runs per
   cell, and remember that subtasks of one parent are correlated.
-- **Base tests that a correct change must break.** In T05, T08, T09 and T11
+- **Base tests that a correct change must break.** In T02, T05, T08, T09 and T11
   the reference solution had to edit pre-existing tests. The agent sees them
   fail and may edit them too; those files are hidden tests (status M) and are
   excluded from `violations.tests_touched`, but the agent's time spent on them

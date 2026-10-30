@@ -323,6 +323,12 @@ Juiz da mesma família (`python -m quality judge --self-family`):
   - não há autopreferência consistente: o Δ bruto é quase todo o viés geral de cada juiz;
   - a exclusão da família é uma precaução, não a correção de um viés medido;
   - **cautela:** a leniência é medida em diffs de outros autores.
+- **Decisão (2026-10-30, artigo do TCC):** como não há autopreferência líquida e o par Muse+DeepSeek
+  (o de Sonnet/Haiku) é o mais leniente dos três, o artigo usa a **média de todos os juízes** de cada
+  run (par de fora + juiz da família; 836 revisões, 218 runs com 3). `python -m quality analyze
+  --name full --all-judges` gera `runs/quality/report-full-all-judges.md` com essa regra;
+  `report-full.md` continua com os dois de fora. Efeito nas médias: Sonnet 4,10→4,08, Haiku
+  4,28→4,19, Muse 3,02→3,03, DeepSeek 3,83→3,77 (nota geral, runs com 3 revisões).
 
 ## Estado em 2026-10-28 (fim da sessão)
 
