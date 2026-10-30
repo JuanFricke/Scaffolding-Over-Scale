@@ -1,0 +1,261 @@
+diff --git a/app/Actions/CallNextTicket.php b/app/Actions/CallNextTicket.php
+new file mode 100644
+index 0000000..4f4623a
+--- /dev/null
++++ b/app/Actions/CallNextTicket.php
+@@ -0,0 +1,135 @@
++<?php
++
++namespace App\Actions;
++
++use App\Enums\CallMode;
++use App\Enums\TicketStatus;
++use App\Exceptions\InactiveQueueException;
++use App\Exceptions\NoWaitingTicketsException;
++use App\Models\Queue;
++use App\Models\Ticket;
++use App\Models\User;
++use Illuminate\Support\Facades\DB;
++
++class CallNextTicket
++{
++    public function __invoke(Queue $queue, User $calledBy, CallMode $mode = CallMode::Any): Ticket
++    {
++        return DB::transaction(function () use ($queue, $calledBy, $mode): Ticket {
++            // Read queue state from the database (it may be stale on the passed instance).
++            $lockedQueue = Queue::query()
++                ->whereKey($queue->id)
++                ->lockForUpdate()
++                ->firstOrFail();
++
++            if (! $lockedQueue->is_active) {
++                throw new InactiveQueueException('Cannot call a ticket from an inactive queue.');
++            }
++
++            $restrictToNormal = false;
++
++            if ($mode === CallMode::Any && $this->hasPriorityStreak($lockedQueue->id)) {
++                $restrictToNormal = Ticket::query()
++                    ->where('queue_id', $lockedQueue->id)
++                    ->where('status', TicketStatus::Waiting)
++                    ->where('priority', 0)
++                    ->exists();
++            }
++
++            /** @var list<int> $skipped */
++            $skipped = [];
++
++            while (true) {
++                $candidate = $this->nextCandidate($lockedQueue->id, $mode, $restrictToNormal, $skipped);
++
++                if ($candidate === null) {
++                    throw new NoWaitingTicketsException('No waiting tickets eligible for the requested mode.');
++                }
++
++                // Lock the candidate row and re-check it is still waiting: it may
++                // have been called concurrently through Ticket::call(), which does
++                // not lock the queue row.
++                $locked = Ticket::query()
++                    ->whereKey($candidate->id)
++                    ->lockForUpdate()
++                    ->firstOrFail();
++
++                if ($locked->status !== TicketStatus::Waiting
++                    || (int) $locked->queue_id !== (int) $lockedQueue->id
++                    || ! $this->matchesMode($locked, $mode, $restrictToNormal)
++                ) {
++                    $skipped[] = $candidate->id;
++
++                    continue;
++                }
++
++                $locked->status = TicketStatus::Called;
++                $locked->called_at = now();
++                $locked->called_by_user_id = $calledBy->id;
++                $locked->save();
++
++                return $locked->refresh();
++            }
++        });
++    }
++
++    private function hasPriorityStreak(int $queueId): bool
++    {
++        $lastThree = Ticket::query()
++            ->where('queue_id', $queueId)
++            ->where('status', TicketStatus::Called)
++            ->orderByDesc('called_at')
++            ->orderByDesc('id')
++            ->limit(3)
++            ->get();
++
++        if ($lastThree->count() !== 3) {
++            return false;
++        }
++
++        // History includes calls made in any mode; a normal call resets the streak.
++        return $lastThree->every(fn (Ticket $ticket): bool => $ticket->priority > 0);
++    }
++
++    /**
++     * @param  list<int>  $skipped
++     */
++    private function nextCandidate(int $queueId, CallMode $mode, bool $restrictToNormal, array $skipped): ?Ticket
++    {
++        $query = Ticket::query()
++            ->where('queue_id', $queueId)
++            ->where('status', TicketStatus::Waiting);
++
++        if ($mode === CallMode::PriorityOnly) {
++            $query->where('priority', '>', 0);
++        } elseif ($mode === CallMode::NormalOnly || $restrictToNormal) {
++            $query->where('priority', 0);
++        }
++
++        if ($skipped !== []) {
++            $query->whereNotIn('id', $skipped);
++        }
++
++        if ($mode === CallMode::NormalOnly || $restrictToNormal) {
++            // All candidates share priority 0; oldest first.
++            $query->orderBy('issued_at')->orderBy('id');
++        } else {
++            $query->orderByDesc('priority')->orderBy('issued_at')->orderBy('id');
++        }
++
++        return $query->first();
++    }
++
++    private function matchesMode(Ticket $ticket, CallMode $mode, bool $restrictToNormal): bool
++    {
++        if ($mode === CallMode::PriorityOnly) {
++            return $ticket->priority > 0;
++        }
++
++        if ($mode === CallMode::NormalOnly || $restrictToNormal) {
++            return $ticket->priority === 0;
++        }
++
++        return true;
++    }
++}
+diff --git a/app/Enums/CallMode.php b/app/Enums/CallMode.php
+new file mode 100644
+index 0000000..26e15cf
+--- /dev/null
++++ b/app/Enums/CallMode.php
+@@ -0,0 +1,10 @@
++<?php
++
++namespace App\Enums;
++
++enum CallMode: string
++{
++    case Any = 'any';
++    case PriorityOnly = 'priority_only';
++    case NormalOnly = 'normal_only';
++}
+diff --git a/app/Exceptions/NoWaitingTicketsException.php b/app/Exceptions/NoWaitingTicketsException.php
+new file mode 100644
+index 0000000..6755d5e
+--- /dev/null
++++ b/app/Exceptions/NoWaitingTicketsException.php
+@@ -0,0 +1,10 @@
++<?php
++
++namespace App\Exceptions;
++
++use RuntimeException;
++
++class NoWaitingTicketsException extends RuntimeException
++{
++    //
++}
+diff --git a/docs/architecture.md b/docs/architecture.md
+index a2550af..647b5c3 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -119,13 +119,26 @@ ### Call the next ticket
+ Return called ticket / display payload
+ ```
+ 
+-The implementation must prevent two concurrent attendants from successfully
+-calling the same waiting ticket. The exact locking strategy belongs to the
+-implementation and database transaction layer; the domain invariant is that a
+-ticket can be called only once.
+-
+-> TODO (follow-up from review): link the test covering the single-call
+-> invariant and concurrent-call protection once implemented.
++Implemented by invokable `App\Actions\CallNextTicket` with `App\Enums\CallMode`
++(`any` / `priority_only` / `normal_only`):
++
++- Candidates are `waiting` tickets of the given queue only, ordered by
++  `priority` descending, `issued_at` ascending, lowest `id` last
++  (`normal_only` and fairness-restricted calls reduce to oldest-first since
++  all candidates share `priority = 0`).
++- `any` mode applies the 3-ticket fairness rule: when the last 3 called
++  tickets in the queue (by `called_at` descending, then `id` descending) are
++  all priority tickets and a normal ticket is waiting, the call is restricted
++  to the oldest waiting normal. History includes calls made in any mode.
++- Inactive queues are rejected with `InactiveQueueException` (state re-read
++  inside the transaction from the locked queue row); no eligible ticket raises
++  `NoWaitingTicketsException`.
++- Exactly-once: one database transaction locks the queue row (`FOR UPDATE`),
++  picks the ordered candidate, then locks the candidate row (`FOR UPDATE`)
++  and re-checks it is still `waiting` before marking it `called` with
++  `called_at = now()` and `called_by_user_id`. A lost race skips to the next
++  candidate. Only the write-once-allowed fields (`status`, `called_at`,
++  `called_by_user_id`) change, so the `Ticket` model `updating` guard holds.
+ 
+ ## Authorization boundary
+ 
+diff --git a/docs/business-rules.md b/docs/business-rules.md
+index 6f98015..199823b 100644
+--- a/docs/business-rules.md
++++ b/docs/business-rules.md
+@@ -98,7 +98,9 @@ ### Ticket
+ 
+ **Immutability enforcement:** the write-once rule is enforced on the `Ticket` model (`updating` hook), so it applies to Eloquent saves only — mass updates through the query builder (`Ticket::query()->update(...)`) bypass it and must not be used on issued tickets.
+ 
+-**Single-ticket call (scope note):** `Ticket::call()` marks one waiting ticket as `called` (entity-membership checked, exactly-once). This minimal domain primitive proves the mutable `status`/`called_*` fields; deterministic call-next selection (priority + age + 3-ticket fairness) and HTTP/Livewire panels remain out of scope per #14.
++**Single-ticket call:** `Ticket::call()` marks one waiting ticket as `called` (entity-membership checked, exactly-once). This minimal domain primitive proves the mutable `status`/`called_*` fields.
++
++**Call-next selection:** domain action `App\Actions\CallNextTicket` (`__invoke(Queue $queue, User $calledBy, CallMode $mode = CallMode::Any): Ticket`) selects and calls the next waiting ticket of the given queue. The caller is trusted (no authorization here); HTTP/Livewire panels remain out of scope. It throws `App\Exceptions\InactiveQueueException` for inactive queues and `App\Exceptions\NoWaitingTicketsException` when no ticket is eligible for the requested mode.
+ 
+ ### Priority
+ 
+@@ -112,11 +114,14 @@ ### Priority
+ 
+ ### Ordering and Fairness
+ 
+-1. **Within same priority:** the **oldest** ticket is called first.
+-2. **Between priorities:** higher priority value is called first.
+-3. **Normal wait limit:** a **normal** ticket cannot wait more than **3 consecutive** priority tickets without being eligible for calling (fairness guarantee).
++1. **Ticket kind:** `priority = 0` is **normal**, `priority > 0` is **priority** (higher value = more important).
++2. **Within same priority:** the **oldest** ticket is called first (`issued_at` ascending, then lowest `id`).
++3. **Between priorities:** higher priority value is called first (then oldest `issued_at`, then lowest `id`).
++4. **Normal wait limit (any mode only):** a **normal** ticket cannot wait behind more than **3 consecutive** priority calls. Look at the last 3 tickets called in this queue (most recent first by `called_at`, then by `id`): if there are 3 of them, all are priority tickets, and at least one normal ticket is waiting, the call is restricted to normal tickets (the oldest normal is called). Calls made in `priority_only`/`normal_only` mode count in that history; a normal call resets the streak. If no normal is waiting, priority tickets keep being called.
++
++The **next candidate queue** is **deterministic**: same state input → same next ticket, no random draw. Only `waiting` tickets of the given queue are candidates; tickets of other queues are never selected and a called ticket is never called again.
+ 
+-The **next candidate queue** is **deterministic**: same state input → same next ticket, no random draw.
++Modes (`App\Enums\CallMode`): `any` (full ordering + fairness), `priority_only` (only priority tickets, full ordering, fairness ignored), `normal_only` (only normal tickets, oldest first, fairness ignored).
+ 
+ ### Call Panel (attendant)
+ 
+@@ -124,11 +129,11 @@ ### Call Panel (attendant)
+ 
+ | Button | Behavior |
+ | ----- | ------------- |
+-| **Next (most important)** | Calls the next ticket according to full ordering (priority + age + 3-ticket fairness rule). |
+-| **Priority** | Calls the next eligible ticket **only** among priority candidates (includes 80+ per configuration). |
+-| **Normal** | Calls the next eligible ticket **only** among normal candidates. |
++| **Next (most important)** | Calls the next ticket according to full ordering (priority + age + 3-ticket fairness rule) — `CallMode::Any`. |
++| **Priority** | Calls the next eligible ticket **only** among priority candidates (includes 80+ per configuration) — `CallMode::PriorityOnly`, fairness ignored. |
++| **Normal** | Calls the next eligible ticket **only** among normal candidates — `CallMode::NormalOnly`, oldest first, fairness ignored. |
+ 
+-After each call, the ticket leaves the waiting queue and enters the session/display call history.
++After each call, the ticket leaves the waiting queue and enters the session/display call history. `CallNextTicket` runs in a transaction: it locks the queue row and reads `is_active` from the database (the passed instance may be stale), picks the ordered candidate, then locks the candidate row and re-checks it is still `waiting` (it may have been called concurrently via `Ticket::call()`, which does not lock the queue); on a race it skips to the next candidate. The winner is marked `called` with `called_at = now()` and `called_by_user_id`, returned with those fields populated, changing only the write-once-allowed fields.
+ 
+ ## Display and Issuance Channels
+ 

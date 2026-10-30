@@ -1,0 +1,1018 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9806b52..8a199bf 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,11 @@ ## [Unreleased]
+ 
+ ### Added
+ 
++- Queues and tickets persistence: `queues` (entity FK cascade, per-entity unique slug, `is_active`, `labels_i18n`) and `tickets` (queue FK cascade, `(queue_id, code)` unique, priority default 0, `waiting`/`called` status, no cancelled state) migrations with a `(queue_id, status, priority, issued_at)` index.
++- `App\Models\Queue` and `App\Models\Ticket` (write-once save guard, `nextCode` sequence, single `call()`), enums `TicketStatus`/`TicketChannel` and `App\Exceptions\InactiveQueueException`.
++- Invokable `App\Actions\IssueTicket`: transactional issuance that re-reads the queue state under lock, allocates the per-queue display code (`A001`, `A002`, ... insertion-ordered, skips malformed legacy codes, retries on `(queue_id, code)` collisions) and rejects inactive queues / negative priority with nothing persisted.
++- `Queue::factory()` and `Ticket::factory()` (sequential code allocation, `forQueue()`, `called()` state).
++
+ - Database schema and Mermaid diagram in [`docs/database-schema.md`](docs/database-schema.md).
+ - Business rules documentation in [`docs/business-rules.md`](docs/business-rules.md): MVP queue management, entity/subscription, roles (admin, owner, employee), tickets, priorities, fairness (3-ticket rule), deterministic call panel, and channels (Flutter totem, web TV, attendant).
+ - This changelog (Keep a Changelog).
+diff --git a/app/Actions/IssueTicket.php b/app/Actions/IssueTicket.php
+new file mode 100644
+index 0000000..53900c6
+--- /dev/null
++++ b/app/Actions/IssueTicket.php
+@@ -0,0 +1,83 @@
++<?php
++
++namespace App\Actions;
++
++use App\Enums\TicketChannel;
++use App\Enums\TicketStatus;
++use App\Exceptions\InactiveQueueException;
++use App\Models\Queue;
++use App\Models\Ticket;
++use Illuminate\Database\QueryException;
++use Illuminate\Support\Facades\DB;
++use InvalidArgumentException;
++
++/**
++ * Issue a new waiting ticket for a queue, allocating its display code
++ * (per-queue sequence A001, A002, ...).
++ *
++ * The queue's active state is re-read from the database inside the
++ * transaction, so a queue deactivated after the caller loaded it is
++ * rejected. Concurrent issuances get a few retry attempts on a unique
++ * (queue_id, code) collision; when all attempts fail the underlying
++ * collision is rethrown.
++ */
++class IssueTicket
++{
++    private const MAX_ATTEMPTS = 3;
++
++    public function __invoke(Queue $queue, int $priority = 0, TicketChannel $channel = TicketChannel::Virtual): Ticket
++    {
++        if ($priority < 0) {
++            throw new InvalidArgumentException('Priority must be greater than or equal to zero.');
++        }
++
++        $attempts = 0;
++
++        while (true) {
++            $attempts++;
++
++            try {
++                return DB::transaction(function () use ($queue, $priority, $channel) {
++                    $fresh = Queue::query()
++                        ->whereKey($queue->getKey())
++                        ->lockForUpdate()
++                        ->first();
++
++                    if ($fresh === null || ! $fresh->is_active) {
++                        throw new InactiveQueueException('Queue is inactive or does not exist.');
++                    }
++
++                    return Ticket::create([
++                        'queue_id' => $fresh->id,
++                        'code' => Ticket::nextCode($fresh->id),
++                        'priority' => $priority,
++                        'channel' => $channel,
++                        'status' => TicketStatus::Waiting,
++                        'issued_at' => now(),
++                    ]);
++                });
++            } catch (QueryException $e) {
++                if ($attempts >= self::MAX_ATTEMPTS || ! $this->isUniqueCollision($e)) {
++                    throw $e;
++                }
++            }
++        }
++    }
++
++    /**
++     * Detect a unique (queue_id, code) collision, to retry concurrent
++     * issuance; anything else bubbles up as-is. The ticket insert is the
++     * only statement in the transaction, so any unique violation on it
++     * comes from the per-queue code key.
++     */
++    private function isUniqueCollision(QueryException $e): bool
++    {
++        // SQLite (tests) reports "UNIQUE constraint failed: tickets.queue_id..."
++        if (str_contains($e->getMessage(), 'tickets') && str_contains($e->getMessage(), 'UNIQUE')) {
++            return true;
++        }
++
++        // MariaDB/MySQL: error code 1062 (ER_DUP_ENTRY).
++        return (int) ($e->errorInfo[1] ?? 0) === 1062;
++    }
++}
+diff --git a/app/Enums/TicketChannel.php b/app/Enums/TicketChannel.php
+new file mode 100644
+index 0000000..3eabeb1
+--- /dev/null
++++ b/app/Enums/TicketChannel.php
+@@ -0,0 +1,10 @@
++<?php
++
++namespace App\Enums;
++
++enum TicketChannel: string
++{
++    case Totem = 'totem';
++    case Virtual = 'virtual';
++    case Printed = 'printed';
++}
+diff --git a/app/Enums/TicketStatus.php b/app/Enums/TicketStatus.php
+new file mode 100644
+index 0000000..c1f82b3
+--- /dev/null
++++ b/app/Enums/TicketStatus.php
+@@ -0,0 +1,9 @@
++<?php
++
++namespace App\Enums;
++
++enum TicketStatus: string
++{
++    case Waiting = 'waiting';
++    case Called = 'called';
++}
+diff --git a/app/Exceptions/InactiveQueueException.php b/app/Exceptions/InactiveQueueException.php
+new file mode 100644
+index 0000000..551e5e6
+--- /dev/null
++++ b/app/Exceptions/InactiveQueueException.php
+@@ -0,0 +1,8 @@
++<?php
++
++namespace App\Exceptions;
++
++class InactiveQueueException extends \RuntimeException
++{
++    //
++}
+diff --git a/app/Models/Entity.php b/app/Models/Entity.php
+index 5889a80..54cf230 100644
+--- a/app/Models/Entity.php
++++ b/app/Models/Entity.php
+@@ -43,6 +43,11 @@ public function invites(): HasMany
+         return $this->hasMany(EntityInvite::class);
+     }
+ 
++    public function queues(): HasMany
++    {
++        return $this->hasMany(Queue::class);
++    }
++
+     /**
+      * Every user that belongs to this entity (pivot = entity_memberships).
+      */
+diff --git a/app/Models/Queue.php b/app/Models/Queue.php
+new file mode 100644
+index 0000000..f3fb8c7
+--- /dev/null
++++ b/app/Models/Queue.php
+@@ -0,0 +1,39 @@
++<?php
++
++namespace App\Models;
++
++use Illuminate\Database\Eloquent\Attributes\Fillable;
++use Illuminate\Database\Eloquent\Factories\HasFactory;
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++use Illuminate\Database\Eloquent\Relations\HasMany;
++
++#[Fillable(['entity_id', 'name', 'slug', 'is_active', 'labels_i18n'])]
++class Queue extends Model
++{
++    /** @use HasFactory<QueueFactory> */
++    use HasFactory;
++
++    /**
++     * Get the attributes that should be cast.
++     *
++     * @return array<string, string>
++     */
++    protected function casts(): array
++    {
++        return [
++            'is_active' => 'boolean',
++            'labels_i18n' => 'array',
++        ];
++    }
++
++    public function entity(): BelongsTo
++    {
++        return $this->belongsTo(Entity::class);
++    }
++
++    public function tickets(): HasMany
++    {
++        return $this->hasMany(Ticket::class);
++    }
++}
+diff --git a/app/Models/Ticket.php b/app/Models/Ticket.php
+new file mode 100644
+index 0000000..580ac8c
+--- /dev/null
++++ b/app/Models/Ticket.php
+@@ -0,0 +1,125 @@
++<?php
++
++namespace App\Models;
++
++use App\Enums\TicketChannel;
++use App\Enums\TicketStatus;
++use Database\Factories\TicketFactory;
++use Illuminate\Auth\Access\AuthorizationException;
++use Illuminate\Database\Eloquent\Attributes\Fillable;
++use Illuminate\Database\Eloquent\Factories\HasFactory;
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++use LogicException;
++
++#[Fillable(['queue_id', 'code', 'priority', 'channel', 'status', 'issued_at', 'called_at', 'called_by_user_id'])]
++class Ticket extends Model
++{
++    /** @use HasFactory<TicketFactory> */
++    use HasFactory;
++
++    /**
++     * Fields that may change after issuance (plus updated_at).
++     *
++     * @var list<string>
++     */
++    private const MUTABLE = ['status', 'called_at', 'called_by_user_id', 'updated_at'];
++
++    /**
++     * Get the attributes that should be cast.
++     *
++     * @return array<string, string|class-string>
++     */
++    protected function casts(): array
++    {
++        return [
++            'priority' => 'integer',
++            'channel' => TicketChannel::class,
++            'status' => TicketStatus::class,
++            'issued_at' => 'datetime',
++            'called_at' => 'datetime',
++        ];
++    }
++
++    public function queue(): BelongsTo
++    {
++        return $this->belongsTo(Queue::class);
++    }
++
++    public function calledBy(): BelongsTo
++    {
++        return $this->belongsTo(User::class, 'called_by_user_id');
++    }
++
++    /**
++     * Next display code for the queue: last valid code in insertion order, + 1.
++     *
++     * Malformed legacy codes (anything not matching `A<digits>`) are skipped,
++     * and deleted tickets' numbers are not offered when a later valid code
++     * exists. Beyond A999 the sequence simply grows (A1000, A1001, ...).
++     */
++    public static function nextCode(int $queueId): string
++    {
++        $last = Ticket::query()
++            ->select('id', 'code')
++            ->where('queue_id', $queueId)
++            ->where('code', 'regexp', '^A[0-9]+$')
++            ->orderByDesc('id')
++            ->first();
++
++        if ($last === null) {
++            return 'A001';
++        }
++
++        return 'A'.str_pad(
++            string: (string) (((int) substr($last->code, 1)) + 1),
++            length: 3,
++            pad_string: '0',
++            pad_type: STR_PAD_LEFT
++        );
++    }
++
++    /**
++     * Call this ticket, marking it as served by the given user.
++     *
++     * Only members of the ticket's entity may call it (authorization
++     * exception, ticket untouched); an already-called ticket is refused
++     * — a ticket receives exactly one call.
++     */
++    public function call(User $user): void
++    {
++        if (! $user->membershipFor($this->queue->entity_id)) {
++            throw new AuthorizationException("Only members of the ticket's entity may call it.");
++        }
++
++        // Solidify the single-call rule against races hitting the same ticket.
++        if ($this->status !== TicketStatus::Waiting) {
++            throw new LogicException('Ticket has already been called.');
++        }
++
++        $this->status = TicketStatus::Called;
++        $this->called_at = now();
++        $this->called_by_user_id = $user->id;
++        $this->save();
++    }
++
++    /**
++     * Every ticket field is write-once: after issuance only status,
++     * called_at, called_by_user_id (and updated_at) may change.
++     */
++    public function save(array $options = []): bool
++    {
++        $mutating = collect($this->getDirty())
++            ->keys()
++            ->reject(fn (string $field): bool => in_array($field, self::MUTABLE, true));
++
++        if ($this->exists && $mutating->isNotEmpty()) {
++            throw new LogicException(sprintf(
++                'Ticket fields [%s] are immutable after issuance.',
++                $mutating->implode(', ')
++            ));
++        }
++
++        return parent::save($options);
++    }
++}
+diff --git a/app/Providers/AppServiceProvider.php b/app/Providers/AppServiceProvider.php
+index 59d9240..dc32a63 100644
+--- a/app/Providers/AppServiceProvider.php
++++ b/app/Providers/AppServiceProvider.php
+@@ -3,6 +3,7 @@
+ namespace App\Providers;
+ 
+ use Illuminate\Support\Facades\Blade;
++use Illuminate\Support\Facades\DB;
+ use Illuminate\Support\Facades\URL;
+ use Illuminate\Support\ServiceProvider;
+ use Illuminate\Validation\Rules\Password;
+@@ -35,5 +36,15 @@ public function boot(): void
+         // Livewire already resolves page layouts as `layouts::app`; this exposes the same
+         // files to plain Blade as <x-layouts::app>, so both render through one template.
+         Blade::anonymousComponentNamespace('layouts', 'layouts');
++
++        // MariaDB (production) has REGEXP built in; SQLite (tests, :memory:)
++        // needs a PHP-backed user-defined function for the same operator.
++        if (DB::connection()->getDriverName() === 'sqlite') {
++            DB::connection()->getPdo()->sqliteCreateFunction(
++                'regexp',
++                fn (string $pattern, ?string $value): int => (int) ($value !== null && preg_match("~{$pattern}~", $value) === 1),
++                2
++            );
++        }
+     }
+ }
+diff --git a/database/factories/QueueFactory.php b/database/factories/QueueFactory.php
+new file mode 100644
+index 0000000..3951182
+--- /dev/null
++++ b/database/factories/QueueFactory.php
+@@ -0,0 +1,28 @@
++<?php
++
++namespace Database\Factories;
++
++use App\Models\Entity;
++use App\Models\Queue;
++use Illuminate\Database\Eloquent\Factories\Factory;
++
++/**
++ * @extends Factory<Queue>
++ */
++class QueueFactory extends Factory
++{
++    /**
++     * Define the model's default state (creates its entity).
++     *
++     * @return array<string, mixed>
++     */
++    public function definition(): array
++    {
++        return [
++            'entity_id' => Entity::factory(),
++            'name' => fake()->words(2, true),
++            'slug' => fake()->unique()->slug(),
++            'is_active' => true,
++        ];
++    }
++}
+diff --git a/database/factories/TicketFactory.php b/database/factories/TicketFactory.php
+new file mode 100644
+index 0000000..e46df3d
+--- /dev/null
++++ b/database/factories/TicketFactory.php
+@@ -0,0 +1,78 @@
++<?php
++
++namespace Database\Factories;
++
++use App\Enums\TicketChannel;
++use App\Enums\TicketStatus;
++use App\Models\Queue;
++use App\Models\Ticket;
++use App\Models\User;
++use Illuminate\Database\Eloquent\Collection;
++use Illuminate\Database\Eloquent\Factories\Factory;
++use Illuminate\Database\Eloquent\Model;
++
++/**
++ * @extends Factory<Ticket>
++ */
++class TicketFactory extends Factory
++{
++    /**
++     * Multi-ticket creation must persist one ticket at a time so each one is
++     * persisted before the next, reading its queue's code sequence (A001,
++     * A002, ...) sequentially; the default batch insert would allocate the
++     * same code to every instance.
++     *
++     * @param  (callable(array<string, mixed>): array<string, mixed>)|array<string, mixed>  $attributes
++     * @return Collection<int, Ticket>|Ticket
++     */
++    public function create($attributes = [], ?Model $parent = null)
++    {
++        if (is_numeric($this->count) && $this->count > 1) {
++            $factory = $attributes === [] ? $this : $this->state($attributes);
++
++            return $factory->createMany($this->count);
++        }
++
++        return parent::create($attributes, $parent);
++    }
++
++    /**
++     * Define the model's default state (creates its queue). The display code
++     * is allocated from the queue's sequence at creation time unless an
++     * explicit `code` attribute is given.
++     *
++     * @return array<string, mixed>
++     */
++    public function definition(): array
++    {
++        return [
++            'queue_id' => Queue::factory(),
++            'code' => fn (array $attributes) => Ticket::nextCode($attributes['queue_id']),
++            'priority' => 0,
++            'channel' => TicketChannel::Virtual,
++            'status' => TicketStatus::Waiting,
++            'issued_at' => now(),
++        ];
++    }
++
++    /**
++     * Pin the ticket to an existing queue so factory-created tickets share
++     * that queue's code sequence.
++     */
++    public function forQueue(Queue $queue): self
++    {
++        return $this->for($queue);
++    }
++
++    /**
++     * Already-called ticket, with caller and call time.
++     */
++    public function called(): self
++    {
++        return $this->state(fn (): array => [
++            'status' => TicketStatus::Called,
++            'called_at' => now(),
++            'called_by_user_id' => User::factory(),
++        ]);
++    }
++}
+diff --git a/database/migrations/2026_10_28_194159_create_queues_and_tickets_table.php b/database/migrations/2026_10_28_194159_create_queues_and_tickets_table.php
+new file mode 100644
+index 0000000..4be74eb
+--- /dev/null
++++ b/database/migrations/2026_10_28_194159_create_queues_and_tickets_table.php
+@@ -0,0 +1,51 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    /**
++     * Run the migrations.
++     */
++    public function up(): void
++    {
++        Schema::create('queues', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('entity_id')->constrained('entities')->cascadeOnDelete();
++            $table->string('name');
++            $table->string('slug');
++            $table->boolean('is_active')->default(true);
++            $table->json('labels_i18n')->nullable();
++            $table->timestamps();
++
++            $table->unique(['entity_id', 'slug'], 'queues_entity_slug_unique');
++        });
++
++        Schema::create('tickets', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('queue_id')->constrained('queues')->cascadeOnDelete();
++            $table->string('code');
++            $table->unsignedInteger('priority')->default(0);
++            $table->string('channel');
++            $table->string('status');
++            $table->dateTime('issued_at');
++            $table->dateTime('called_at')->nullable();
++            $table->foreignId('called_by_user_id')->nullable()->constrained('users')->nullOnDelete();
++            $table->timestamps();
++
++            $table->unique(['queue_id', 'code'], 'tickets_queue_code_unique');
++            $table->index(['queue_id', 'status', 'priority', 'issued_at'], 'tickets_call_next_index');
++        });
++    }
++
++    /**
++     * Reverse the migrations.
++     */
++    public function down(): void
++    {
++        Schema::dropIfExists('tickets');
++        Schema::dropIfExists('queues');
++    }
++};
+diff --git a/docs/README.md b/docs/README.md
+index 9401e42..5e6fe19 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -9,7 +9,7 @@ ## Start here
+ | Document | Purpose |
+ | --- | --- |
+ | [`business-rules.md`](business-rules.md) | Product/domain rules: entities, roles, queues, tickets, priorities, fairness, channels and billing |
+-| [`database-schema.md`](database-schema.md) | Proposed relational model and ER diagram |
++| [`database-schema.md`](database-schema.md) | Relational model and ER diagram (implemented tables + proposals) |
+ | [`architecture.md`](architecture.md) | System boundaries, request flows and ownership of responsibilities |
+ | [`api/prompt-injection.md`](api/prompt-injection.md) | Security requirements for LLM-backed API features |
+ | [`ops/devops.md`](ops/devops.md) | Local development, deployment, CI/CD and VPS operations |
+diff --git a/docs/business-rules.md b/docs/business-rules.md
+index 7a3126a..c96700b 100644
+--- a/docs/business-rules.md
++++ b/docs/business-rules.md
+@@ -1,6 +1,6 @@
+ # Business Rules — PegaFila
+ 
+-Domain document for **PegaFilaWeb** — repository **frontend, backend and totem API** (Laravel monolith). Derived from product requirements; implementation does not exist in this repository yet.
++Domain document for **PegaFilaWeb** — repository **frontend, backend and totem API** (Laravel monolith). Domain proposal; the entities (entity, memberships, invites), queues and tickets (issuance and calling) are implemented in this repository. The rest does not exist yet.
+ 
+ ## MVP Scope
+ 
+@@ -67,14 +67,39 @@ ## User Administration
+ 
+ ## Queue and Tickets
+ 
++### Queue
++
++A queue serves one entity and holds the tickets of one line of service. Attributes:
++
++- Belongs to **one** entity (limit per plan).
++- A display `name` and a `slug` **unique within the entity** (identifier for URLs/APIs).
++- An `is_active` flag (default `true`): **issuance is rejected for inactive queues**.
++- Optional `labels_i18n` (JSON): multilingual display labels (e.g. `{"pt_BR": "Fila do caixa"}`) with locale fallback.
++
+ ### Ticket
+ 
+-Unit of service in the queue. It is **single-use** and receives **one single call** — all data is immutable after issuance, except `called_at` and `called_by` (filled when called). Attributes:
++Unit of service in the queue. It is **single-use** and receives **one single call** — all data is immutable after issuance (write-once), except `called_at` and `called_by_user_id` (filled when called). Attributes:
+ 
+ - Source queue — the ticket belongs to **one** queue (within the entity); does not record which totem it came from.
+-- Priority (numeric, see below).
+-- Issuance timestamp (ordering "oldest first" within same priority).
+-- Issuance channel: totem, virtual, printed copy, etc.
++- **Display code** — issued at creation, unique per queue (see below).
++- Priority (numeric, see below; integer in the database).
++- `issued_at` — issuance timestamp (ordering "oldest first" within same priority).
++- Issuance channel: `totem`, `virtual` (default) or `printed`.
++- Status: `waiting` (default) → `called`. There is **no cancelled status** (cancellation is out of scope).
++
++**Calling** — a ticket is called **exactly once**: the call marks it `called` and fills `called_at` plus `called_by_user_id` (member of the same entity; other users are rejected with an authorization error and the ticket stays untouched). Calling an already-called ticket throws. Selecting *which* ticket to call next (priority/fairness) is a separate concern (see *Ordering and Fairness*).
++
++### Display Code
++
++Per-queue sequence used as the customer's "password" (`A001`, `A002`, ...):
++
++- Format `A` **+ zero-padded number** with at least 3 digits; beyond 999 it simply grows (`A1000`, `A1001`).
++- **Unique per `(queue_id, code)`** (database constraint).
++- The **next code is the last valid code + 1, by insertion order** — not by string order: after `A999`, the next code (inserted last) drives the sequence, so `A1000` is followed by `A1001` (string ordering would pick `A999` again).
++- **Deleting a ticket does not free its number**: after `A001..A003` with `A002` deleted, the next is `A004`.
++- **Malformed legacy codes** (anything not matching `A<digits>`) are skipped: with only `A-X` present the next is `A001`; with `A001` then `A-X` the next is `A002`.
++
++**Implementation note** — issuance runs in one transaction: the queue's active state is **re-read from the database with a row lock** (a queue deactivated after the caller loaded it is still rejected), the code is allocated inside the lock, and unique `(queue_id, code)` collisions from concurrent issuances get a few retry attempts. Nothing is persisted on rejection; a negative priority is rejected.
+ 
+ ### Priority
+ 
+diff --git a/docs/database-schema.md b/docs/database-schema.md
+index 770fd91..7de6673 100644
+--- a/docs/database-schema.md
++++ b/docs/database-schema.md
+@@ -1,6 +1,6 @@
+ # Database Schema — PegaFila
+ 
+-Relational model derived from [`business-rules.md`](business-rules.md). Domain proposal — no migrations in this repository yet.
++Relational model derived from [`business-rules.md`](business-rules.md). Implemented so far: entities, entity_memberships, entity_invites, **queues and tickets (with `App\Actions\IssueTicket`)**. The rest (billing/plans/totems) is still a proposal.
+ 
+ ## ER Diagram
+ 
+@@ -94,8 +94,8 @@ ## ER Diagram
+         bigint entity_id FK
+         string name
+         string slug
+-        bool is_active
+-        json labels_i18n
++        bool is_active "default true; inactive queues reject issuance"
++        json labels_i18n "nullable display labels per locale"
+     }
+     queue_access {
+         bigint id PK
+@@ -106,13 +106,13 @@ ## ER Diagram
+     tickets {
+         bigint id PK
+         bigint queue_id FK
+-        string code
+-        int priority
+-        string channel
+-        string status
++        string code "A<digits>, >=3 digits zero padded, e.g. A001"
++        int priority ">= 0, default 0; higher = more priority"
++        string channel "[totem, virtual, printed]"
++        string status "[waiting, called] — no cancelled status"
+         datetime issued_at
+-        datetime called_at
+-        bigint called_by_user_id FK
++        datetime called_at "nullable, set once at call time"
++        bigint called_by_user_id FK "nullable; attendant who called"
+     }
+     totems {
+         bigint id PK
+@@ -146,10 +146,11 @@ ## Modeling Notes
+ - **Account vs member:** `users` is the login account (Laravel Auth); `entity_memberships` is the user's link to the entity with role.
+ - **User↔entity cardinality:** `entity_memberships` is N:N by design (allows future multi-entity). In MVP, "one user per entity" rule is enforced in application; no global UK on `user_id`.
+ - **Owner invariant:** `entities` has no `owner_membership_id` FK. The single-owner constraint lives on `entity_memberships` via `entities.owner_seq` (generated `CASE WHEN role='owner' THEN 1 ELSE NULL END`) and a unique `(entity_id, owner_seq)` index — portable across SQLite + MySQL. Bootstrapping creates the entity then its owner row in one transaction; ownership transfer demotes the old owner to `admin` and promotes the target `admin` to `owner` in the same transaction. The generated column goes NULL during both steps, so the transient no-owner state is allowed (only a 2nd `role='owner'` row for the same entity collides).
+-- **Numeric priority:** `tickets.priority` is an integer — **higher value, more prioritized**. Named levels (normal/priority/80+) are configurable presets per entity mapping to values; sorting uses the number.
+-- **Ticket write-once:** ticket is **single-use** and receives **one single call**. All fields are immutable after issuance, **except** `called_at` and `called_by_user_id`, filled at call time. No call history table.
+-- **Ticket ↔ totem:** ticket knows only its **queue** (`queue_id`). `channel` records origin type; no FK to `totems`.
+-- **Ticket `code`:** displayable password (e.g., `A012`) shown on totem/TV; scope and format per queue/entity.
++- **Numeric priority:** `tickets.priority` is an integer, default `0` — **higher value, more prioritized**. Named levels (normal/priority/80+) are configurable presets per entity mapping to values; sorting uses the number.
++- **Ticket write-once:** ticket is **single-use** and receives **one single call**. All fields are immutable after issuance, **except** `called_at` and `called_by_user_id`, filled at call time — `App\Models\Ticket::save()` throws `LogicException` if any other field changed. No call history table.
++- **Ticket ↔ totem:** ticket knows only its **queue** (`queue_id`). `channel` records origin type (`totem`/`virtual`/`printed`); no FK to `totems`.
++- **Ticket `code`:** displayable password (`A001`, `A002`, ...) shown on totem/TV. Sequence = **last valid code + 1 by insertion order** (not string order), zero padded to at least 3 digits, growing past `A999`; deletion does not free numbers; malformed legacy codes (`!regexp ^A[0-9]+$`) are skipped. Unique per `(queue_id, code)`.
++- **Cascading FKs:** `queues.entity_id → entities` (`cascadeOnDelete`) and `tickets.queue_id → queues` (`cascadeOnDelete`); `tickets.called_by_user_id → users` `nullOnDelete`. `App\Actions\IssueTicket` issues tickets in a transaction: re-reads the queue with `lockForUpdate` (stale snapshots still rejected), allocates the code under lock and retries unique `(queue_id, code)` collisions a few times; inactive queues or negative priority reject with no writes.
+ - **Fairness:** 3-ticket priority fairness rule calculated in domain (queue state), no extra table.
+ - **Separated finance:** `billing_accounts` (1:0..1 with entity) + `subscriptions` + `plans` isolate financial model. Entity without billing can be created and tested without payment configuration. `payment_options` defines cycle (MONTHLY/ANNUAL), method (PIX/CARD/BOLETO), discount and refund window. `payments` tracks individual charges with `due_date`, `paid_at`, `refund_deadline`. Asaas webhooks update `status` idempotently. `asaas_customer_id` in `billing_accounts`; `asaas_subscription_id` in `subscriptions`; `asaas_payment_id` in `payments`.
+ - **Active subscription unique:** `billing_account_id` is UK in `subscriptions` (1:1); payment history in `payments`.
+@@ -157,5 +158,5 @@ ## Modeling Notes
+ - **Payments:** `payments` tracks each charge generated by subscription; status synced with Asaas (PENDING, RECEIVED, REFUNDED, CANCELED, OVERDUE).
+ - **Billing account:** `cpf_cnpj` stores fiscal data for invoice generation.
+ - **Enums:** `role` (`admin`, `owner`, `employee`); `subscriptions.status`; `tickets.channel`; `tickets.status` — values in business rules.
+-- **Unique constraints:** `billing_accounts (entity_id)`; `entity_memberships (entity_id, user_id)`; `queues (entity_id, slug)`; `queue_access (entity_membership_id, queue_id)`; `tickets (queue_id, code)` per issuance window; `payments (asaas_payment_id)`; `subscriptions (billing_account_id)` (1:1).
+-- **Suggested indexes:** `(queue_id, status, priority, issued_at)` on `tickets`.
+\ No newline at end of file
++- **Unique constraints:** `billing_accounts (entity_id)`; `entity_memberships (entity_id, user_id)`; `queues (entity_id, slug)`; `queue_access (entity_membership_id, queue_id)`; `tickets (queue_id, code)`; `payments (asaas_payment_id)`; `subscriptions (billing_account_id)` (1:1).
++- **Implemented indexes:** `(queue_id, status, priority, issued_at)` on `tickets` (call-next lookup).
+\ No newline at end of file
+diff --git a/tests/Feature/Queue/IssueTicketTest.php b/tests/Feature/Queue/IssueTicketTest.php
+new file mode 100644
+index 0000000..97c784e
+--- /dev/null
++++ b/tests/Feature/Queue/IssueTicketTest.php
+@@ -0,0 +1,227 @@
++<?php
++
++use App\Actions\IssueTicket;
++use App\Enums\TicketChannel;
++use App\Enums\TicketStatus;
++use App\Exceptions\InactiveQueueException;
++use App\Models\Entity;
++use App\Models\Queue;
++use App\Models\Ticket;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Schema;
++
++uses(RefreshDatabase::class);
++
++test('queues table has required columns and per-entity slug index', function () {
++    $this->assertTrue(Schema::hasTable('queues'));
++
++    $this->assertTrue(Schema::hasColumns('queues', [
++        'id', 'entity_id', 'name', 'slug', 'is_active', 'labels_i18n', 'created_at', 'updated_at',
++    ]));
++
++    $this->assertTrue(Schema::hasIndex('queues', 'queues_entity_slug_unique'));
++});
++
++test('tickets table has required columns and call-next index', function () {
++    $this->assertTrue(Schema::hasTable('tickets'));
++
++    $this->assertTrue(Schema::hasColumns('tickets', [
++        'id', 'queue_id', 'code', 'priority', 'channel', 'status',
++        'issued_at', 'called_at', 'called_by_user_id', 'created_at', 'updated_at',
++    ]));
++
++    $this->assertTrue(Schema::hasIndex('tickets', 'tickets_queue_code_unique'));
++    $this->assertTrue(Schema::hasIndex('tickets', 'tickets_call_next_index'));
++});
++
++test('tickets cascade delete with their queue and entity', function () {
++    $entity = Queue::factory()->create()->entity;
++    $queue = Queue::factory()->for($entity)->create();
++
++    $queueId = $queue->id;
++    $entity->forceDelete();
++
++    expect(DB::table('queues')->find($queueId))->toBeNull()
++        ->and(DB::table('tickets')->where('queue_id', $queueId)->count())->toBe(0);
++});
++
++test('queue model relations and casts', function () {
++    $queue = Queue::factory()->create(['labels_i18n' => ['pt_BR' => 'Fila do caixa']]);
++    $sibling = Queue::factory()->for($queue->entity)->create();
++
++    expect($queue->entity)->toBeInstanceOf(Entity::class)
++        ->and($queue->is_active)->toBeTrue()
++        ->and($queue->labels_i18n)->toBe(['pt_BR' => 'Fila do caixa'])
++        ->and($queue->tickets)->toBeEmpty();
++
++    Ticket::factory()->for($queue)->count(2)->create();
++
++    expect($queue->tickets()->count())->toBe(2)
++        ->and(Entity::find($queue->entity_id)->queues()->get())->toHaveCount(2);
++});
++
++test('each queue allocates its own display codes starting at A001', function () {
++    $queue = Queue::factory()->create();
++    $other = Queue::factory()->create();
++
++    $codes = Ticket::factory()->for($queue)->count(3)->create()->map->code;
++    Ticket::factory()->for($other)->create();
++
++    expect($codes->all())->toBe(['A001', 'A002', 'A003'])
++        ->and(Ticket::query()->where('queue_id', $other->id)->first()->code)->toBe('A001');
++});
++
++test('code sequence grows past three digits by insertion order', function () {
++    $queue = Queue::factory()->create();
++
++    // Insertion order wins over string order: A1000 sorts before A999 as a
++    // string, yet the next code must follow the last *inserted* valid code.
++    Ticket::factory()->for($queue)->create(['code' => 'A998']);
++    Ticket::factory()->for($queue)->create(['code' => 'A999']);
++
++    expect(Ticket::nextCode($queue->id))->toBe('A1000');
++
++    Ticket::factory()->for($queue)->create();
++
++    expect(Ticket::nextCode($queue->id))->toBe('A1001');
++});
++
++test('deleting a ticket does not downgrade the sequence', function () {
++    $queue = Queue::factory()->create();
++
++    $tickets = Ticket::factory()->for($queue)->count(3)->create();
++    $tickets->get(1)->delete();
++
++    expect(Ticket::factory()->for($queue)->create()->code)->toBe('A004');
++});
++
++test('malformed legacy codes are skipped by the sequence', function () {
++    $orphan = Queue::factory()->create();
++    Ticket::factory()->for($orphan)->create(['code' => 'A-X']);
++
++    expect(Ticket::nextCode($orphan->id))->toBe('A001');
++
++    $legacy = Queue::factory()->create();
++    Ticket::factory()->for($legacy)->create(['code' => 'A001']);
++    Ticket::factory()->for($legacy)->create(['code' => 'A-X']);
++
++    expect(Ticket::nextCode($legacy->id))->toBe('A002')
++        ->and(Ticket::factory()->for($legacy)->create()->code)->toBe('A002');
++});
++
++test('issued ticket is persisted with defaults', function () {
++    $queue = Queue::factory()->create();
++
++    $ticket = (new IssueTicket)($queue);
++
++    expect($ticket->exists)->toBeTrue()
++        ->and($ticket->queue_id)->toBe($queue->id)
++        ->and($ticket->code)->toBe('A001')
++        ->and($ticket->priority)->toBe(0)
++        ->and($ticket->channel)->toBe(TicketChannel::Virtual)
++        ->and($ticket->status)->toBe(TicketStatus::Waiting)
++        ->and($ticket->called_at)->toBeNull()
++        ->and($ticket->called_by_user_id)->toBeNull()
++        ->and($ticket->issued_at->format('Y-m-d H:i:s'))
++        ->toBe(now()->format('Y-m-d H:i:s'));
++
++    expect(Ticket::query()->where('queue_id', $queue->id)->count())->toBe(1);
++});
++
++test('issued custom priority and channel are respected', function () {
++    $queue = Queue::factory()->create();
++
++    $ticket = (new IssueTicket)($queue, 10, TicketChannel::Totem);
++
++    expect($ticket->priority)->toBe(10)
++        ->and($ticket->channel)->toBe(TicketChannel::Totem);
++});
++
++test('negative priority is rejected', function () {
++    (new IssueTicket)(Queue::factory()->create(), -1);
++})->throws(InvalidArgumentException::class);
++
++test('inactive queue is rejected and nothing is persisted', function () {
++    $queue = Queue::factory()->create(['is_active' => false]);
++
++    try {
++        (new IssueTicket)($queue);
++
++        $this->fail('InactiveQueueException was not thrown.');
++    } catch (InactiveQueueException) {
++        // expected
++    }
++
++    expect(Ticket::query()->count())->toBe(0);
++});
++
++test('a queue deactivated after the caller loaded it is still rejected', function () {
++    $queue = Queue::factory()->create();
++
++    $stale = Queue::query()->findOrFail($queue->id);
++    Queue::query()->whereKey($queue->id)->update(['is_active' => false]);
++
++    try {
++        (new IssueTicket)($stale);
++
++        $this->fail('InactiveQueueException was not thrown.');
++    } catch (InactiveQueueException) {
++        // expected
++    }
++
++    expect(Ticket::query()->count())->toBe(0);
++});
++
++test('a queue reactivated in the database is accepted from a stale snapshot', function () {
++    $queue = Queue::factory()->create(['is_active' => false]);
++
++    $stale = Queue::query()->findOrFail($queue->id);
++    Queue::query()->whereKey($queue->id)->update(['is_active' => true]);
++
++    $ticket = (new IssueTicket)($stale);
++
++    expect($ticket->code)->toBe('A001');
++});
++
++test('ticket factory keeps explicit code and reads per-queue context', function () {
++    $queue = Queue::factory()->create();
++
++    $placed = Ticket::factory()->forQueue($queue)->create(['code' => 'A-X', 'priority' => 2]);
++    $next = Ticket::factory()->forQueue($queue)->create();
++
++    expect($placed->code)->toBe('A-X')
++        ->and($placed->priority)->toBe(2)
++        ->and($next->code)->toBe('A001');
++});
++
++test('unique code collision during issuance is retried', function () {
++    $attempts = 0;
++    Ticket::creating(function (Ticket $ticket) use (&$attempts) {
++        $attempts++;
++
++        if ($attempts === 1) {
++            // Simulate another process having claimed the same code between
++            // nextCode() and the insert: as the transaction (with our rival
++            // row) is rolled back, attempt 2 reallocates the code from scratch.
++            Ticket::withoutEvents(fn () => DB::table('tickets')->insert([
++                'queue_id' => $ticket->queue_id,
++                'code' => $ticket->code,
++                'priority' => 0,
++                'channel' => 'virtual',
++                'status' => 'waiting',
++                'issued_at' => now(),
++                'created_at' => now(),
++                'updated_at' => now(),
++            ]));
++        }
++    });
++
++    $queue = Queue::factory()->create();
++
++    $ticket = (new IssueTicket)($queue);
++
++    expect($attempts)->toBe(2)
++        ->and($ticket->exists)->toBeTrue()
++        ->and(Ticket::query()->where('queue_id', $queue->id)->count())->toBe(1);
++});
+diff --git a/tests/Feature/Queue/TicketCallTest.php b/tests/Feature/Queue/TicketCallTest.php
+new file mode 100644
+index 0000000..2e52180
+--- /dev/null
++++ b/tests/Feature/Queue/TicketCallTest.php
+@@ -0,0 +1,96 @@
++<?php
++
++use App\Enums\TicketStatus;
++use App\Models\Ticket;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Auth\Access\AuthorizationException;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Carbon;
++
++uses(RefreshDatabase::class);
++
++test('ticket model relations and casts', function () {
++    $ticket = Ticket::factory()->create();
++
++    expect($ticket->queue()->first())->not->toBeNull()
++        ->and($ticket->calledBy)->toBeNull()
++        ->and($ticket->priority)->toBeInt()
++        ->and($ticket->issued_at)->toBeInstanceOf(Carbon::class);
++});
++
++test('member of the entity can call a waiting ticket exactly once', function () {
++    $ticket = Ticket::factory()->create();
++    $user = User::factory()->create();
++
++    $entity = $ticket->queue->entity;
++    $entity->users()->attach($user->id, ['role' => UserRole::Employee->value]);
++
++    $ticket->call($user);
++    $before = $ticket->fresh();
++
++    expect($before->status)->toBe(TicketStatus::Called)
++        ->and($before->called_by_user_id)->toBe($user->id)
++        ->and($before->called_at->gt(now()->subMinute()))->toBeTrue();
++
++    $ticket->call($user);
++})->throws(LogicException::class, 'already');
++
++test('calling by a non-member is rejected and the ticket stays untouched', function () {
++    $ticket = Ticket::factory()->create();
++    $outsider = User::factory()->create();
++
++    try {
++        $ticket->call($outsider);
++
++        $this->fail('AuthorizationException was not thrown.');
++    } catch (AuthorizationException) {
++        // expected
++    }
++
++    $after = $ticket->fresh();
++
++    expect($after->status)->toBe(TicketStatus::Waiting)
++        ->and($after->called_at)->toBeNull()
++        ->and($after->called_by_user_id)->toBeNull();
++});
++
++test('calling an already called ticket throws LogicException', function () {
++    $ticket = Ticket::factory()->called()->create();
++    $user = User::factory()->create();
++    $entity = $ticket->queue->entity;
++    $entity->users()->attach($user->id, ['role' => UserRole::Employee->value]);
++
++    $ticket->call($user);
++})->throws(LogicException::class);
++
++test('ticket is write-once: immutable fields throw on save', function () {
++    $ticket = Ticket::factory()->create();
++
++    $ticket->code = 'A999';
++    expect(fn () => $ticket->save())->toThrow(LogicException::class);
++    expect($ticket->fresh()->code)->not->toBe('A999');
++
++    $ticket->priority = 3;
++    expect(fn () => $ticket->save())->toThrow(LogicException::class);
++    expect($ticket->fresh()->priority)->not->toBe(3);
++
++    $ticket->update(['priority' => 7]);
++})->throws(LogicException::class);
++
++test('mutable fields can still be persisted without throwing', function () {
++    $ticket = Ticket::factory()->create();
++    $user = User::factory()->create();
++
++    $ticket->status = TicketStatus::Called;
++    $ticket->called_at = now();
++    $ticket->called_by_user_id = $user->id;
++
++    expect($ticket->save())->toBeTrue();
++
++    $after = $ticket->fresh();
++
++    expect($after->status)->toBe(TicketStatus::Called)
++        ->and($after->called_by_user_id)->toBe($user->id)
++        ->and($after->called_at)->not->toBeNull();
++});

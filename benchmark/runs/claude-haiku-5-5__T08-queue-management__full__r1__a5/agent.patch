@@ -1,0 +1,1742 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9806b52..1f37e7b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,7 @@ ### Added
+ - Database schema and Mermaid diagram in [`docs/database-schema.md`](docs/database-schema.md).
+ - Business rules documentation in [`docs/business-rules.md`](docs/business-rules.md): MVP queue management, entity/subscription, roles (admin, owner, employee), tickets, priorities, fairness (3-ticket rule), deterministic call panel, and channels (Flutter totem, web TV, attendant).
+ - This changelog (Keep a Changelog).
++- Queue management and call authorization: `App\Actions\CreateQueue` and `UpdateQueue` (owner/admin; rename, re-slug, activate/deactivate; no delete), `App\Actions\SetQueueAccess` (owner/admin grants or revokes the `call` permission of an employee on a queue, audited as `queue.access.granted` / `queue.access.revoked`), the `queue_access` table with `App\Models\QueueAccess` and factory, `App\Enums\QueuePermission`, and `App\Policies\QueuePolicy` (`create`, `update`, `manageAccess`, `call`). `CallNextTicket` (every mode) and `Ticket::call()` now require the caller to be allowed to call on the queue, so calls by employees without a grant are refused. Documented in [`docs/business-rules.md`](docs/business-rules.md) and [`docs/database-schema.md`](docs/database-schema.md).
+ - Auth system: Livewire `login`/`register`, password reset and email verification flows and the mail theme — with rate limiting, strict email validation and password rules ([#18](https://github.com/PegaFila/PegaFilaWeb/pull/18), [#19](https://github.com/PegaFila/PegaFilaWeb/pull/19)).
+ - Portuguese (`pt_BR`) interface localization ([#7](https://github.com/PegaFila/PegaFilaWeb/pull/7)).
+ - Ops logging: `archive` (daily) and `audit` log channels, plus `App\Ops\DiscordOpsAlert` for human-pageable ops alerts ([#17](https://github.com/PegaFila/PegaFilaWeb/pull/17)).
+diff --git a/app/Actions/CallNextTicket.php b/app/Actions/CallNextTicket.php
+index fd95ff4..05c5ec3 100644
+--- a/app/Actions/CallNextTicket.php
++++ b/app/Actions/CallNextTicket.php
+@@ -9,10 +9,21 @@
+ use App\Models\Queue;
+ use App\Models\Ticket;
+ use App\Models\User;
++use Illuminate\Auth\Access\AuthorizationException;
+ use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Gate;
+ 
+ class CallNextTicket
+ {
++    /**
++     * Call the next waiting ticket of the queue according to the call mode.
++     *
++     * The caller must be allowed to call on the queue (QueuePolicy::call), for every mode.
++     *
++     * @throws InactiveQueueException when the queue is deactivated
++     * @throws AuthorizationException when the caller may not call on the queue
++     * @throws NoWaitingTicketsException when no waiting ticket is eligible for the mode
++     */
+     public function __invoke(
+         Queue $queue,
+         User $calledBy,
+@@ -28,6 +39,8 @@ public function __invoke(
+                 throw new InactiveQueueException('Cannot call a ticket from an inactive queue.');
+             }
+ 
++            Gate::forUser($calledBy)->authorize('call', $lockedQueue);
++
+             $fairnessRestrictsToNormals = $mode === CallMode::Any
+                 && $this->fairnessApplies($lockedQueue->id);
+ 
+diff --git a/app/Actions/CreateQueue.php b/app/Actions/CreateQueue.php
+new file mode 100644
+index 0000000..34570e5
+--- /dev/null
++++ b/app/Actions/CreateQueue.php
+@@ -0,0 +1,57 @@
++<?php
++
++namespace App\Actions;
++
++use App\Models\Entity;
++use App\Models\Queue;
++use App\Models\User;
++use App\Support\UniqueViolation;
++use Illuminate\Auth\Access\AuthorizationException;
++use Illuminate\Database\QueryException;
++use Illuminate\Support\Facades\Gate;
++use Illuminate\Support\Facades\Validator;
++use Illuminate\Support\Str;
++use Illuminate\Validation\Rule;
++use Illuminate\Validation\ValidationException;
++
++class CreateQueue
++{
++    /**
++     * Create an active queue in the entity.
++     *
++     * The slug defaults to the name and is slugified either way; it is unique
++     * within the entity.
++     *
++     * @throws AuthorizationException when the actor is not an owner or admin of the entity
++     * @throws ValidationException when the name or slug is invalid or the slug is already used in the entity
++     */
++    public function __invoke(Entity $entity, User $actor, string $name, ?string $slug = null): Queue
++    {
++        Gate::forUser($actor)->authorize('create', [Queue::class, $entity]);
++
++        $name = trim($name);
++        $slug = Str::slug($slug ?? $name);
++
++        Validator::make(['name' => $name, 'slug' => $slug], [
++            'name' => ['required', 'string', 'max:255'],
++            'slug' => ['required', 'string', 'max:255', Rule::unique('queues')->where('entity_id', $entity->id)],
++        ])->validate();
++
++        try {
++            return $entity->queues()->create([
++                'name' => $name,
++                'slug' => $slug,
++                'is_active' => true,
++            ]);
++        } catch (QueryException $e) {
++            // Another request took the slug between validation and insert.
++            if (! UniqueViolation::matches($e)) {
++                throw $e;
++            }
++
++            throw ValidationException::withMessages([
++                'slug' => __('validation.unique', ['attribute' => 'slug']),
++            ]);
++        }
++    }
++}
+diff --git a/app/Actions/IssueTicket.php b/app/Actions/IssueTicket.php
+index 2feb3b3..736f03a 100644
+--- a/app/Actions/IssueTicket.php
++++ b/app/Actions/IssueTicket.php
+@@ -7,6 +7,7 @@
+ use App\Exceptions\InactiveQueueException;
+ use App\Models\Queue;
+ use App\Models\Ticket;
++use App\Support\UniqueViolation;
+ use Illuminate\Database\QueryException;
+ use Illuminate\Support\Facades\DB;
+ use InvalidArgumentException;
+@@ -53,22 +54,10 @@ public function __invoke(
+                     ]);
+                 });
+             } catch (QueryException $e) {
+-                if ($attempt >= 3 || ! self::isUniqueViolation($e)) {
++                if ($attempt >= 3 || ! UniqueViolation::matches($e)) {
+                     throw $e;
+                 }
+             }
+         }
+     }
+-
+-    private static function isUniqueViolation(QueryException $e): bool
+-    {
+-        $sqlState = $e->errorInfo[0] ?? (string) $e->getCode();
+-
+-        if ($sqlState === '23000') {
+-            return true;
+-        }
+-
+-        return str_contains($e->getMessage(), 'UNIQUE')
+-            || str_contains($e->getMessage(), 'Duplicate');
+-    }
+ }
+diff --git a/app/Actions/SetQueueAccess.php b/app/Actions/SetQueueAccess.php
+new file mode 100644
+index 0000000..3b88a8a
+--- /dev/null
++++ b/app/Actions/SetQueueAccess.php
+@@ -0,0 +1,89 @@
++<?php
++
++namespace App\Actions;
++
++use App\Enums\QueuePermission;
++use App\Models\EntityMembership;
++use App\Models\Queue;
++use App\Models\QueueAccess;
++use App\Models\User;
++use Illuminate\Auth\Access\AuthorizationException;
++use Illuminate\Support\Facades\Gate;
++use Illuminate\Support\Facades\Log;
++use Illuminate\Support\Facades\Validator;
++use Illuminate\Validation\Rule;
++use Illuminate\Validation\ValidationException;
++
++class SetQueueAccess
++{
++    /**
++     * Set the permissions a membership holds on a queue.
++     *
++     * A non-empty list grants them (creating or replacing the row); an empty list
++     * revokes the row. Grants and revokes are written to the audit channel. A revoke
++     * with no existing row is a no-op and is not audited.
++     *
++     * @param  list<string>  $permissions
++     *
++     * @throws AuthorizationException when the actor is not an owner or admin of the queue's entity
++     * @throws ValidationException when a permission is unknown or the membership and queue are in different entities
++     */
++    public function __invoke(
++        EntityMembership $targetMembership,
++        Queue $queue,
++        User $actor,
++        array $permissions,
++    ): void {
++        Gate::forUser($actor)->authorize('manageAccess', $queue);
++
++        Validator::make(['permissions' => $permissions], [
++            'permissions' => ['array', 'list'],
++            'permissions.*' => ['string', Rule::enum(QueuePermission::class)],
++        ])->validate();
++
++        if ($targetMembership->entity_id !== $queue->entity_id) {
++            throw ValidationException::withMessages([
++                'entity_membership_id' => 'The membership and the queue must belong to the same entity.',
++            ]);
++        }
++
++        $permissions = array_values(array_unique($permissions));
++
++        if ($permissions === []) {
++            $revoked = QueueAccess::query()
++                ->where('entity_membership_id', $targetMembership->id)
++                ->where('queue_id', $queue->id)
++                ->delete();
++
++            if ($revoked > 0) {
++                Log::channel('audit')->info('queue.access.revoked', [
++                    'actor_id' => $actor->id,
++                    'queue_id' => $queue->id,
++                    'entity_membership_id' => $targetMembership->id,
++                ]);
++            }
++
++            return;
++        }
++
++        // Single atomic statement, so two managers granting at once cannot collide on the unique pair.
++        QueueAccess::query()->upsert(
++            [[
++                'entity_membership_id' => $targetMembership->id,
++                'queue_id' => $queue->id,
++                'permissions' => json_encode($permissions, JSON_THROW_ON_ERROR),
++                'created_at' => now(),
++                'updated_at' => now(),
++            ]],
++            ['entity_membership_id', 'queue_id'],
++            ['permissions', 'updated_at'],
++        );
++
++        Log::channel('audit')->info('queue.access.granted', [
++            'actor_id' => $actor->id,
++            'queue_id' => $queue->id,
++            'entity_membership_id' => $targetMembership->id,
++            'permissions' => $permissions,
++        ]);
++    }
++}
+diff --git a/app/Actions/UpdateQueue.php b/app/Actions/UpdateQueue.php
+new file mode 100644
+index 0000000..854ed9c
+--- /dev/null
++++ b/app/Actions/UpdateQueue.php
+@@ -0,0 +1,80 @@
++<?php
++
++namespace App\Actions;
++
++use App\Models\Queue;
++use App\Models\User;
++use App\Support\UniqueViolation;
++use Illuminate\Auth\Access\AuthorizationException;
++use Illuminate\Database\QueryException;
++use Illuminate\Support\Facades\Gate;
++use Illuminate\Support\Facades\Validator;
++use Illuminate\Support\Str;
++use Illuminate\Validation\Rule;
++use Illuminate\Validation\ValidationException;
++
++class UpdateQueue
++{
++    /**
++     * Rename, re-slug and/or (de)activate a queue. A null argument leaves that field unchanged.
++     *
++     * Queues are never deleted: deactivating one keeps its tickets and blocks
++     * issuing and calling until it is reactivated.
++     *
++     * @throws AuthorizationException when the actor is not an owner or admin of the entity
++     * @throws ValidationException when the name or slug is invalid or the slug belongs to another queue of the entity
++     */
++    public function __invoke(
++        Queue $queue,
++        User $actor,
++        ?string $name = null,
++        ?string $slug = null,
++        ?bool $isActive = null,
++    ): Queue {
++        Gate::forUser($actor)->authorize('update', $queue);
++
++        $changes = [];
++
++        if ($name !== null) {
++            $changes['name'] = trim($name);
++        }
++
++        if ($slug !== null) {
++            $changes['slug'] = Str::slug($slug);
++        }
++
++        if ($isActive !== null) {
++            $changes['is_active'] = $isActive;
++        }
++
++        Validator::make($changes, [
++            'name' => ['sometimes', 'required', 'string', 'max:255'],
++            'slug' => [
++                'sometimes',
++                'required',
++                'string',
++                'max:255',
++                Rule::unique('queues')->where('entity_id', $queue->entity_id)->ignore($queue->id),
++            ],
++        ])->validate();
++
++        if ($changes === []) {
++            return $queue;
++        }
++
++        try {
++            $queue->update($changes);
++        } catch (QueryException $e) {
++            // Another request took the slug between validation and update.
++            if (! UniqueViolation::matches($e)) {
++                throw $e;
++            }
++
++            throw ValidationException::withMessages([
++                'slug' => __('validation.unique', ['attribute' => 'slug']),
++            ]);
++        }
++
++        return $queue;
++    }
++}
+diff --git a/app/Enums/QueuePermission.php b/app/Enums/QueuePermission.php
+new file mode 100644
+index 0000000..6f96368
+--- /dev/null
++++ b/app/Enums/QueuePermission.php
+@@ -0,0 +1,9 @@
++<?php
++
++namespace App\Enums;
++
++enum QueuePermission: string
++{
++    /** Call tickets from the queue (call-next and single-ticket call). */
++    case Call = 'call';
++}
+diff --git a/app/Models/QueueAccess.php b/app/Models/QueueAccess.php
+new file mode 100644
+index 0000000..c30a03f
+--- /dev/null
++++ b/app/Models/QueueAccess.php
+@@ -0,0 +1,50 @@
++<?php
++
++namespace App\Models;
++
++use Database\Factories\QueueAccessFactory;
++use Illuminate\Database\Eloquent\Attributes\Fillable;
++use Illuminate\Database\Eloquent\Attributes\Table;
++use Illuminate\Database\Eloquent\Factories\HasFactory;
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++
++/**
++ * Per-queue permissions granted to an employee membership.
++ *
++ * Owners and admins never need a row; only employees are granted access.
++ * Use App\Actions\SetQueueAccess to change grants so they are authorized and audited.
++ */
++#[Table('queue_access')]
++#[Fillable(['entity_membership_id', 'queue_id', 'permissions'])]
++class QueueAccess extends Model
++{
++    /** @use HasFactory<QueueAccessFactory> */
++    use HasFactory;
++
++    /**
++     * @return array<string, string>
++     */
++    protected function casts(): array
++    {
++        return [
++            'permissions' => 'array',
++        ];
++    }
++
++    /**
++     * @return BelongsTo<EntityMembership, $this>
++     */
++    public function membership(): BelongsTo
++    {
++        return $this->belongsTo(EntityMembership::class, 'entity_membership_id');
++    }
++
++    /**
++     * @return BelongsTo<Queue, $this>
++     */
++    public function queue(): BelongsTo
++    {
++        return $this->belongsTo(Queue::class);
++    }
++}
+diff --git a/app/Models/Ticket.php b/app/Models/Ticket.php
+index 1336457..fad6a15 100644
+--- a/app/Models/Ticket.php
++++ b/app/Models/Ticket.php
+@@ -4,6 +4,7 @@
+ 
+ use App\Enums\TicketChannel;
+ use App\Enums\TicketStatus;
++use App\Exceptions\InactiveQueueException;
+ use Database\Factories\TicketFactory;
+ use Illuminate\Auth\Access\AuthorizationException;
+ use Illuminate\Database\Eloquent\Attributes\Fillable;
+@@ -11,6 +12,7 @@
+ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Database\Eloquent\Relations\BelongsTo;
+ use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Gate;
+ use LogicException;
+ 
+ #[Fillable([
+@@ -79,30 +81,35 @@ protected static function booted(): void
+     /**
+      * Mark the ticket as called exactly once.
+      *
+-     * Caller must be a member of the ticket's entity; membership is
+-     * enforced here so the domain action is safe without an HTTP layer.
++     * The caller must be allowed to call on the ticket's queue (QueuePolicy::call);
++     * that is enforced here so the domain action is safe without an HTTP layer.
++     *
++     * @throws InactiveQueueException when the queue is deactivated
++     * @throws AuthorizationException when the caller may not call on the queue
++     * @throws LogicException when the ticket is no longer waiting
+      */
+     public function call(User $user): void
+     {
+         DB::transaction(function () use ($user): void {
++            // Queue before ticket: the same lock order as CallNextTicket and IssueTicket.
++            $queue = Queue::query()
++                ->whereKey($this->queue_id)
++                ->lockForUpdate()
++                ->firstOrFail();
++
+             $ticket = self::query()
+                 ->whereKey($this->id)
+                 ->lockForUpdate()
+                 ->firstOrFail();
+ 
+-            if ($ticket->status !== TicketStatus::Waiting) {
+-                throw new LogicException('Only waiting tickets can be called.');
++            if (! $queue->is_active) {
++                throw new InactiveQueueException('Cannot call a ticket from an inactive queue.');
+             }
+ 
+-            $entityId = Queue::query()->whereKey($ticket->queue_id)->value('entity_id');
+-
+-            $isMember = EntityMembership::query()
+-                ->where('entity_id', $entityId)
+-                ->where('user_id', $user->id)
+-                ->exists();
++            Gate::forUser($user)->authorize('call', $queue);
+ 
+-            if (! $isMember) {
+-                throw new AuthorizationException('Only entity members can call tickets.');
++            if ($ticket->status !== TicketStatus::Waiting) {
++                throw new LogicException('Only waiting tickets can be called.');
+             }
+ 
+             $ticket->status = TicketStatus::Called;
+diff --git a/app/Policies/QueuePolicy.php b/app/Policies/QueuePolicy.php
+new file mode 100644
+index 0000000..6c63e4f
+--- /dev/null
++++ b/app/Policies/QueuePolicy.php
+@@ -0,0 +1,78 @@
++<?php
++
++namespace App\Policies;
++
++use App\Enums\QueuePermission;
++use App\Models\Entity;
++use App\Models\Queue;
++use App\Models\QueueAccess;
++use App\Models\User;
++use App\Models\UserRole;
++
++/**
++ * Single source of truth for queue authorization.
++ *
++ * Queues are retired by deactivation, never deleted, so there is no delete ability:
++ * undefined abilities are denied by Gate.
++ */
++class QueuePolicy
++{
++    /**
++     * Determine whether the user can create queues in the entity (owner + admin).
++     */
++    public function create(User $user, Entity $entity): bool
++    {
++        return $this->isManagerOf($user, $entity->id);
++    }
++
++    /**
++     * Determine whether the user can rename, re-slug or (de)activate the queue (owner + admin).
++     */
++    public function update(User $user, Queue $queue): bool
++    {
++        return $this->isManagerOf($user, $queue->entity_id);
++    }
++
++    /**
++     * Determine whether the user can grant or revoke per-queue permissions (owner + admin).
++     */
++    public function manageAccess(User $user, Queue $queue): bool
++    {
++        return $this->isManagerOf($user, $queue->entity_id);
++    }
++
++    /**
++     * Determine whether the user can call tickets of the queue.
++     *
++     * Owners and admins always can. Anyone else needs a queue_access row for this
++     * queue whose permissions are an array containing `call`.
++     */
++    public function call(User $user, Queue $queue): bool
++    {
++        if ($this->isManagerOf($user, $queue->entity_id)) {
++            return true;
++        }
++
++        $membership = $user->membershipFor($queue->entity_id);
++
++        if ($membership === null) {
++            return false;
++        }
++
++        $access = QueueAccess::query()
++            ->where('entity_membership_id', $membership->id)
++            ->where('queue_id', $queue->id)
++            ->first();
++
++        return is_array($access?->permissions)
++            && in_array(QueuePermission::Call->value, $access->permissions, true);
++    }
++
++    protected function isManagerOf(User $user, int $entityId): bool
++    {
++        $membership = $user->membershipFor($entityId);
++
++        return $membership
++            && in_array($membership->role, [UserRole::Owner, UserRole::Admin], true);
++    }
++}
+diff --git a/app/Support/UniqueViolation.php b/app/Support/UniqueViolation.php
+new file mode 100644
+index 0000000..23ba6e5
+--- /dev/null
++++ b/app/Support/UniqueViolation.php
+@@ -0,0 +1,17 @@
++<?php
++
++namespace App\Support;
++
++use Illuminate\Database\QueryException;
++
++/**
++ * Recognizes a unique-index violation (SQLite and MariaDB messages).
++ */
++final class UniqueViolation
++{
++    public static function matches(QueryException $e): bool
++    {
++        return str_contains($e->getMessage(), 'UNIQUE')
++            || str_contains($e->getMessage(), 'Duplicate');
++    }
++}
+diff --git a/database/factories/QueueAccessFactory.php b/database/factories/QueueAccessFactory.php
+new file mode 100644
+index 0000000..6a6f6e4
+--- /dev/null
++++ b/database/factories/QueueAccessFactory.php
+@@ -0,0 +1,35 @@
++<?php
++
++namespace Database\Factories;
++
++use App\Enums\QueuePermission;
++use App\Models\EntityMembership;
++use App\Models\Queue;
++use App\Models\QueueAccess;
++use Illuminate\Database\Eloquent\Factories\Factory;
++
++/**
++ * @extends Factory<QueueAccess>
++ */
++class QueueAccessFactory extends Factory
++{
++    /**
++     * Define the model's default state.
++     *
++     * The membership is created in the queue's entity. Factory attributes resolve
++     * in definition order, so `queue_id` is already an id when the membership
++     * closure reads it; an explicit `queue_id` override is honoured the same way.
++     *
++     * @return array<string, mixed>
++     */
++    public function definition(): array
++    {
++        return [
++            'queue_id' => Queue::factory(),
++            'entity_membership_id' => fn (array $attributes) => EntityMembership::factory()->create([
++                'entity_id' => Queue::query()->whereKey($attributes['queue_id'])->value('entity_id'),
++            ]),
++            'permissions' => [QueuePermission::Call->value],
++        ];
++    }
++}
+diff --git a/database/migrations/2026_10_29_050658_create_queue_access_table.php b/database/migrations/2026_10_29_050658_create_queue_access_table.php
+new file mode 100644
+index 0000000..b4e7586
+--- /dev/null
++++ b/database/migrations/2026_10_29_050658_create_queue_access_table.php
+@@ -0,0 +1,32 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    /**
++     * Run the migrations.
++     */
++    public function up(): void
++    {
++        Schema::create('queue_access', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('entity_membership_id')->constrained()->cascadeOnDelete();
++            $table->foreignId('queue_id')->constrained()->cascadeOnDelete();
++            $table->json('permissions');
++            $table->timestamps();
++
++            $table->unique(['entity_membership_id', 'queue_id'], 'queue_access_membership_queue_unique');
++        });
++    }
++
++    /**
++     * Reverse the migrations.
++     */
++    public function down(): void
++    {
++        Schema::dropIfExists('queue_access');
++    }
++};
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 19717be..d396c8e 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -139,6 +139,9 @@ ## Authorization boundary
+ - subscription limits are enforced before creating users or queues;
+ - totem authentication identifies the registered device before issuing tickets.
+ 
++Queue-level rules live in `App\Policies\QueuePolicy` (single source of truth).
++Queue actions and both call paths authorize through it, never through the UI.
++
+ Do not rely on hidden UI controls as authorization.
+ 
+ ## Source of truth
+diff --git a/docs/business-rules.md b/docs/business-rules.md
+index d72c8c7..baf75c1 100644
+--- a/docs/business-rules.md
++++ b/docs/business-rules.md
+@@ -98,7 +98,35 @@ ### Ticket
+ 
+ **Immutability enforcement:** the write-once rule is enforced on the `Ticket` model (`updating` hook), so it applies to Eloquent saves only — mass updates through the query builder (`Ticket::query()->update(...)`) bypass it and must not be used on issued tickets.
+ 
+-**Single-ticket call (scope note):** `Ticket::call()` marks one waiting ticket as `called` (entity-membership checked, exactly-once). This minimal domain primitive proves the mutable `status`/`called_*` fields. Deterministic call-next selection (priority + age + 3-ticket fairness) is implemented by `App\Actions\CallNextTicket` with the three call-panel modes below (`any` applies fairness; `priority_only`/`normal_only` ignore it); AuthZ stays out of scope per #20 and HTTP/Livewire panels remain future work.
++**Single-ticket call (scope note):** `Ticket::call()` marks one waiting ticket as `called` (exactly-once), and only for a caller allowed to call on its queue (see [Queue Management and Call Access](#queue-management-and-call-access)). This minimal domain primitive proves the mutable `status`/`called_*` fields. Deterministic call-next selection (priority + age + 3-ticket fairness) is implemented by `App\Actions\CallNextTicket` with the three call-panel modes below (`any` applies fairness; `priority_only`/`normal_only` ignore it); HTTP/Livewire panels remain future work.
++
++### Queue Management and Call Access
++
++Owners and admins manage the queues of their entity. Employees only call tickets, and only on queues they were granted.
++
++**Queue lifecycle (owner and admin only):**
++
++- **Create:** a name (trimmed, 1–255 characters) and an optional slug. The slug defaults to the slugified name (`Atendimento Geral` → `atendimento-geral`) and is slugified either way. New queues are active.
++- **Slug uniqueness:** unique **within an entity**; the same slug may exist in another entity. A duplicate is rejected as a validation error.
++- **Update:** name, slug and active flag can change in any combination. Keeping the queue's own slug is fine; taking another queue's slug is rejected.
++- **Retire, never delete:** a queue is retired by deactivation (`is_active = false`). Its tickets are preserved, and issuing or calling on it fails with `InactiveQueueException` until it is reactivated. There is no delete action for queues.
++
++**Per-queue grants (`queue_access`):**
++
++- Owners and admins set the permissions an employee membership holds on a queue. The only permission today is `call`. A non-empty list grants it; an empty list revokes it.
++- Owners and admins never need a grant: their role already allows calling on every queue of the entity.
++- Employees cannot grant access, including to themselves.
++- Every grant and revoke is audited (`queue.access.granted` and `queue.access.revoked`, with the acting user, queue and membership). A revoke with no existing grant is not audited.
++
++**Who may call tickets of a queue:**
++
++| Who | May call on the queue |
++| --- | --- |
++| Owner or admin of the queue's entity | Yes, always |
++| Employee with a `queue_access` grant on that queue whose permissions include `call` | Yes |
++| Employee without such a grant, member of another entity, non-member | No |
++
++A denied call changes nothing. Both call paths enforce the rule: `CallNextTicket` (every call mode) and `Ticket::call()`. The checks run in this order: queue is active (`InactiveQueueException`), caller is allowed (`AuthorizationException`), ticket is still waiting (`LogicException` for `Ticket::call()`).
+ 
+ ### Priority
+ 
+diff --git a/docs/database-schema.md b/docs/database-schema.md
+index 674ff8d..850d959 100644
+--- a/docs/database-schema.md
++++ b/docs/database-schema.md
+@@ -2,7 +2,7 @@ # Database Schema — PegaFila
+ 
+ Relational model derived from [`business-rules.md`](business-rules.md).
+ 
+-**Core tables migrated:** `entities`, `entity_memberships`, `queues`, and `tickets` have reversible Laravel migrations and Eloquent models. Billing (`plans`, `billing_accounts`, `subscriptions`, `payments`, `payment_options`), `totems`, and `queue_access` remain schema proposals only — not yet migrated.
++**Core tables migrated:** `entities`, `entity_memberships`, `queues`, `tickets`, and `queue_access` have reversible Laravel migrations and Eloquent models. Billing (`plans`, `billing_accounts`, `subscriptions`, `payments`, `payment_options`) and `totems` remain schema proposals only — not yet migrated.
+ 
+ ## ER Diagram
+ 
+@@ -138,7 +138,7 @@ ## Main Relationships
+ | **Owner invariant** | `entity_memberships` has exactly one `role='owner'` per `entity_id`. Enforced by `entities.owner_seq` (generated `CASE WHEN role='owner' THEN 1 ELSE NULL END`) + unique `(entity_id, owner_seq)` — permits multiple non-owners, rejects a 2nd owner. No FK back to `entities`. Ownership transfer = demote old owner (role→admin), promote target admin (role→owner); the generated column + unique index tolerate the transient no-owner row within the transaction. |
+ | `entity_memberships.role` | enum | `admin`, `owner`, `employee` — billing only for owner |
+ | `plans` → limits | — | `max_users`, `max_queues` |
+-| `queue_access` | join 1:N/1:N | Employee: granular permissions per queue |
++| `queue_access` | `entity_memberships` 1 : N, `queues` 1 : N | Employee: granular permissions per queue. One row per (membership, queue) pair; `permissions` is a JSON array of strings (`call` is the only value today). Owners and admins need no row |
+ | `queues` → `tickets` | 1 : N | Ticket belongs to **one** queue; ordering by `priority` (desc) + `issued_at` (asc) |
+ | `users` → `tickets` | 1 : N | `called_by_user_id`: attendant who called the ticket |
+ | `totems` | per entity | Device registration for API auth; **no** ticket relationship |
+@@ -158,6 +158,7 @@ ## Modeling Notes
+ - **Payment option:** `payment_options` can be preferred (`is_preferred`) and active (`is_active`). Discount (`discount_percent`) and refund window (`refund_window_days`) configurable.
+ - **Payments:** `payments` tracks each charge generated by subscription; status synced with Asaas (PENDING, RECEIVED, REFUNDED, CANCELED, OVERDUE).
+ - **Billing account:** `cpf_cnpj` stores fiscal data for invoice generation.
+-- **Enums:** `role` (`admin`, `owner`, `employee`); `tickets.channel` (`totem`, `virtual`, `printed`); `tickets.status` (`waiting`, `called`); `subscriptions.status` — remaining values in business rules.
++- **Enums:** `role` (`admin`, `owner`, `employee`); `tickets.channel` (`totem`, `virtual`, `printed`); `tickets.status` (`waiting`, `called`); `queue_access.permissions` items (`call`); `subscriptions.status` — remaining values in business rules.
+ - **Unique constraints:** `billing_accounts (entity_id)`; `entity_memberships (entity_id, user_id)`; `queues (entity_id, slug)`; `queue_access (entity_membership_id, queue_id)`; `tickets (queue_id, code)` per issuance window; `payments (asaas_payment_id)`; `subscriptions (billing_account_id)` (1:1).
+-- **Suggested indexes:** `(queue_id, status, priority, issued_at)` on `tickets`.
+\ No newline at end of file
++- **Suggested indexes:** `(queue_id, status, priority, issued_at)` on `tickets`.
++- **Queue access:** `queue_access` stores only employee grants. Owners and admins act through their role, so they have no rows. Rows are written and removed only by `App\Actions\SetQueueAccess`, which authorizes and audits the change. Deleting a membership or a queue deletes its grants (cascade). `permissions` is a JSON array; a corrupted (non-array) value grants nothing.
+\ No newline at end of file
+diff --git a/tests/Feature/CallNextTicketTest.php b/tests/Feature/CallNextTicketTest.php
+index 8537ac2..c89d800 100644
+--- a/tests/Feature/CallNextTicketTest.php
++++ b/tests/Feature/CallNextTicketTest.php
+@@ -11,13 +11,14 @@
+ use App\Models\Queue;
+ use App\Models\Ticket;
+ use App\Models\User;
++use App\Models\UserRole;
+ use Illuminate\Foundation\Testing\RefreshDatabase;
+ 
+ uses(RefreshDatabase::class);
+ 
+ it('calls the higher priority ticket first', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+-    $calledBy = User::factory()->create();
++    $calledBy = memberOf($queue->entity, UserRole::Admin);
+ 
+     $normal = (new IssueTicket)($queue, 0);
+     $priority = (new IssueTicket)($queue, 10);
+@@ -30,7 +31,7 @@
+ 
+ it('calls the oldest ticket first within the same priority', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+-    $calledBy = User::factory()->create();
++    $calledBy = memberOf($queue->entity, UserRole::Admin);
+ 
+     $older = Ticket::factory()->forQueue($queue)->create([
+         'priority' => 0,
+@@ -48,7 +49,7 @@
+ 
+ it('forces the oldest normal ticket after three consecutive priority calls', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+-    $calledBy = User::factory()->create();
++    $calledBy = memberOf($queue->entity, UserRole::Admin);
+ 
+     $olderNormal = Ticket::factory()->forQueue($queue)->create([
+         'priority' => 0,
+@@ -74,7 +75,7 @@
+ 
+ it('resets fairness after a normal call', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+-    $calledBy = User::factory()->create();
++    $calledBy = memberOf($queue->entity, UserRole::Admin);
+ 
+     (new IssueTicket)($queue, 0);
+     (new IssueTicket)($queue, 10);
+@@ -96,7 +97,7 @@
+ 
+ it('breaks issued_at ties by lowest id', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+-    $calledBy = User::factory()->create();
++    $calledBy = memberOf($queue->entity, UserRole::Admin);
+     $issuedAt = now();
+ 
+     $first = Ticket::factory()->forQueue($queue)->create([
+@@ -115,7 +116,7 @@
+ 
+ it('still calls priority when no normal is waiting after three priority calls', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+-    $calledBy = User::factory()->create();
++    $calledBy = memberOf($queue->entity, UserRole::Admin);
+ 
+     (new IssueTicket)($queue, 10);
+     (new IssueTicket)($queue, 10);
+@@ -133,7 +134,7 @@
+ 
+ it('ignores fairness in priority_only mode', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+-    $calledBy = User::factory()->create();
++    $calledBy = memberOf($queue->entity, UserRole::Admin);
+ 
+     (new IssueTicket)($queue, 0);
+     (new IssueTicket)($queue, 10);
+@@ -152,7 +153,7 @@
+ 
+ it('only considers normals in normal_only mode', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+-    $calledBy = User::factory()->create();
++    $calledBy = memberOf($queue->entity, UserRole::Admin);
+ 
+     $normal = (new IssueTicket)($queue, 0);
+     (new IssueTicket)($queue, 10);
+@@ -164,7 +165,7 @@
+ 
+ it('rejects calling from an inactive queue', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+-    $calledBy = User::factory()->create();
++    $calledBy = memberOf($queue->entity, UserRole::Admin);
+     $ticket = (new IssueTicket)($queue, 0);
+ 
+     $queue->update(['is_active' => false]);
+@@ -177,7 +178,7 @@
+ 
+ it('rejects calling when no waiting tickets are eligible', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+-    $calledBy = User::factory()->create();
++    $calledBy = memberOf($queue->entity, UserRole::Admin);
+ 
+     expect(fn () => (new CallNextTicket)($queue, $calledBy, CallMode::Any))
+         ->toThrow(NoWaitingTicketsException::class);
+@@ -185,7 +186,7 @@
+ 
+ it('rejects priority_only when only normals wait', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+-    $calledBy = User::factory()->create();
++    $calledBy = memberOf($queue->entity, UserRole::Admin);
+ 
+     (new IssueTicket)($queue, 0);
+ 
+@@ -195,7 +196,7 @@
+ 
+ it('rejects normal_only when only priority tickets wait', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+-    $calledBy = User::factory()->create();
++    $calledBy = memberOf($queue->entity, UserRole::Admin);
+ 
+     (new IssueTicket)($queue, 10);
+ 
+@@ -206,7 +207,7 @@
+ it('never selects tickets from another queue', function () {
+     $queueA = Queue::factory()->create(['is_active' => true]);
+     $queueB = Queue::factory()->create(['is_active' => true]);
+-    $calledBy = User::factory()->create();
++    $calledBy = memberOf($queueA->entity, UserRole::Admin);
+ 
+     $ticketA = (new IssueTicket)($queueA, 0);
+     (new IssueTicket)($queueB, 10);
+@@ -241,7 +242,7 @@
+ 
+ it('fills called fields on the returned ticket', function () {
+     $queue = Queue::factory()->create(['is_active' => true]);
+-    $calledBy = User::factory()->create();
++    $calledBy = memberOf($queue->entity, UserRole::Admin);
+     (new IssueTicket)($queue, 0);
+ 
+     $called = (new CallNextTicket)($queue, $calledBy, CallMode::Any);
+diff --git a/tests/Feature/Queue/CallAuthorizationTest.php b/tests/Feature/Queue/CallAuthorizationTest.php
+new file mode 100644
+index 0000000..0cced36
+--- /dev/null
++++ b/tests/Feature/Queue/CallAuthorizationTest.php
+@@ -0,0 +1,152 @@
++<?php
++
++use App\Actions\CallNextTicket;
++use App\Actions\IssueTicket;
++use App\Enums\CallMode;
++use App\Enums\TicketStatus;
++use App\Exceptions\InactiveQueueException;
++use App\Models\Entity;
++use App\Models\Queue;
++use App\Models\QueueAccess;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Auth\Access\AuthorizationException;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use LogicException;
++
++uses(RefreshDatabase::class);
++
++/**
++ * An employee of the entity; grants `call` on the queue when $granted is true.
++ */
++function callerFor(Queue $queue, bool $granted): User
++{
++    $employee = memberOf($queue->entity, UserRole::Employee);
++
++    if ($granted) {
++        QueueAccess::factory()->create([
++            'entity_membership_id' => $employee->memberships()->firstOrFail()->id,
++            'queue_id' => $queue->id,
++        ]);
++    }
++
++    return $employee;
++}
++
++it('refuses to call next ticket for an employee without a grant in every call mode', function (CallMode $mode) {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $ticket = (new IssueTicket)($queue, 0);
++    $employee = callerFor($queue, granted: false);
++
++    expect(fn () => (new CallNextTicket)($queue, $employee, $mode))
++        ->toThrow(AuthorizationException::class);
++
++    expect($ticket->fresh())
++        ->status->toBe(TicketStatus::Waiting)
++        ->called_by_user_id->toBeNull();
++})->with([
++    'any' => [CallMode::Any],
++    'priority only' => [CallMode::PriorityOnly],
++    'normal only' => [CallMode::NormalOnly],
++]);
++
++it('refuses to call next ticket for outsiders and managers of another entity', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $ticket = (new IssueTicket)($queue, 0);
++    $outsider = User::factory()->create();
++    $otherManager = memberOf(Entity::factory()->create(), UserRole::Admin);
++
++    expect(fn () => (new CallNextTicket)($queue, $outsider))->toThrow(AuthorizationException::class);
++    expect(fn () => (new CallNextTicket)($queue, $otherManager))->toThrow(AuthorizationException::class);
++
++    expect($ticket->fresh()->status)->toBe(TicketStatus::Waiting);
++});
++
++it('lets an employee with a call grant call next ticket in every mode', function (CallMode $mode, int $priority) {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $ticket = (new IssueTicket)($queue, $priority);
++    $employee = callerFor($queue, granted: true);
++
++    $called = (new CallNextTicket)($queue, $employee, $mode);
++
++    expect($called->id)->toBe($ticket->id)
++        ->and($called->called_by_user_id)->toBe($employee->id);
++})->with([
++    'any' => [CallMode::Any, 0],
++    'priority only' => [CallMode::PriorityOnly, 10],
++    'normal only' => [CallMode::NormalOnly, 0],
++]);
++
++it('does not let a call grant on one queue call tickets of another queue', function () {
++    $entity = Entity::factory()->create();
++    $granted = Queue::factory()->for($entity)->create(['is_active' => true]);
++    $other = Queue::factory()->for($entity)->create(['is_active' => true]);
++    $ticket = (new IssueTicket)($other, 0);
++    $employee = callerFor($granted, granted: true);
++
++    expect(fn () => (new CallNextTicket)($other, $employee))
++        ->toThrow(AuthorizationException::class);
++
++    expect($ticket->fresh()->status)->toBe(TicketStatus::Waiting);
++});
++
++it('reports an inactive queue before authorization when calling next ticket', function () {
++    $queue = Queue::factory()->create(['is_active' => false]);
++    $outsider = User::factory()->create();
++
++    expect(fn () => (new CallNextTicket)($queue, $outsider))
++        ->toThrow(InactiveQueueException::class);
++});
++
++it('refuses Ticket::call for an employee without a grant and leaves the ticket waiting', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $ticket = (new IssueTicket)($queue, 0);
++    $employee = callerFor($queue, granted: false);
++
++    expect(fn () => $ticket->call($employee))->toThrow(AuthorizationException::class);
++
++    expect($ticket->fresh()->status)->toBe(TicketStatus::Waiting);
++});
++
++it('lets an employee with a call grant call a ticket', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $ticket = (new IssueTicket)($queue, 0);
++    $employee = callerFor($queue, granted: true);
++
++    $ticket->call($employee);
++
++    expect($ticket->fresh())
++        ->status->toBe(TicketStatus::Called)
++        ->called_by_user_id->toBe($employee->id);
++});
++
++it('reports an unauthorized caller before the already-called check on Ticket::call', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $ticket = (new IssueTicket)($queue, 0);
++    $manager = memberOf($queue->entity, UserRole::Admin);
++    $ticket->call($manager);
++    $outsider = User::factory()->create();
++
++    expect(fn () => $ticket->fresh()->call($outsider))->toThrow(AuthorizationException::class);
++    expect(fn () => $ticket->fresh()->call($manager))->toThrow(LogicException::class);
++});
++
++it('reports an inactive queue before authorization on Ticket::call', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $ticket = (new IssueTicket)($queue, 0);
++    $outsider = User::factory()->create();
++    $queue->update(['is_active' => false]);
++
++    expect(fn () => $ticket->call($outsider))->toThrow(InactiveQueueException::class);
++
++    expect($ticket->fresh()->status)->toBe(TicketStatus::Waiting);
++});
++
++it('keeps Ticket::call locked to waiting tickets for authorized callers', function () {
++    $queue = Queue::factory()->create(['is_active' => true]);
++    $ticket = (new IssueTicket)($queue, 0);
++    $manager = memberOf($queue->entity, UserRole::Admin);
++    $ticket->call($manager);
++
++    expect(fn () => $ticket->fresh()->call($manager))->toThrow(LogicException::class);
++});
+diff --git a/tests/Feature/Queue/CreateQueueTest.php b/tests/Feature/Queue/CreateQueueTest.php
+new file mode 100644
+index 0000000..5585141
+--- /dev/null
++++ b/tests/Feature/Queue/CreateQueueTest.php
+@@ -0,0 +1,125 @@
++<?php
++
++use App\Actions\CreateQueue;
++use App\Models\Entity;
++use App\Models\Queue;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Auth\Access\AuthorizationException;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Validation\ValidationException;
++
++uses(RefreshDatabase::class);
++
++it('creates an active queue with a trimmed name and a slug derived from it', function () {
++    $entity = Entity::factory()->create();
++
++    $queue = (new CreateQueue)($entity, memberOf($entity, UserRole::Admin), '  Atendimento Geral  ');
++
++    expect($queue->fresh())
++        ->entity_id->toBe($entity->id)
++        ->name->toBe('Atendimento Geral')
++        ->slug->toBe('atendimento-geral')
++        ->is_active->toBeTrue();
++});
++
++it('slugifies an explicit slug', function () {
++    $entity = Entity::factory()->create();
++
++    $queue = (new CreateQueue)($entity, memberOf($entity, UserRole::Owner), 'Caixa', 'Fila VIP!!');
++
++    expect($queue->slug)->toBe('fila-vip');
++});
++
++it('allows the same slug in another entity', function () {
++    $first = Entity::factory()->create();
++    $second = Entity::factory()->create();
++    (new CreateQueue)($first, memberOf($first, UserRole::Admin), 'Geral');
++
++    $queue = (new CreateQueue)($second, memberOf($second, UserRole::Admin), 'Geral');
++
++    expect($queue->slug)->toBe('geral')
++        ->and(Queue::query()->where('slug', 'geral')->count())->toBe(2);
++});
++
++it('rejects a duplicate slug within the same entity', function () {
++    $entity = Entity::factory()->create();
++    $manager = memberOf($entity, UserRole::Admin);
++    (new CreateQueue)($entity, $manager, 'Geral');
++
++    expect(fn () => (new CreateQueue)($entity, $manager, 'Geral'))
++        ->toThrow(ValidationException::class);
++
++    expect(Queue::query()->where('entity_id', $entity->id)->count())->toBe(1);
++});
++
++it('turns a slug collision caught only by the database index into a validation error', function () {
++    $entity = Entity::factory()->create();
++    $manager = memberOf($entity, UserRole::Admin);
++
++    // Another request takes the slug between validation and insert.
++    Queue::creating(function () use ($entity): void {
++        DB::table('queues')->insert([
++            'entity_id' => $entity->id,
++            'name' => 'Geral',
++            'slug' => 'geral',
++            'is_active' => true,
++            'created_at' => now(),
++            'updated_at' => now(),
++        ]);
++    });
++
++    try {
++        expect(fn () => (new CreateQueue)($entity, $manager, 'Geral'))
++            ->toThrow(ValidationException::class);
++    } finally {
++        Queue::flushEventListeners();
++    }
++
++    expect(Queue::query()->where('entity_id', $entity->id)->count())->toBe(1);
++});
++
++it('rejects a blank name', function () {
++    $entity = Entity::factory()->create();
++
++    expect(fn () => (new CreateQueue)($entity, memberOf($entity, UserRole::Admin), '   '))
++        ->toThrow(ValidationException::class);
++
++    expect(Queue::query()->count())->toBe(0);
++});
++
++it('accepts a 255 character name and rejects 256', function () {
++    $entity = Entity::factory()->create();
++    $manager = memberOf($entity, UserRole::Admin);
++
++    $queue = (new CreateQueue)($entity, $manager, str_repeat('a', 255));
++
++    expect($queue->name)->toHaveLength(255);
++
++    expect(fn () => (new CreateQueue)($entity, $manager, str_repeat('b', 256)))
++        ->toThrow(ValidationException::class);
++});
++
++it('rejects an explicit slug that slugifies to nothing', function () {
++    $entity = Entity::factory()->create();
++
++    expect(fn () => (new CreateQueue)($entity, memberOf($entity, UserRole::Admin), 'Geral', '!!!'))
++        ->toThrow(ValidationException::class);
++
++    expect(Queue::query()->count())->toBe(0);
++});
++
++it('refuses employees, managers of another entity and outsiders without writing', function (Closure $actorFor) {
++    $entity = Entity::factory()->create();
++    $actor = $actorFor($entity);
++
++    expect(fn () => (new CreateQueue)($entity, $actor, 'Geral'))
++        ->toThrow(AuthorizationException::class);
++
++    expect(Queue::query()->count())->toBe(0);
++})->with([
++    'employee' => [fn (Entity $entity) => memberOf($entity, UserRole::Employee)],
++    'admin of another entity' => [fn () => memberOf(Entity::factory()->create(), UserRole::Admin)],
++    'outsider' => [fn () => User::factory()->create()],
++]);
+diff --git a/tests/Feature/Queue/QueueAccessSchemaTest.php b/tests/Feature/Queue/QueueAccessSchemaTest.php
+new file mode 100644
+index 0000000..7c624a7
+--- /dev/null
++++ b/tests/Feature/Queue/QueueAccessSchemaTest.php
+@@ -0,0 +1,66 @@
++<?php
++
++use App\Enums\QueuePermission;
++use App\Models\EntityMembership;
++use App\Models\Queue;
++use App\Models\QueueAccess;
++use Illuminate\Database\QueryException;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Schema;
++
++uses(RefreshDatabase::class);
++
++it('creates queue_access with its columns and a unique membership and queue pair', function () {
++    expect(Schema::hasTable('queue_access'))->toBeTrue()
++        ->and(Schema::hasColumns('queue_access', [
++            'id', 'entity_membership_id', 'queue_id', 'permissions', 'created_at', 'updated_at',
++        ]))->toBeTrue()
++        ->and(Schema::hasIndex('queue_access', 'queue_access_membership_queue_unique'))->toBeTrue();
++});
++
++it('rejects a second grant for the same membership and queue at the database level', function () {
++    $access = QueueAccess::factory()->create();
++
++    expect(fn () => QueueAccess::factory()->create([
++        'entity_membership_id' => $access->entity_membership_id,
++        'queue_id' => $access->queue_id,
++    ]))->toThrow(QueryException::class);
++});
++
++it('deletes grants when their membership or queue is deleted', function () {
++    $byMembership = QueueAccess::factory()->create();
++    $byQueue = QueueAccess::factory()->create();
++
++    EntityMembership::query()->whereKey($byMembership->entity_membership_id)->delete();
++    Queue::query()->whereKey($byQueue->queue_id)->delete();
++
++    expect(QueueAccess::query()->whereKey([$byMembership->id, $byQueue->id])->count())->toBe(0);
++});
++
++it('casts permissions to an array', function () {
++    $access = QueueAccess::factory()->create(['permissions' => [QueuePermission::Call->value]]);
++
++    expect($access->fresh()->permissions)->toBe(['call']);
++});
++
++it('defaults the factory to a call grant', function () {
++    $access = QueueAccess::factory()->create();
++
++    expect($access->fresh()->permissions)->toBe(['call']);
++});
++
++it('keeps the factory membership and queue in the same entity', function () {
++    $access = QueueAccess::factory()->create();
++
++    expect($access->membership->entity_id)->toBe($access->queue->entity_id);
++});
++
++it('keeps the factory membership and queue in the same entity when the queue is given', function () {
++    $queue = Queue::factory()->create();
++
++    $access = QueueAccess::factory()->create(['queue_id' => $queue->id]);
++
++    expect($access->membership->entity_id)->toBe($queue->entity_id)
++        ->and(DB::table('queue_access')->where('id', $access->id)->value('queue_id'))->toBe($queue->id);
++});
+diff --git a/tests/Feature/Queue/QueuePolicyTest.php b/tests/Feature/Queue/QueuePolicyTest.php
+new file mode 100644
+index 0000000..a49eec3
+--- /dev/null
++++ b/tests/Feature/Queue/QueuePolicyTest.php
+@@ -0,0 +1,112 @@
++<?php
++
++use App\Models\Entity;
++use App\Models\Queue;
++use App\Models\QueueAccess;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Gate;
++
++uses(RefreshDatabase::class);
++
++it('lets owners and admins create, update, manage access to and call on their entity queues', function (UserRole $role) {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $gate = Gate::forUser(memberOf($entity, $role));
++
++    expect($gate->allows('create', [Queue::class, $entity]))->toBeTrue()
++        ->and($gate->allows('update', $queue))->toBeTrue()
++        ->and($gate->allows('manageAccess', $queue))->toBeTrue()
++        ->and($gate->allows('call', $queue))->toBeTrue();
++})->with([
++    'owner' => [UserRole::Owner],
++    'admin' => [UserRole::Admin],
++]);
++
++it('denies employees create, update and manageAccess even with a call grant', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $employee = memberOf($entity, UserRole::Employee);
++    QueueAccess::factory()->create([
++        'entity_membership_id' => $employee->memberships()->firstOrFail()->id,
++        'queue_id' => $queue->id,
++    ]);
++    $gate = Gate::forUser($employee);
++
++    expect($gate->allows('create', [Queue::class, $entity]))->toBeFalse()
++        ->and($gate->allows('update', $queue))->toBeFalse()
++        ->and($gate->allows('manageAccess', $queue))->toBeFalse()
++        ->and($gate->allows('call', $queue))->toBeTrue();
++});
++
++it('denies an employee without a grant every ability', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $gate = Gate::forUser(memberOf($entity, UserRole::Employee));
++
++    expect($gate->allows('create', [Queue::class, $entity]))->toBeFalse()
++        ->and($gate->allows('update', $queue))->toBeFalse()
++        ->and($gate->allows('manageAccess', $queue))->toBeFalse()
++        ->and($gate->allows('call', $queue))->toBeFalse();
++});
++
++it('denies a call grant that is for a different queue of the same entity', function () {
++    $entity = Entity::factory()->create();
++    $granted = Queue::factory()->for($entity)->create();
++    $other = Queue::factory()->for($entity)->create();
++    $employee = memberOf($entity, UserRole::Employee);
++    QueueAccess::factory()->create([
++        'entity_membership_id' => $employee->memberships()->firstOrFail()->id,
++        'queue_id' => $granted->id,
++    ]);
++
++    expect(Gate::forUser($employee)->allows('call', $granted))->toBeTrue()
++        ->and(Gate::forUser($employee)->allows('call', $other))->toBeFalse();
++});
++
++it('denies a grant that lists permissions without call', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $employee = memberOf($entity, UserRole::Employee);
++    QueueAccess::factory()->create([
++        'entity_membership_id' => $employee->memberships()->firstOrFail()->id,
++        'queue_id' => $queue->id,
++        'permissions' => ['view'],
++    ]);
++
++    expect(Gate::forUser($employee)->allows('call', $queue))->toBeFalse();
++});
++
++it('denies call when the stored permissions are not an array', function (string $raw) {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $employee = memberOf($entity, UserRole::Employee);
++    $access = QueueAccess::factory()->create([
++        'entity_membership_id' => $employee->memberships()->firstOrFail()->id,
++        'queue_id' => $queue->id,
++    ]);
++    DB::table('queue_access')->where('id', $access->id)->update(['permissions' => $raw]);
++
++    expect(Gate::forUser($employee)->allows('call', $queue))->toBeFalse();
++})->with([
++    'json string' => ['"call"'],
++    'not json' => ['call'],
++    'json number' => ['1'],
++]);
++
++it('denies members of another entity and outsiders every ability', function (Closure $actorFor) {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $gate = Gate::forUser($actorFor($entity));
++
++    expect($gate->allows('create', [Queue::class, $entity]))->toBeFalse()
++        ->and($gate->allows('update', $queue))->toBeFalse()
++        ->and($gate->allows('manageAccess', $queue))->toBeFalse()
++        ->and($gate->allows('call', $queue))->toBeFalse();
++})->with([
++    'admin of another entity' => [fn () => memberOf(Entity::factory()->create(), UserRole::Admin)],
++    'employee of another entity' => [fn () => memberOf(Entity::factory()->create(), UserRole::Employee)],
++    'outsider' => [fn () => User::factory()->create()],
++]);
+diff --git a/tests/Feature/Queue/SetQueueAccessTest.php b/tests/Feature/Queue/SetQueueAccessTest.php
+new file mode 100644
+index 0000000..fac3aad
+--- /dev/null
++++ b/tests/Feature/Queue/SetQueueAccessTest.php
+@@ -0,0 +1,170 @@
++<?php
++
++use App\Actions\SetQueueAccess;
++use App\Models\Entity;
++use App\Models\EntityMembership;
++use App\Models\Queue;
++use App\Models\QueueAccess;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Auth\Access\AuthorizationException;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Facades\Log;
++use Illuminate\Validation\ValidationException;
++use Psr\Log\LoggerInterface;
++
++uses(RefreshDatabase::class);
++
++/**
++ * Route the audit channel to a spy so each test can assert on the trail.
++ */
++function auditSpy(): LoggerInterface
++{
++    $audit = Mockery::spy(LoggerInterface::class);
++    Log::shouldReceive('channel')->with('audit')->andReturn($audit);
++
++    return $audit;
++}
++
++it('grants call to an employee on a queue of the same entity', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $employee = memberOf($entity, UserRole::Employee);
++    $membership = $employee->memberships()->firstOrFail();
++
++    (new SetQueueAccess)($membership, $queue, memberOf($entity, UserRole::Admin), ['call']);
++
++    $access = QueueAccess::query()
++        ->where('entity_membership_id', $membership->id)
++        ->where('queue_id', $queue->id)
++        ->firstOrFail();
++
++    expect($access->permissions)->toBe(['call']);
++});
++
++it('updates the existing grant instead of adding a second row', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $membership = memberOf($entity, UserRole::Employee)->memberships()->firstOrFail();
++    $manager = memberOf($entity, UserRole::Admin);
++
++    (new SetQueueAccess)($membership, $queue, $manager, ['call']);
++    (new SetQueueAccess)($membership, $queue, $manager, ['call']);
++
++    expect(QueueAccess::query()->where('queue_id', $queue->id)->count())->toBe(1);
++});
++
++it('stores each permission once', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $membership = memberOf($entity, UserRole::Employee)->memberships()->firstOrFail();
++
++    (new SetQueueAccess)($membership, $queue, memberOf($entity, UserRole::Admin), ['call', 'call']);
++
++    expect(QueueAccess::query()->where('queue_id', $queue->id)->firstOrFail()->permissions)->toBe(['call']);
++});
++
++it('revokes the grant when the permission list is empty', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $membership = memberOf($entity, UserRole::Employee)->memberships()->firstOrFail();
++    $manager = memberOf($entity, UserRole::Admin);
++    (new SetQueueAccess)($membership, $queue, $manager, ['call']);
++
++    (new SetQueueAccess)($membership, $queue, $manager, []);
++
++    expect(QueueAccess::query()->where('queue_id', $queue->id)->exists())->toBeFalse();
++});
++
++it('logs queue.access.granted with the actor, queue and membership', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $membership = memberOf($entity, UserRole::Employee)->memberships()->firstOrFail();
++    $manager = memberOf($entity, UserRole::Admin);
++    $audit = auditSpy();
++
++    (new SetQueueAccess)($membership, $queue, $manager, ['call']);
++
++    $audit->shouldHaveReceived('info')
++        ->with('queue.access.granted', Mockery::on(fn (array $context) => $context['actor_id'] === $manager->id
++            && $context['queue_id'] === $queue->id
++            && $context['entity_membership_id'] === $membership->id))
++        ->once();
++});
++
++it('logs queue.access.revoked when an existing grant is removed', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $membership = memberOf($entity, UserRole::Employee)->memberships()->firstOrFail();
++    $manager = memberOf($entity, UserRole::Admin);
++    (new SetQueueAccess)($membership, $queue, $manager, ['call']);
++    $audit = auditSpy();
++
++    (new SetQueueAccess)($membership, $queue, $manager, []);
++
++    $audit->shouldHaveReceived('info')
++        ->with('queue.access.revoked', Mockery::on(fn (array $context) => $context['actor_id'] === $manager->id
++            && $context['queue_id'] === $queue->id
++            && $context['entity_membership_id'] === $membership->id))
++        ->once();
++});
++
++it('does not log a revoke when there was no grant to delete', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $membership = memberOf($entity, UserRole::Employee)->memberships()->firstOrFail();
++    $audit = auditSpy();
++
++    (new SetQueueAccess)($membership, $queue, memberOf($entity, UserRole::Admin), []);
++
++    $audit->shouldNotHaveReceived('info');
++});
++
++it('rejects unknown permissions and stores nothing', function (array $permissions) {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $membership = memberOf($entity, UserRole::Employee)->memberships()->firstOrFail();
++
++    expect(fn () => (new SetQueueAccess)($membership, $queue, memberOf($entity, UserRole::Admin), $permissions))
++        ->toThrow(ValidationException::class);
++
++    expect(QueueAccess::query()->count())->toBe(0);
++})->with([
++    'unknown string' => [['delete']],
++    'known and unknown mixed' => [['call', 'manage']],
++    'wrong case' => [['CALL']],
++    'integer entry' => [[1]],
++    'null entry' => [[null]],
++    'nested list' => [[['call']]],
++    'keyed map' => [['grant' => 'call']],
++]);
++
++it('rejects a membership and a queue from different entities', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $foreign = memberOf(Entity::factory()->create(), UserRole::Employee)->memberships()->firstOrFail();
++
++    expect(fn () => (new SetQueueAccess)($foreign, $queue, memberOf($entity, UserRole::Admin), ['call']))
++        ->toThrow(ValidationException::class);
++
++    expect(QueueAccess::query()->count())->toBe(0);
++});
++
++it('refuses grants from employees (including self-grants), other-entity managers and outsiders', function (Closure $actorFor) {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create();
++    $membership = memberOf($entity, UserRole::Employee)->memberships()->firstOrFail();
++    $actor = $actorFor($entity, $membership);
++    $audit = auditSpy();
++
++    expect(fn () => (new SetQueueAccess)($membership, $queue, $actor, ['call']))
++        ->toThrow(AuthorizationException::class);
++
++    expect(QueueAccess::query()->count())->toBe(0);
++    $audit->shouldNotHaveReceived('info');
++})->with([
++    'employee granting themselves' => [fn (Entity $entity, EntityMembership $membership) => $membership->user],
++    'other employee' => [fn (Entity $entity) => memberOf($entity, UserRole::Employee)],
++    'admin of another entity' => [fn () => memberOf(Entity::factory()->create(), UserRole::Admin)],
++    'outsider' => [fn () => User::factory()->create()],
++]);
+diff --git a/tests/Feature/Queue/UpdateQueueTest.php b/tests/Feature/Queue/UpdateQueueTest.php
+new file mode 100644
+index 0000000..3a54b75
+--- /dev/null
++++ b/tests/Feature/Queue/UpdateQueueTest.php
+@@ -0,0 +1,169 @@
++<?php
++
++use App\Actions\IssueTicket;
++use App\Actions\UpdateQueue;
++use App\Exceptions\InactiveQueueException;
++use App\Models\Entity;
++use App\Models\Queue;
++use App\Models\QueueAccess;
++use App\Models\Ticket;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Auth\Access\AuthorizationException;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Validation\ValidationException;
++
++uses(RefreshDatabase::class);
++
++it('renames a queue and leaves its slug and active flag alone', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create(['name' => 'Geral', 'slug' => 'geral', 'is_active' => true]);
++
++    (new UpdateQueue)($queue, memberOf($entity, UserRole::Admin), name: '  Triagem  ');
++
++    expect($queue->fresh())
++        ->name->toBe('Triagem')
++        ->slug->toBe('geral')
++        ->is_active->toBeTrue();
++});
++
++it('changes the slug, slugifying the explicit value', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create(['slug' => 'geral']);
++
++    (new UpdateQueue)($queue, memberOf($entity, UserRole::Owner), slug: 'Caixa Rápido');
++
++    expect($queue->fresh()->slug)->toBe('caixa-rapido');
++});
++
++it('keeps its own slug when the same slug is passed again', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create(['slug' => 'geral']);
++
++    (new UpdateQueue)($queue, memberOf($entity, UserRole::Admin), slug: 'geral');
++
++    expect($queue->fresh()->slug)->toBe('geral');
++});
++
++it('rejects taking the slug of another queue in the same entity', function () {
++    $entity = Entity::factory()->create();
++    $manager = memberOf($entity, UserRole::Admin);
++    Queue::factory()->for($entity)->create(['slug' => 'geral']);
++    $queue = Queue::factory()->for($entity)->create(['slug' => 'caixa']);
++
++    expect(fn () => (new UpdateQueue)($queue, $manager, slug: 'geral'))
++        ->toThrow(ValidationException::class);
++
++    expect($queue->fresh()->slug)->toBe('caixa');
++});
++
++it('allows taking a slug used by a queue of another entity', function () {
++    $entity = Entity::factory()->create();
++    $other = Entity::factory()->create();
++    Queue::factory()->for($other)->create(['slug' => 'geral']);
++    $queue = Queue::factory()->for($entity)->create(['slug' => 'caixa']);
++
++    (new UpdateQueue)($queue, memberOf($entity, UserRole::Admin), slug: 'geral');
++
++    expect($queue->fresh()->slug)->toBe('geral');
++});
++
++it('turns a slug collision caught only by the database index into a validation error', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create(['slug' => 'caixa']);
++
++    // Another request takes the slug between validation and update.
++    Queue::updating(function () use ($entity): void {
++        DB::table('queues')->insert([
++            'entity_id' => $entity->id,
++            'name' => 'Outra',
++            'slug' => 'novo',
++            'is_active' => true,
++            'created_at' => now(),
++            'updated_at' => now(),
++        ]);
++    });
++
++    try {
++        expect(fn () => (new UpdateQueue)($queue, memberOf($entity, UserRole::Admin), slug: 'novo'))
++            ->toThrow(ValidationException::class);
++    } finally {
++        Queue::flushEventListeners();
++    }
++
++    expect($queue->fresh()->slug)->toBe('caixa');
++});
++
++it('rejects a blank name without writing', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create(['name' => 'Geral']);
++
++    expect(fn () => (new UpdateQueue)($queue, memberOf($entity, UserRole::Admin), name: ' '))
++        ->toThrow(ValidationException::class);
++
++    expect($queue->fresh()->name)->toBe('Geral');
++});
++
++it('deactivates a queue and keeps its tickets', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create(['is_active' => true]);
++    (new IssueTicket)($queue);
++    (new IssueTicket)($queue, 10);
++
++    (new UpdateQueue)($queue, memberOf($entity, UserRole::Admin), isActive: false);
++
++    expect($queue->fresh()->is_active)->toBeFalse()
++        ->and(Ticket::query()->where('queue_id', $queue->id)->count())->toBe(2);
++});
++
++it('blocks issuing into a deactivated queue until it is reactivated', function () {
++    $entity = Entity::factory()->create();
++    $manager = memberOf($entity, UserRole::Admin);
++    $queue = Queue::factory()->for($entity)->create(['is_active' => true]);
++
++    (new UpdateQueue)($queue, $manager, isActive: false);
++
++    expect(fn () => (new IssueTicket)($queue))->toThrow(InactiveQueueException::class);
++
++    (new UpdateQueue)($queue, $manager, isActive: true);
++
++    expect((new IssueTicket)($queue))->toBeInstanceOf(Ticket::class);
++});
++
++it('does nothing when no field is given', function () {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create(['name' => 'Geral', 'slug' => 'geral', 'is_active' => true]);
++
++    $updated = (new UpdateQueue)($queue, memberOf($entity, UserRole::Admin));
++
++    expect($updated->fresh())
++        ->name->toBe('Geral')
++        ->slug->toBe('geral')
++        ->is_active->toBeTrue();
++});
++
++it('refuses employees, managers of another entity and outsiders without writing', function (Closure $actorFor) {
++    $entity = Entity::factory()->create();
++    $queue = Queue::factory()->for($entity)->create(['name' => 'Geral', 'is_active' => true]);
++    $actor = $actorFor($entity, $queue);
++
++    expect(fn () => (new UpdateQueue)($queue, $actor, name: 'Hack', isActive: false))
++        ->toThrow(AuthorizationException::class);
++
++    expect($queue->fresh())
++        ->name->toBe('Geral')
++        ->is_active->toBeTrue();
++})->with([
++    'employee with a call grant' => [function (Entity $entity, Queue $queue) {
++        $employee = memberOf($entity, UserRole::Employee);
++        QueueAccess::factory()->create([
++            'entity_membership_id' => $employee->memberships()->firstOrFail()->id,
++            'queue_id' => $queue->id,
++        ]);
++
++        return $employee;
++    }],
++    'admin of another entity' => [fn () => memberOf(Entity::factory()->create(), UserRole::Admin)],
++    'outsider' => [fn () => User::factory()->create()],
++]);
+diff --git a/tests/Pest.php b/tests/Pest.php
+index 2c5012c..829da4e 100644
+--- a/tests/Pest.php
++++ b/tests/Pest.php
+@@ -1,5 +1,9 @@
+ <?php
+ 
++use App\Models\Entity;
++use App\Models\EntityMembership;
++use App\Models\User;
++use App\Models\UserRole;
+ use Illuminate\Foundation\Testing\RefreshDatabase;
+ use Tests\TestCase;
+ 
+@@ -48,3 +52,19 @@ function something()
+ {
+     // ..
+ }
++
++/**
++ * A new user holding the given role in the entity (no role is implied).
++ */
++function memberOf(Entity $entity, UserRole $role): User
++{
++    $user = User::factory()->create();
++
++    EntityMembership::factory()->create([
++        'entity_id' => $entity->id,
++        'user_id' => $user->id,
++        'role' => $role->value,
++    ]);
++
++    return $user;
++}

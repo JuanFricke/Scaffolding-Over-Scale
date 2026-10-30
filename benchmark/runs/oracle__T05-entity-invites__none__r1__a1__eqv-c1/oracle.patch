@@ -1,0 +1,1165 @@
+diff --git a/app/Livewire/Entity/Dashboard.php b/app/Livewire/Entity/Dashboard.php
+index 64a8260..5b7fe36 100644
+--- a/app/Livewire/Entity/Dashboard.php
++++ b/app/Livewire/Entity/Dashboard.php
+@@ -3,6 +3,7 @@
+ namespace App\Livewire\Entity;
+ 
+ use App\Models\Entity;
++use App\Models\UserRole;
+ use Illuminate\Contracts\View\View;
+ use Livewire\Attributes\Layout;
+ use Livewire\Component;
+@@ -22,7 +23,7 @@ public function render(): View
+         return view('livewire.entity.dashboard')
+             ->with([
+                 'isOwner' => $this->entity->ownerMembership()?->user_id === auth()->id(),
+-                'isManager' => (bool) auth()->user()?->membershipFor($this->entity->id),
++                'isManager' => in_array(auth()->user()?->membershipFor($this->entity->id)?->role, [UserRole::Owner, UserRole::Admin], true),
+             ]);
+     }
+ }
+diff --git a/app/Livewire/Entity/Members.php b/app/Livewire/Entity/Members.php
+index 9ce5a06..adf1fd7 100644
+--- a/app/Livewire/Entity/Members.php
++++ b/app/Livewire/Entity/Members.php
+@@ -2,12 +2,18 @@
+ 
+ namespace App\Livewire\Entity;
+ 
++use App\Mail\EntityInviteMail;
+ use App\Models\Entity;
++use App\Models\EntityInvite;
+ use App\Models\EntityMembership;
+ use App\Models\User;
+ use App\Models\UserRole;
+ use Illuminate\Contracts\View\View;
++use Illuminate\Database\QueryException;
+ use Illuminate\Support\Facades\Log;
++use Illuminate\Support\Facades\Mail;
++use Illuminate\Support\Facades\RateLimiter;
++use Illuminate\Support\Str;
+ use Livewire\Attributes\Layout;
+ use Livewire\Attributes\Locked;
+ use Livewire\Attributes\Validate;
+@@ -19,8 +25,29 @@ class Members extends Component
+     #[Locked]
+     public Entity $entity;
+ 
+-    #[Validate('required|email:strict|exists:users,email')]
+-    public string $email = '';
++    #[Validate('required|email:strict|max:255')]
++    public string $inviteEmail = '';
++
++    #[Validate('required|in:admin,employee')]
++    public string $inviteRole = 'employee';
++
++    /**
++     * Membership shown in the detail modal. Untrusted client state — always
++     * re-resolved scoped to the entity before use.
++     */
++    public ?int $selectedMembershipId = null;
++
++    /**
++     * Draft role edited in the detail modal. Only persisted via saveRole().
++     */
++    #[Validate('required|in:admin,employee')]
++    public string $memberRole = '';
++
++    /**
++     * Whether the remove-confirmation modal is open. Client-writable flag —
++     * every action re-resolves and authorizes server-side.
++     */
++    public bool $confirmingRemoval = false;
+ 
+     /**
+      * Roles an actor may assign here (never owner — that is ownership transfer in Settings).
+@@ -29,51 +56,138 @@ class Members extends Component
+ 
+     public function mount(Entity $entity): void
+     {
+-        $this->authorize('view', $entity);
++        $this->authorize('update', $entity);
+         $this->entity = $entity;
+     }
+ 
+-    public function addMember(): void
++    public function sendInvite(): void
+     {
+         $this->authorize('update', $this->entity);
+ 
+-        $data = $this->validate();
++        $limiterKey = 'entity-invite:'.$this->entity->id.':'.auth()->id();
++        if (RateLimiter::tooManyAttempts($limiterKey, 10)) {
++            $this->addError('inviteEmail', __('ui.members_rate_limited'));
+ 
+-        $user = User::where('email', $data['email'])->firstOrFail();
++            return;
++        }
+ 
+-        if ($this->entity->memberships()->where('user_id', $user->id)->exists()) {
+-            $this->addError('email', __('entity.member_exists'));
++        // Validate only the invite fields: the role draft (memberRole) lives
++        // in the detail modal and must not block invites while empty.
++        // Validation runs before RateLimiter::hit so typos never burn quota.
++        $this->validateOnly('inviteEmail');
++        $this->validateOnly('inviteRole');
++        $data = ['inviteEmail' => $this->inviteEmail, 'inviteRole' => $this->inviteRole];
++
++        $email = Str::lower(trim($data['inviteEmail']));
++
++        $existingUser = User::where('email', $email)->first();
++        if ($existingUser && $this->entity->memberships()->where('user_id', $existingUser->id)->exists()) {
++            $this->addError('inviteEmail', __('ui.members_exists'));
+ 
+             return;
+         }
+ 
+-        EntityMembership::create([
++        $pending = $this->entity->invites()->where('email', $email)->first();
++        if ($pending && $pending->isPending()) {
++            $this->addError('inviteEmail', __('ui.members_pending'));
++
++            return;
++        }
++        $pending?->delete();
++
++        try {
++            $invite = EntityInvite::create([
++                'entity_id' => $this->entity->id,
++                'invited_by' => auth()->id(),
++                'email' => $email,
++                'role' => $data['inviteRole'],
++                'expires_at' => now()->addDays(7),
++            ]);
++        } catch (QueryException) {
++            // Lost a check-then-create race (unique entity_id+email):
++            // report a validation error instead of a 500.
++            $this->addError('inviteEmail', __('ui.members_pending'));
++
++            return;
++        }
++
++        RateLimiter::hit($limiterKey, 3600);
++
++        Mail::to($email)->queue(new EntityInviteMail($invite));
++
++        Log::channel('audit')->info('Entity invite sent', [
+             'entity_id' => $this->entity->id,
+-            'user_id' => $user->id,
+-            'role' => UserRole::Employee->value,
++            'actor_id' => auth()->id(),
++            'invite_id' => $invite->id,
++            'role' => $invite->role->value,
+         ]);
+ 
+-        Log::channel('audit')->info('Member added', [
++        $this->reset('inviteEmail', 'inviteRole');
++        $this->inviteRole = 'employee';
++    }
++
++    public function cancelInvite($inviteId): void
++    {
++        $invite = $this->entity->invites()->findOrFail($inviteId);
++
++        $this->authorize('delete', $invite);
++
++        Log::channel('audit')->info('Entity invite cancelled', [
+             'entity_id' => $this->entity->id,
+             'actor_id' => auth()->id(),
+-            'target_user_id' => $user->id,
++            'invite_id' => $invite->id,
+         ]);
+ 
+-        $this->reset('email');
++        $invite->delete();
+     }
+ 
+-    public function assignRole($membershipId, string $role): void
++    public function openMember($membershipId): void
+     {
+         $membership = $this->entity->memberships()->findOrFail($membershipId);
+ 
++        $this->authorize('view', $membership);
++
++        $this->selectedMembershipId = $membership->id;
++        $this->memberRole = $membership->role->value;
++        $this->confirmingRemoval = false;
++        $this->resetValidation('memberRole');
++    }
++
++    public function closeMember(): void
++    {
++        $this->reset('selectedMembershipId', 'memberRole', 'confirmingRemoval');
++        $this->resetValidation('memberRole');
++    }
++
++    public function selectedMembership(): ?EntityMembership
++    {
++        if ($this->selectedMembershipId === null) {
++            return null;
++        }
++
++        return $this->entity->memberships()->with('user')->find($this->selectedMembershipId);
++    }
++
++    /**
++     * Persist the role draft for the selected membership. The draft alone
++     * never touches the database — an explicit save click is required.
++     */
++    public function saveRole(): void
++    {
++        $membership = $this->entity->memberships()->findOrFail($this->selectedMembershipId ?? 0);
++
+         $this->authorize('assignRole', $membership);
+ 
+         // The owner membership is immutable here — that path is ownership transfer in Settings.
+         abort_if($membership->role === UserRole::Owner, 403);
+ 
+-        // The owner role is never assignable here — that path is ownership transfer in Settings.
++        $this->validateOnly('memberRole');
++
++        $role = $this->memberRole;
++
++        // Defense in depth: the owner role is never assignable here.
+         if (! in_array($role, self::ASSIGNABLE_ROLES, true)) {
+-            $this->addError('role', __('validation.in'));
++            $this->addError('memberRole', __('validation.in'));
+ 
+             return;
+         }
+@@ -97,6 +211,20 @@ public function assignRole($membershipId, string $role): void
+         ]);
+     }
+ 
++    public function confirmRemoval(): void
++    {
++        $membership = $this->entity->memberships()->findOrFail($this->selectedMembershipId ?? 0);
++
++        $this->authorize('delete', $membership);
++
++        $this->confirmingRemoval = true;
++    }
++
++    public function cancelRemoval(): void
++    {
++        $this->confirmingRemoval = false;
++    }
++
+     public function removeMember($membershipId): void
+     {
+         $membership = $this->entity->memberships()->findOrFail($membershipId);
+@@ -114,6 +242,9 @@ public function removeMember($membershipId): void
+ 
+         $membership->delete();
+ 
++        $this->reset('selectedMembershipId', 'memberRole', 'confirmingRemoval');
++        $this->resetValidation('memberRole');
++
+         Log::channel('audit')->info('Member removed', [
+             'entity_id' => $this->entity->id,
+             'actor_id' => auth()->id(),
+@@ -124,7 +255,9 @@ public function removeMember($membershipId): void
+     public function render(): View
+     {
+         return view('livewire.entity.members', [
+-            'memberships' => $this->entity->memberships()->latest('id')->get(),
++            'memberships' => $this->entity->memberships()->with('user')->latest('id')->get(),
++            'pendingInvites' => $this->entity->invites()->latest('id')->get(),
++            'selected' => $this->selectedMembership(),
+         ]);
+     }
+ }
+diff --git a/app/Livewire/Entity/PendingInvites.php b/app/Livewire/Entity/PendingInvites.php
+new file mode 100644
+index 0000000..73f8ead
+--- /dev/null
++++ b/app/Livewire/Entity/PendingInvites.php
+@@ -0,0 +1,86 @@
++<?php
++
++namespace App\Livewire\Entity;
++
++use App\Models\EntityInvite;
++use App\Models\EntityMembership;
++use Illuminate\Contracts\View\View;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Log;
++use Illuminate\Support\Str;
++use Livewire\Attributes\Layout;
++use Livewire\Component;
++
++#[Layout('layouts::default-page')]
++class PendingInvites extends Component
++{
++    public bool $embedded = false;
++
++    public function accept($inviteId): void
++    {
++        $invite = EntityInvite::findOrFail($inviteId);
++
++        $this->authorize('accept', $invite);
++
++        if ($invite->accepted_at !== null) {
++            return;
++        }
++
++        if ($invite->isExpired()) {
++            $this->addError('invite', __('ui.invites_expired'));
++
++            return;
++        }
++
++        DB::transaction(function () use ($invite) {
++            EntityMembership::firstOrCreate(
++                ['entity_id' => $invite->entity_id, 'user_id' => auth()->id()],
++                ['role' => $invite->role->value]
++            );
++
++            $invite->update(['accepted_at' => now()]);
++        });
++
++        Log::channel('audit')->info('Entity invite accepted', [
++            'entity_id' => $invite->entity_id,
++            'actor_id' => auth()->id(),
++            'invite_id' => $invite->id,
++        ]);
++
++        session(['current_entity_id' => $invite->entity_id]);
++
++        $this->redirect(route('entity.dashboard', $invite->entity->slug));
++    }
++
++    public function decline($inviteId): void
++    {
++        $invite = EntityInvite::findOrFail($inviteId);
++
++        $this->authorize('decline', $invite);
++
++        Log::channel('audit')->info('Entity invite declined', [
++            'entity_id' => $invite->entity_id,
++            'actor_id' => auth()->id(),
++            'invite_id' => $invite->id,
++        ]);
++
++        $invite->delete();
++    }
++
++    public function render(): View
++    {
++        $email = auth()->user()->email ?? null;
++        $email = $email ? Str::lower(trim($email)) : null;
++
++        return view('livewire.entity.pending-invites', [
++            'invites' => $email
++                ? EntityInvite::with('entity')
++                    ->where('email', $email)
++                    ->whereNull('accepted_at')
++                    ->where('expires_at', '>', now())
++                    ->latest('id')
++                    ->get()
++                : collect(),
++        ]);
++    }
++}
+diff --git a/app/Mail/EntityInviteMail.php b/app/Mail/EntityInviteMail.php
+new file mode 100644
+index 0000000..c2641ac
+--- /dev/null
++++ b/app/Mail/EntityInviteMail.php
+@@ -0,0 +1,44 @@
++<?php
++
++namespace App\Mail;
++
++use App\Models\EntityInvite;
++use Illuminate\Bus\Queueable;
++use Illuminate\Contracts\Queue\ShouldQueue;
++use Illuminate\Mail\Mailable;
++use Illuminate\Mail\Mailables\Content;
++use Illuminate\Mail\Mailables\Envelope;
++use Illuminate\Queue\SerializesModels;
++
++class EntityInviteMail extends Mailable implements ShouldQueue
++{
++    use Queueable, SerializesModels;
++
++    public function __construct(public EntityInvite $invite)
++    {
++        //
++    }
++
++    public function envelope(): Envelope
++    {
++        return new Envelope(
++            subject: __('You are invited to :entity', ['entity' => $this->invite->entity->name]),
++        );
++    }
++
++    public function content(): Content
++    {
++        return new Content(
++            markdown: 'emails.entity-invite',
++            with: [
++                'invite' => $this->invite,
++                'loginUrl' => route('login'),
++            ],
++        );
++    }
++
++    public function attachments(): array
++    {
++        return [];
++    }
++}
+diff --git a/app/Models/Entity.php b/app/Models/Entity.php
+index 803b07f..5889a80 100644
+--- a/app/Models/Entity.php
++++ b/app/Models/Entity.php
+@@ -38,6 +38,11 @@ public function memberships(): HasMany
+         return $this->hasMany(EntityMembership::class);
+     }
+ 
++    public function invites(): HasMany
++    {
++        return $this->hasMany(EntityInvite::class);
++    }
++
+     /**
+      * Every user that belongs to this entity (pivot = entity_memberships).
+      */
+diff --git a/app/Models/EntityInvite.php b/app/Models/EntityInvite.php
+new file mode 100644
+index 0000000..3be62e2
+--- /dev/null
++++ b/app/Models/EntityInvite.php
+@@ -0,0 +1,58 @@
++<?php
++
++namespace App\Models;
++
++use Illuminate\Database\Eloquent\Factories\HasFactory;
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++use Illuminate\Support\Str;
++
++class EntityInvite extends Model
++{
++    use HasFactory;
++
++    protected $fillable = [
++        'entity_id',
++        'invited_by',
++        'email',
++        'role',
++        'expires_at',
++        'accepted_at',
++    ];
++
++    protected function casts(): array
++    {
++        return [
++            'role' => UserRole::class,
++            'expires_at' => 'datetime',
++            'accepted_at' => 'datetime',
++        ];
++    }
++
++    protected static function booted(): void
++    {
++        // Single normalization point: every write path agrees on lowercase
++        // trimmed email so lookups and the unique index never diverge.
++        static::saving(fn (self $invite) => $invite->email = Str::lower(trim($invite->email)));
++    }
++
++    public function entity(): BelongsTo
++    {
++        return $this->belongsTo(Entity::class);
++    }
++
++    public function inviter(): BelongsTo
++    {
++        return $this->belongsTo(User::class, 'invited_by');
++    }
++
++    public function isExpired(): bool
++    {
++        return $this->expires_at->isPast();
++    }
++
++    public function isPending(): bool
++    {
++        return $this->accepted_at === null && ! $this->isExpired();
++    }
++}
+diff --git a/app/Policies/EntityInvitePolicy.php b/app/Policies/EntityInvitePolicy.php
+new file mode 100644
+index 0000000..fa5bbad
+--- /dev/null
++++ b/app/Policies/EntityInvitePolicy.php
+@@ -0,0 +1,45 @@
++<?php
++
++namespace App\Policies;
++
++use App\Models\EntityInvite;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Support\Str;
++
++class EntityInvitePolicy
++{
++    /**
++     * Only managers (owner/admin) of the entity may invite or cancel.
++     */
++    public function invite(User $user, EntityInvite $invite): bool
++    {
++        return $this->isManagerOf($user, $invite->entity_id);
++    }
++
++    public function delete(User $user, EntityInvite $invite): bool
++    {
++        return $this->isManagerOf($user, $invite->entity_id);
++    }
++
++    /**
++     * Only the user whose email matches (case-insensitive) may accept/decline.
++     */
++    public function accept(User $user, EntityInvite $invite): bool
++    {
++        return Str::lower(trim($user->email)) === Str::lower(trim($invite->email));
++    }
++
++    public function decline(User $user, EntityInvite $invite): bool
++    {
++        return $this->accept($user, $invite);
++    }
++
++    protected function isManagerOf(User $user, int $entityId): bool
++    {
++        $membership = $user->membershipFor($entityId);
++
++        return $membership
++            && in_array($membership->role, [UserRole::Owner, UserRole::Admin], true);
++    }
++}
+diff --git a/database/factories/EntityInviteFactory.php b/database/factories/EntityInviteFactory.php
+new file mode 100644
+index 0000000..2eda8e7
+--- /dev/null
++++ b/database/factories/EntityInviteFactory.php
+@@ -0,0 +1,34 @@
++<?php
++
++namespace Database\Factories;
++
++use App\Models\Entity;
++use App\Models\EntityInvite;
++use App\Models\User;
++use App\Models\UserRole;
++use Illuminate\Database\Eloquent\Factories\Factory;
++
++/**
++ * @extends Factory<EntityInvite>
++ */
++class EntityInviteFactory extends Factory
++{
++    public function definition(): array
++    {
++        return [
++            'entity_id' => Entity::factory(),
++            'invited_by' => User::factory(),
++            'email' => fake()->unique()->safeEmail(),
++            'role' => UserRole::Employee->value,
++            'expires_at' => now()->addDays(7),
++            'accepted_at' => null,
++        ];
++    }
++
++    public function expired(): static
++    {
++        return $this->state(fn (array $attributes) => [
++            'expires_at' => now()->subDay(),
++        ]);
++    }
++}
+diff --git a/database/migrations/2026_09_06_184838_create_entity_invites_table.php b/database/migrations/2026_09_06_184838_create_entity_invites_table.php
+new file mode 100644
+index 0000000..9409ed1
+--- /dev/null
++++ b/database/migrations/2026_09_06_184838_create_entity_invites_table.php
+@@ -0,0 +1,35 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    /**
++     * Run the migrations.
++     */
++    public function up(): void
++    {
++        Schema::create('entity_invites', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('entity_id')->constrained()->cascadeOnDelete();
++            $table->foreignId('invited_by')->nullable()->constrained('users')->nullOnDelete();
++            $table->string('email');
++            $table->string('role')->default('employee');
++            $table->timestamp('expires_at');
++            $table->timestamp('accepted_at')->nullable();
++            $table->timestamps();
++
++            $table->unique(['entity_id', 'email'], 'entity_invites_entity_email_unique');
++        });
++    }
++
++    /**
++     * Reverse the migrations.
++     */
++    public function down(): void
++    {
++        Schema::dropIfExists('entity_invites');
++    }
++};
+diff --git a/lang/en/ui.php b/lang/en/ui.php
+index ad42c29..1b12e99 100644
+--- a/lang/en/ui.php
++++ b/lang/en/ui.php
+@@ -60,6 +60,15 @@
+     'onboarding_submit' => 'Create',
+     'create_first_entity' => 'Create your first entity',
+ 
++    'invites_title' => 'Pending invites',
++    'invites_accept' => 'Accept',
++    'invites_decline' => 'Decline',
++    'invites_role' => 'Role: :role',
++    'invites_expired' => 'Invite expired.',
++    'role_owner' => 'Owner',
++    'role_admin' => 'Admin',
++    'role_employee' => 'Employee',
++
+     'dashboard_owner_notice' => 'You are the owner of this entity.',
+     'dashboard_admin_notice' => 'You are an administrator of this entity.',
+ 
+@@ -74,4 +83,26 @@
+     'settings_transfer' => 'Transfer',
+     'settings_confirm_delete' => 'Confirm deletion?',
+     'settings_delete' => 'Soft-delete entity',
++
++    'members_title' => 'Members of :entity',
++    'members_invite_title' => 'Invite member',
++    'members_email_placeholder' => 'user@example.com',
++    'members_role' => 'Role',
++    'members_send' => 'Send invite',
++    'members_expires' => 'Expires :date',
++    'members_cancel_confirm' => 'Cancel this invite?',
++    'members_cancel' => 'Cancel',
++    'members_no_pending' => 'No pending invites.',
++    'members_list_title' => 'Members',
++    'members_empty' => 'No members yet.',
++    'members_details' => 'Member details',
++    'members_close' => 'Close',
++    'members_since' => 'Member since :date',
++    'members_save' => 'Save',
++    'members_remove_title' => 'Remove member',
++    'members_remove_message' => 'Remove :name from this entity? This cannot be undone.',
++    'members_remove' => 'Remove member',
++    'members_rate_limited' => 'Too many invites. Try again later.',
++    'members_exists' => 'This user is already a member.',
++    'members_pending' => 'Invite already pending.',
+ ];
+diff --git a/lang/pt_BR.json b/lang/pt_BR.json
+index c421564..b66bce1 100644
+--- a/lang/pt_BR.json
++++ b/lang/pt_BR.json
+@@ -15,6 +15,7 @@
+     "A new verification link has been sent to the email address you provided in your profile settings.": "Um novo link de verificação foi enviado para o endereço de e-mail fornecido nas configurações do seu perfil.",
+     "A new verification link has been sent to your email address.": "Um novo link de verificação foi enviado para seu endereço de e-mail.",
+     "Accept Invitation": "Aceitar convite",
++    "Access the link below to sign in and accept your invite:": "Acesse o link abaixo para entrar e aceitar seu convite:",
+     "Action": "Ação",
+     "Action Event": "Evento de ação",
+     "Action Events": "Eventos de ação",
+@@ -621,6 +622,8 @@
+     "Show Recovery Codes": "Mostrar Códigos de Recuperação",
+     "Showing": "Mostrando",
+     "Sierra Leone": "Serra Leoa",
++    "Sign in to PegaFila": "Entrar no PegaFila",
++    "Sign in with this email to accept the invite from your entities page.": "Entre com este e-mail para aceitar o convite na sua página de entidades.",
+     "Signed in as": "Logado como",
+     "Singapore": "Singapura",
+     "Sint Maarten (Dutch part)": "Ilha de São Martinho (Parte holandesa)",
+@@ -670,6 +673,7 @@
+     "Team Members": "Membros do Time",
+     "Team Name": "Nome do Time",
+     "Team Owner": "Dono do Time",
++    "Team PegaFila": "Time PegaFila",
+     "Team Settings": "Configurações do Time",
+     "Terms of Service": "Termos de Serviço",
+     "Thailand": "Tailândia",
+@@ -732,6 +736,7 @@
+     "This coupon code can only be used by new customers.": "Este código de cupom só pode ser usado por novos clientes.",
+     "This device": "Este dispositivo",
+     "This file field is read-only.": "Este campo de arquivo é apenas para leitura.",
++    "This invite expires on :date.": "Este convite expira em :date.",
+     "This invoice is no longer open.": "Essa fatura não está mais aberta.",
+     "This is a secure area of the application. Please confirm your password before continuing.": "Esta é uma área segura da aplicação. Por favor, confirme a sua senha antes de continuar.",
+     "This password does not match our records.": "Esta senha não corresponde aos nossos registros.",
+@@ -829,6 +834,8 @@
+     "You are already subscribed.": "Você já esta inscrito.",
+     "You are currently within your free trial period. Your trial will expire on :date.": "Você atualmente está no período de teste. Seu teste irá expirar em :date.",
+     "You are currently within your free trial period. Your trial will expire on :date. Starting a new subscription will end your trial.": "Você atualmente está no período de teste. Seu teste irá expirar em :date. Iniciar uma nova assinatura encerrará sua avaliação.",
++    "You are invited to :entity": "Você foi convidado para :entity",
++    "You are invited to join :entity as :role.": "Você foi convidado para participar de :entity como :role.",
+     "You are logged in!": "Você está logado!",
+     "You are receiving this email because we received a password reset request for your account.": "Você recebeu esse e-mail porque foi solicitado uma redefinição de senha na sua conta.",
+     "You have been invited to join the :team team!": "Foi convidado para se juntar ao time :team!",
+diff --git a/lang/pt_BR/ui.php b/lang/pt_BR/ui.php
+index 2f5f729..e4d3cac 100644
+--- a/lang/pt_BR/ui.php
++++ b/lang/pt_BR/ui.php
+@@ -60,6 +60,15 @@
+     'onboarding_submit' => 'Criar',
+     'create_first_entity' => 'Crie sua primeira entidade',
+ 
++    'invites_title' => 'Convites pendentes',
++    'invites_accept' => 'Aceitar',
++    'invites_decline' => 'Recusar',
++    'invites_role' => 'Papel: :role',
++    'invites_expired' => 'Convite expirado.',
++    'role_owner' => 'Proprietário',
++    'role_admin' => 'Administrador',
++    'role_employee' => 'Funcionário',
++
+     'dashboard_owner_notice' => 'Você é o proprietário desta entidade.',
+     'dashboard_admin_notice' => 'Você é administrador desta entidade.',
+ 
+@@ -74,4 +83,26 @@
+     'settings_transfer' => 'Transferir',
+     'settings_confirm_delete' => 'Confirmar exclusão?',
+     'settings_delete' => 'Excluir entidade',
++
++    'members_title' => 'Membros de :entity',
++    'members_invite_title' => 'Convidar membro',
++    'members_email_placeholder' => 'usuario@example.com',
++    'members_role' => 'Papel',
++    'members_send' => 'Enviar convite',
++    'members_expires' => 'Expira em :date',
++    'members_cancel_confirm' => 'Cancelar este convite?',
++    'members_cancel' => 'Cancelar',
++    'members_no_pending' => 'Nenhum convite pendente.',
++    'members_list_title' => 'Membros',
++    'members_empty' => 'Nenhum membro ainda.',
++    'members_details' => 'Detalhes do membro',
++    'members_close' => 'Fechar',
++    'members_since' => 'Membro desde :date',
++    'members_save' => 'Salvar',
++    'members_remove_title' => 'Remover membro',
++    'members_remove_message' => 'Remover :name desta entidade? Isso não pode ser desfeito.',
++    'members_remove' => 'Remover membro',
++    'members_rate_limited' => 'Muitos convites. Tente novamente mais tarde.',
++    'members_exists' => 'Este usuário já é membro.',
++    'members_pending' => 'Convite já pendente.',
+ ];
+diff --git a/resources/views/emails/entity-invite.blade.php b/resources/views/emails/entity-invite.blade.php
+new file mode 100644
+index 0000000..1cdef02
+--- /dev/null
++++ b/resources/views/emails/entity-invite.blade.php
+@@ -0,0 +1,22 @@
++<x-mail::message>
++# {{ __('Hello!') }}
++
++{{ __('You are invited to join :entity as :role.', ['entity' => $invite->entity->name, 'role' => __('ui.role_'.$invite->role->value)]) }}
++
++{{ __('Sign in with this email to accept the invite from your entities page.') }}
++
++{{ __('Access the link below to sign in and accept your invite:') }}
++
++<x-mail::button :url="$loginUrl">
++{{ __('Sign in to PegaFila') }}
++</x-mail::button>
++
++{{ __('This invite expires on :date.', ['date' => $invite->expires_at->toDateString()]) }}
++
++{{ __('Regards,') }}<br>
++{{ __('Team PegaFila') }}
++
++<x-slot:subcopy>
++{{ __("If you're having trouble clicking the \":actionText\" button, copy and paste the URL below\ninto your web browser:", ['actionText' => __('Sign in to PegaFila')]) }} <span class="break-all">[{{ $loginUrl }}]({{ $loginUrl }})</span>
++</x-slot:subcopy>
++</x-mail::message>
+diff --git a/resources/views/entity/switcher.blade.php b/resources/views/entity/switcher.blade.php
+index b7bbee1..42796d5 100644
+--- a/resources/views/entity/switcher.blade.php
++++ b/resources/views/entity/switcher.blade.php
+@@ -1,10 +1,12 @@
+ <x-layouts::default-page :title="__('ui.switch_entity')">
+     <div class="columns is-centered">
+-        <div class="column is-4">
++        <div class="column is-12-mobile is-6-tablet is-4-desktop">
+             <div class="box">
+                 <p class="title is-5">{{ __('ui.switch_entity') }}</p>
+                 <x-entity-switcher />
+             </div>
++
++            <livewire:entity.pending-invites />
+         </div>
+     </div>
+ </x-layouts::default-page>
+diff --git a/resources/views/layouts/default-page.blade.php b/resources/views/layouts/default-page.blade.php
+index d6826d3..b3dd4d9 100644
+--- a/resources/views/layouts/default-page.blade.php
++++ b/resources/views/layouts/default-page.blade.php
+@@ -41,6 +41,8 @@
+                         @can('view', $currentEntity)
+                             <a class="navbar-item"
+                                href="{{ route('entity.dashboard', ['entity' => $currentEntity->slug]) }}">{{ __('ui.nav_dashboard') }}</a>
++                        @endcan
++                        @can('update', $currentEntity)
+                             <a class="navbar-item"
+                                href="{{ route('entity.members', ['entity' => $currentEntity->slug]) }}">{{ __('ui.nav_members') }}</a>
+                         @endcan
+diff --git a/resources/views/livewire/entity/create-entity.blade.php b/resources/views/livewire/entity/create-entity.blade.php
+index d0feff5..6d853fa 100644
+--- a/resources/views/livewire/entity/create-entity.blade.php
++++ b/resources/views/livewire/entity/create-entity.blade.php
+@@ -3,15 +3,18 @@
+ </x-slot>
+ 
+ <div>
+-    <p class="title is-5">{{ __('ui.onboarding_heading') }}</p>
++    <section aria-label="{{ __('ui.onboarding_heading') }}">
++        <p class="title is-5">{{ __('ui.onboarding_heading') }}</p>
+ 
+-    <form wire:submit.prevent="submit">
+-        <div class="field">
+-            <x-label for="name">{{ __('ui.name') }}</x-label>
+-            <x-input id="name" type="text" wire:model="name" required />
+-            @error('name') <p class="help is-danger">{{ $message }}</p> @enderror
+-        </div>
++        <form wire:submit.prevent="submit">
++            <div class="field">
++                <x-label for="name">{{ __('ui.name') }}</x-label>
++                <x-input id="name" name="name" type="text" wire:model="name" required />
++            </div>
+ 
+-        <button type="submit" class="button is-primary is-fullwidth">{{ __('ui.onboarding_submit') }}</button>
+-    </form>
++            <button type="submit" class="button is-primary is-fullwidth">{{ __('ui.onboarding_submit') }}</button>
++        </form>
++    </section>
++
++    <livewire:entity.pending-invites :embedded="true" />
+ </div>
+diff --git a/resources/views/livewire/entity/dashboard.blade.php b/resources/views/livewire/entity/dashboard.blade.php
+index dc622a7..7159422 100644
+--- a/resources/views/livewire/entity/dashboard.blade.php
++++ b/resources/views/livewire/entity/dashboard.blade.php
+@@ -18,10 +18,6 @@
+                     @if (Route::has('entity.members'))
+                         <a class="button is-link" href="{{ route('entity.members', $entity->slug) }}">{{ __('ui.nav_members') }}</a>
+                     @endif
+-                @else
+-                    @if (Route::has('entity.members'))
+-                        <a class="button is-link" href="{{ route('entity.members', $entity->slug) }}">{{ __('ui.nav_members') }}</a>
+-                    @endif
+                 @endif
+             </nav>
+ 
+diff --git a/resources/views/livewire/entity/members.blade.php b/resources/views/livewire/entity/members.blade.php
+index bb3ca45..b980a81 100644
+--- a/resources/views/livewire/entity/members.blade.php
++++ b/resources/views/livewire/entity/members.blade.php
+@@ -1,63 +1,152 @@
+ <x-slot name="title">
+-    {{ __('Members of :entity', ['entity' => $entity->name]) }}
++    {{ __('ui.members_title', ['entity' => $entity->name]) }}
+ </x-slot>
+ 
+-<div class="card">
+-    <div class="card-content">
+-        <div class="level mb-4">
+-            <div class="level-left">
+-                <p class="title is-5 mb-0">{{ __('Members') }}</p>
++<div>
++{{-- Box 1: invite --}}
++@can('update', $entity)
++    <section class="box mb-4" aria-label="{{ __('ui.members_invite_title') }}">
++        <p class="title is-6 mb-3">{{ __('ui.members_invite_title') }}</p>
++        <form wire:submit.prevent="sendInvite">
++            <div class="columns is-multiline is-mobile mb-0">
++                <div class="column is-12-mobile is-6-tablet">
++                    <x-label for="inviteEmail">{{ __('ui.email') }}</x-label>
++                    <x-input type="email" id="inviteEmail" name="inviteEmail" placeholder="{{ __('ui.members_email_placeholder') }}" wire:model="inviteEmail" required />
++                </div>
++                <div class="column is-12-mobile is-3-tablet">
++                    <x-label for="inviteRole">{{ __('ui.members_role') }}</x-label>
++                    <div class="select is-fullwidth">
++                        <select id="inviteRole" wire:model="inviteRole">
++                            <option value="employee">{{ __('ui.role_employee') }}</option>
++                            <option value="admin">{{ __('ui.role_admin') }}</option>
++                        </select>
++                    </div>
++                    @error('inviteRole') <p class="help is-danger">{{ $message }}</p> @enderror
++                </div>
+             </div>
+-        </div>
++            <div class="is-flex is-justify-content-flex-end mt-3">
++                <button type="submit" class="button is-primary is-fullwidth-mobile">{{ __('ui.members_send') }}</button>
++            </div>
++        </form>
++    </section>
++@endcan
+ 
+-        @can('update', $entity)
+-            <form wire:submit.prevent="addMember" class="mb-4">
+-                <div class="field has-addons">
+-                    <div class="control is-expanded">
+-                        <x-input type="email" name="email" placeholder="{{ __('user@example.com') }}" wire:model="email" />
+-                        @error('email') <p class="help is-danger">{{ $message }}</p> @enderror
+-                    </div>
+-                    <div class="control">
+-                        <button type="submit" class="button is-primary">{{ __('Add') }}</button>
++{{-- Box 2: pending invites --}}
++@can('update', $entity)
++    <section class="box mb-4" aria-label="{{ __('ui.invites_title') }}">
++        <p class="title is-6 mb-3">{{ __('ui.invites_title') }}</p>
++        @forelse ($pendingInvites as $invite)
++            <div class="button is-fullwidth p-3 mb-2" style="height: auto; cursor: default; white-space: normal;">
++                <span class="is-flex is-flex-wrap-wrap is-justify-content-space-between is-align-items-center is-flex-grow-1" style="gap: .5rem;">
++                    <span class="has-text-left is-flex-grow-1" style="min-width: 10rem; overflow-wrap: anywhere;">
++                        <span class="is-block has-text-weight-semibold">{{ $invite->email }}</span>
++                        <span class="is-block is-size-7 has-text-grey">{{ __('ui.invites_role', ['role' => __('ui.role_'.$invite->role->value)]) }} · {{ __('ui.members_expires', ['date' => $invite->expires_at->toDateString()]) }}</span>
++                    </span>
++                    <button type="button" class="button is-small is-danger is-light is-fullwidth-mobile"
++                            wire:click="cancelInvite({{ $invite->id }})"
++                            wire:confirm="{{ __('ui.members_cancel_confirm') }}">{{ __('ui.members_cancel') }}</button>
++                </span>
++            </div>
++        @empty
++            <p class="has-text-grey">{{ __('ui.members_no_pending') }}</p>
++        @endforelse
++    </section>
++@endcan
++
++{{-- Box 3: members list --}}
++<section class="box" aria-label="{{ __('ui.members_list_title') }}">
++    <p class="title is-6 mb-3">{{ __('ui.members_list_title') }}</p>
++    @forelse ($memberships as $membership)
++        <button type="button" wire:click="openMember({{ $membership->id }})"
++                class="button is-fullwidth p-3 mb-2" style="height: auto;">
++            <span class="is-flex is-justify-content-space-between is-align-items-center is-flex-grow-1" style="gap: .5rem;">
++                <span class="has-text-left">
++                    <span class="is-block has-text-weight-semibold">{{ $membership->user->name }}</span>
++                    <span class="is-block is-size-7 has-text-grey">{{ $membership->user->email }}</span>
++                </span>
++                @if ($membership->role === \App\Models\UserRole::Owner)
++                    <span class="tag is-warning" title="{{ __('ui.role_owner') }}" aria-label="{{ __('ui.role_owner') }}"><i class="fa fa-crown"></i></span>
++                @elseif ($membership->role === \App\Models\UserRole::Admin)
++                    <span class="tag is-info" title="{{ __('ui.role_admin') }}" aria-label="{{ __('ui.role_admin') }}"><i class="fa fa-shield-halved"></i></span>
++                @else
++                    <span class="tag is-light" title="{{ __('ui.role_employee') }}" aria-label="{{ __('ui.role_employee') }}"><i class="fa fa-user"></i></span>
++                @endif
++            </span>
++        </button>
++    @empty
++        <p class="has-text-grey">{{ __('ui.members_empty') }}</p>
++    @endforelse
++</section>
++
++{{-- Member detail modal --}}
++<div class="modal @if ($selected) is-active @endif" role="dialog" aria-modal="true" aria-label="{{ __('ui.members_details') }}">
++    <div class="modal-background" wire:click="closeMember"></div>
++    @if ($selected)
++        <div class="modal-card mx-3">
++            <header class="modal-card-head">
++                <p class="modal-card-title">{{ __('ui.members_details') }}</p>
++                <button type="button" class="delete" aria-label="{{ __('ui.members_close') }}" wire:click="closeMember"></button>
++            </header>
++            <section class="modal-card-body">
++                <p class="title is-6 mb-1">{{ $selected->user->name }}</p>
++                <p class="has-text-grey mb-1">{{ $selected->user->email }}</p>
++                <p class="mb-4">
++                    @if ($selected->role === \App\Models\UserRole::Owner)
++                        <span class="tag is-warning"><i class="fa fa-crown mr-1"></i>{{ __('ui.role_owner') }}</span>
++                    @elseif ($selected->role === \App\Models\UserRole::Admin)
++                        <span class="tag is-info"><i class="fa fa-shield-halved mr-1"></i>{{ __('ui.role_admin') }}</span>
++                    @else
++                        <span class="tag is-light"><i class="fa fa-user mr-1"></i>{{ __('ui.role_employee') }}</span>
++                    @endif
++                    <span class="is-size-7 has-text-grey ml-2">{{ __('ui.members_since', ['date' => $selected->created_at->toDateString()]) }}</span>
++                </p>
++                @can('assignRole', $selected)
++                    <div class="field">
++                        <x-label for="memberRole">{{ __('ui.members_role') }}</x-label>
++                        <div class="select is-fullwidth">
++                            <select id="memberRole" wire:model="memberRole">
++                                <option value="admin">{{ __('ui.role_admin') }}</option>
++                                <option value="employee">{{ __('ui.role_employee') }}</option>
++                            </select>
++                        </div>
+                     </div>
+-                </div>
+-            </form>
+-        @endcan
++                    @error('memberRole') <p class="help is-danger">{{ $message }}</p> @enderror
++                @endcan
++            </section>
++            <footer class="modal-card-foot is-flex is-flex-wrap-wrap" style="gap: .5rem;">
++                @can('assignRole', $selected)
++                    <button type="button" class="button is-primary" style="flex: 1 1 12rem;"
++                            wire:click="saveRole">{{ __('ui.members_save') }}</button>
++                @endcan
++                @can('delete', $selected)
++                    <button type="button" class="button is-danger is-light" style="flex: 1 1 12rem;"
++                            wire:click="confirmRemoval">{{ __('ui.members_remove') }}</button>
++                @endcan
++            </footer>
++        </div>
++    @endif
++</div>
+ 
+-        <table class="table is-striped is-fullwidth">
+-            <thead>
+-                <tr>
+-                    <th>{{ __('Name') }}</th>
+-                    <th>{{ __('E-mail') }}</th>
+-                    <th>{{ __('Role') }}</th>
+-                    <th></th>
+-                </tr>
+-            </thead>
+-            <tbody>
+-                @forelse ($memberships as $membership)
+-                    <tr>
+-                        <td>{{ $membership->user->name }}</td>
+-                        <td>{{ $membership->user->email }}</td>
+-                        <td>{{ $membership->role->name }}</td>
+-                        <td>
+-                            @can('assignRole', $membership)
+-                                <div class="select is-small"><select wire:change="assignRole({{ $membership->id }}, $event.target.value)">
+-                                    <option value="">{{ __('Change') }}</option>
+-                                    <option value="admin">{{ __('Admin') }}</option>
+-                                    <option value="employee">{{ __('Employee') }}</option>
+-                                </select></div>
+-                            @endcan
+-                            @can('delete', $membership)
+-                                <button type="button" class="button is-small is-light is-danger"
+-                                        wire:click="removeMember({{ $membership->id }})"
+-                                        wire:confirm="{{ __('Confirm removal?') }}">{{ __('Remove') }}</button>
+-                            @endcan
+-                        </td>
+-                    </tr>
+-                @empty
+-                    <tr><td colspan="4">{{ __('No members yet.') }}</td></tr>
+-                @endforelse
+-            </tbody>
+-        </table>
+-    </div>
++{{-- Remove confirmation modal --}}
++<div class="modal @if ($selected && $confirmingRemoval) is-active @endif" role="dialog" aria-modal="true" aria-label="{{ __('ui.members_remove_title') }}">
++    <div class="modal-background" wire:click="cancelRemoval"></div>
++    @if ($selected && $confirmingRemoval)
++        <div class="modal-card mx-3">
++            <header class="modal-card-head">
++                <p class="modal-card-title">{{ __('ui.members_remove_title') }}</p>
++                <button type="button" class="delete" aria-label="{{ __('ui.members_close') }}" wire:click="cancelRemoval"></button>
++            </header>
++            <section class="modal-card-body">
++                <p>{{ __('ui.members_remove_message', ['name' => $selected->user->name]) }}</p>
++            </section>
++            <footer class="modal-card-foot">
++                <div class="buttons is-justify-content-flex-end" style="width: 100%;">
++                    <button type="button" class="button" wire:click="cancelRemoval">{{ __('ui.members_cancel') }}</button>
++                    <button type="button" class="button is-danger"
++                            wire:click="removeMember({{ $selected->id }})">{{ __('ui.members_remove') }}</button>
++                </div>
++            </footer>
++        </div>
++    @endif
++</div>
+ </div>
+diff --git a/resources/views/livewire/entity/pending-invites.blade.php b/resources/views/livewire/entity/pending-invites.blade.php
+new file mode 100644
+index 0000000..fc3f126
+--- /dev/null
++++ b/resources/views/livewire/entity/pending-invites.blade.php
+@@ -0,0 +1,54 @@
++<div>
++    @if ($invites->isNotEmpty())
++        @if ($embedded)
++            <hr>
++            <section aria-label="{{ __('ui.invites_title') }}">
++                <p class="title is-6 mb-3">{{ __('ui.invites_title') }}</p>
++
++                <div class="is-flex is-flex-direction-column" style="gap: .75rem;">
++                    @foreach ($invites as $invite)
++                        <article class="p-3" style="border: 1px solid var(--bulma-border, #dbdbdb); border-radius: var(--bulma-radius, 6px);">
++                            <div class="is-flex is-flex-wrap-wrap is-justify-content-space-between is-align-items-center" style="gap: .75rem;">
++                                <div class="is-flex-grow-1" style="min-width: 12rem;">
++                                    <p class="has-text-weight-semibold">{{ $invite->entity->name }}</p>
++                                    <p class="is-size-7 has-text-grey">{{ __('ui.invites_role', ['role' => __('ui.role_'.$invite->role->value)]) }}</p>
++                                </div>
++                                <div class="buttons mb-0">
++                                    <button type="button" class="button is-primary is-fullwidth-mobile"
++                                        wire:click="accept({{ $invite->id }})">{{ __('ui.invites_accept') }}</button>
++                                    <button type="button" class="button is-light is-fullwidth-mobile"
++                                        wire:click="decline({{ $invite->id }})">{{ __('ui.invites_decline') }}</button>
++                                </div>
++                            </div>
++                        </article>
++                    @endforeach
++                </div>
++                @error('invite') <p class="help is-danger mt-2">{{ $message }}</p> @enderror
++            </section>
++        @else
++            <section class="box" aria-label="{{ __('ui.invites_title') }}">
++                <p class="title is-6 mb-3">{{ __('ui.invites_title') }}</p>
++
++                <div class="is-flex is-flex-direction-column" style="gap: .75rem;">
++                    @foreach ($invites as $invite)
++                        <article class="box mb-0 p-3">
++                            <div class="is-flex is-flex-wrap-wrap is-justify-content-space-between is-align-items-center" style="gap: .75rem;">
++                                <div class="is-flex-grow-1" style="min-width: 12rem;">
++                                    <p class="has-text-weight-semibold">{{ $invite->entity->name }}</p>
++                                    <p class="is-size-7 has-text-grey">{{ __('ui.invites_role', ['role' => __('ui.role_'.$invite->role->value)]) }}</p>
++                                </div>
++                                <div class="buttons mb-0">
++                                    <button type="button" class="button is-primary is-fullwidth-mobile"
++                                        wire:click="accept({{ $invite->id }})">{{ __('ui.invites_accept') }}</button>
++                                    <button type="button" class="button is-light is-fullwidth-mobile"
++                                        wire:click="decline({{ $invite->id }})">{{ __('ui.invites_decline') }}</button>
++                                </div>
++                            </div>
++                        </article>
++                    @endforeach
++                </div>
++                @error('invite') <p class="help is-danger mt-2">{{ $message }}</p> @enderror
++            </section>
++        @endif
++    @endif
++</div>
+diff --git a/resources/views/livewire/entity/settings.blade.php b/resources/views/livewire/entity/settings.blade.php
+index a746757..27de920 100644
+--- a/resources/views/livewire/entity/settings.blade.php
++++ b/resources/views/livewire/entity/settings.blade.php
+@@ -9,14 +9,12 @@
+         <form wire:submit.prevent="save">
+             <div class="field">
+                 <x-label for="name">{{ __('ui.settings_name') }}</x-label>
+-                <x-input id="name" type="text" wire:model="name" required />
+-                @error('name') <p class="help is-danger">{{ $message }}</p> @enderror
++                <x-input id="name" name="name" type="text" wire:model="name" required />
+             </div>
+ 
+             <div class="field">
+                 <x-label for="slug">{{ __('ui.settings_slug') }}</x-label>
+-                <x-input id="slug" type="text" wire:model="slug" required />
+-                @error('slug') <p class="help is-danger">{{ $message }}</p> @enderror
++                <x-input id="slug" name="slug" type="text" wire:model="slug" required />
+             </div>
+ 
+             <button type="submit" class="button is-primary">{{ __('ui.settings_save') }}</button>

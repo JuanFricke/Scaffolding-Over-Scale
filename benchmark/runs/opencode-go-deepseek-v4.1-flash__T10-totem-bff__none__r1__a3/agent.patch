@@ -1,0 +1,2184 @@
+diff --git a/.env.example b/.env.example
+index 1e7785a..9ebcc29 100644
+--- a/.env.example
++++ b/.env.example
+@@ -78,6 +78,12 @@ DISCORD_WEBHOOK_URL=
+ # Optional Discord user ID pinged on every ops alert (<@id>). Empty = no ping.
+ DISCORD_MENTION_ID=
+ 
++# Totem API (Flutter client). Use a long random secret (32+ chars) in production.
++TOTEM_JWT_SECRET=
++TOTEM_JWT_TTL=3600
++# Optional extra allowed CORS origin for the totem web build (localhost is always allowed).
++TOTEM_WEB_ORIGIN=
++
+ # Hostinger / PegaFila ops (bin/pf) — never commit real secrets.
+ # GitHub Actions: store the same key as repository secret HOSTINGER_API
+ HOSTINGER_API=
+diff --git a/app/Console/Commands/PairingCodeCommand.php b/app/Console/Commands/PairingCodeCommand.php
+new file mode 100644
+index 0000000..df3e12e
+--- /dev/null
++++ b/app/Console/Commands/PairingCodeCommand.php
+@@ -0,0 +1,53 @@
++<?php
++
++namespace App\Console\Commands;
++
++use App\Models\TotemPreset;
++use Illuminate\Console\Command;
++use Illuminate\Support\Facades\Log;
++
++class PairingCodeCommand extends Command
++{
++    protected $signature = 'totem:pairing-code {preset}';
++
++    protected $description = 'Open a 10-minute pairing window for a totem preset';
++
++    public function handle(): int
++    {
++        $presetId = $this->argument('preset');
++        $preset = TotemPreset::query()->find($presetId);
++
++        if ($preset === null) {
++            $this->error("Unknown totem preset: {$presetId}");
++
++            return self::FAILURE;
++        }
++
++        do {
++            $code = str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT);
++        } while (TotemPreset::query()
++            ->where('login_code', $code)
++            ->whereKeyNot($preset->id)
++            ->exists());
++
++        $expiresAt = now()->addMinutes(10);
++
++        $preset->forceFill([
++            'login_code' => $code,
++            'login_code_expires_at' => $expiresAt,
++            'login_code_consumed_at' => null,
++        ])->save();
++
++        Log::channel('audit')?->info('totem.pairing_code.generated', [
++            'entity_id' => $preset->entity_id,
++            'preset_id' => $preset->id,
++            'expires_at' => $expiresAt->toIso8601String(),
++        ]);
++
++        $this->info("Pairing code: {$code}");
++        $this->line("Preset: {$preset->name} ({$preset->id})");
++        $this->line("Expires at {$expiresAt->toIso8601String()}.");
++
++        return self::SUCCESS;
++    }
++}
+diff --git a/app/Enums/TicketPriority.php b/app/Enums/TicketPriority.php
+new file mode 100644
+index 0000000..999d7fb
+--- /dev/null
++++ b/app/Enums/TicketPriority.php
+@@ -0,0 +1,67 @@
++<?php
++
++namespace App\Enums;
++
++/**
++ * Backend-owned priority levels for ticket issuance and the totem API.
++ *
++ * Higher values are served first. Labels and visuals are presentation data,
++ * but the values and the allowed set are business rules.
++ */
++enum TicketPriority: int
++{
++    case Normal = 0;
++    case Priority = 10;
++    case Priority80 = 20;
++
++    public function label(): string
++    {
++        return match ($this) {
++            self::Normal => 'Normal',
++            self::Priority => 'Prioritário',
++            self::Priority80 => 'Prioridade 80+',
++        };
++    }
++
++    /**
++     * @return array{color: string, icon: string, order: int}
++     */
++    public function visual(): array
++    {
++        return match ($this) {
++            self::Normal => ['color' => '#2E7D32', 'icon' => 'person', 'order' => 1],
++            self::Priority => ['color' => '#C62828', 'icon' => 'priority', 'order' => 2],
++            self::Priority80 => ['color' => '#6A1B9A', 'icon' => 'elderly', 'order' => 3],
++        };
++    }
++
++    /**
++     * Contract payload for the priorities endpoint.
++     *
++     * @return list<array{value: int, label: string, visual: array{color: string, icon: string, order: int}}>
++     */
++    public static function options(): array
++    {
++        return array_map(
++            fn (self $priority): array => [
++                'value' => $priority->value,
++                'label' => $priority->label(),
++                'visual' => $priority->visual(),
++            ],
++            self::cases(),
++        );
++    }
++
++    public static function fromRequest(mixed $value): ?self
++    {
++        if (is_int($value)) {
++            return self::tryFrom($value);
++        }
++
++        if (is_string($value) && preg_match('/^-?\d+$/D', $value) === 1) {
++            return self::tryFrom((int) $value);
++        }
++
++        return null;
++    }
++}
+diff --git a/app/Http/Controllers/Api/TotemAuthController.php b/app/Http/Controllers/Api/TotemAuthController.php
+new file mode 100644
+index 0000000..69345c5
+--- /dev/null
++++ b/app/Http/Controllers/Api/TotemAuthController.php
+@@ -0,0 +1,133 @@
++<?php
++
++namespace App\Http\Controllers\Api;
++
++use App\Http\Controllers\Controller;
++use App\Models\Totem;
++use App\Models\TotemPreset;
++use App\Support\TotemJwt;
++use Illuminate\Http\JsonResponse;
++use Illuminate\Http\Request;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Log;
++
++class TotemAuthController extends Controller
++{
++    public function __construct(private readonly TotemJwt $jwt) {}
++
++    /**
++     * Exchange a preset pairing code for a totem JWT.
++     */
++    public function login(Request $request): JsonResponse
++    {
++        $code = $request->input('code');
++
++        if (is_int($code)) {
++            $code = (string) $code;
++        }
++
++        if (! is_string($code) || preg_match('/^\d{6}$/D', $code) !== 1) {
++            $this->auditFailure($request, 'invalid_code_format');
++
++            return response()->json(['code' => 'invalid_code_format'], 400);
++        }
++
++        $result = DB::transaction(function () use ($code, $request): ?array {
++            $preset = TotemPreset::query()
++                ->where('login_code', $code)
++                ->lockForUpdate()
++                ->first();
++
++            if ($preset === null) {
++                $this->auditFailure($request, 'unknown_code');
++
++                return null;
++            }
++
++            if ($preset->login_code_expires_at === null || ! $preset->login_code_expires_at->isFuture()) {
++                $this->auditFailure($request, 'expired_code', $preset);
++
++                return null;
++            }
++
++            if ($preset->login_code_consumed_at !== null) {
++                $this->auditFailure($request, 'consumed_code', $preset);
++
++                return null;
++            }
++
++            if (! $preset->is_active) {
++                $this->auditFailure($request, 'inactive_preset', $preset);
++
++                return null;
++            }
++
++            $entity = $preset->entity;
++
++            if ($entity === null) {
++                $this->auditFailure($request, 'missing_entity', $preset);
++
++                return null;
++            }
++
++            $preset->forceFill(['login_code_consumed_at' => now()])->save();
++
++            $totem = Totem::query()->create([
++                'entity_id' => $preset->entity_id,
++                'name' => $preset->name,
++                'is_active' => true,
++                'last_seen_at' => now(),
++            ]);
++
++            $queueIds = $preset->queues()
++                ->pluck('queues.id')
++                ->map(fn (mixed $id): int => (int) $id)
++                ->all();
++
++            $token = $this->jwt->issue([
++                'totem_id' => $totem->id,
++                'entity_id' => $preset->entity_id,
++                'preset_id' => $preset->id,
++                'queues' => $queueIds,
++            ]);
++
++            $this->auditSuccess($request, $totem, $preset);
++
++            return [
++                'token' => $token,
++                'token_type' => 'Bearer',
++                'expires_in' => $this->jwt->ttl(),
++                'entity' => [
++                    'slug' => $entity->slug,
++                    'name' => $entity->name,
++                ],
++            ];
++        });
++
++        if ($result === null) {
++            return response()->json(['code' => 'invalid_pairing_code'], 401);
++        }
++
++        return response()->json($result, 200);
++    }
++
++    private function auditSuccess(Request $request, Totem $totem, TotemPreset $preset): void
++    {
++        Log::channel('audit')?->info('totem.pairing.succeeded', [
++            'totem_id' => $totem->id,
++            'entity_id' => $preset->entity_id,
++            'preset_id' => $preset->id,
++            'ip' => $request->ip(),
++        ]);
++    }
++
++    private function auditFailure(Request $request, string $reason, ?TotemPreset $preset = null): void
++    {
++        Log::channel('audit')?->warning('totem.pairing.failed', [
++            'reason' => $reason,
++            'entity_id' => $preset?->entity_id,
++            'preset_id' => $preset?->id,
++            'ip' => $request->ip(),
++        ]);
++    }
++}
+diff --git a/app/Http/Controllers/Api/TotemQueueController.php b/app/Http/Controllers/Api/TotemQueueController.php
+new file mode 100644
+index 0000000..f05c84c
+--- /dev/null
++++ b/app/Http/Controllers/Api/TotemQueueController.php
+@@ -0,0 +1,165 @@
++<?php
++
++namespace App\Http\Controllers\Api;
++
++use App\Actions\IssueTicket;
++use App\Enums\TicketChannel;
++use App\Enums\TicketPriority;
++use App\Exceptions\InactiveQueueException;
++use App\Http\Controllers\Controller;
++use App\Models\Entity;
++use App\Models\Queue;
++use App\Models\TotemPreset;
++use App\Support\TotemPresentation;
++use Illuminate\Http\JsonResponse;
++use Illuminate\Http\Request;
++
++class TotemQueueController extends Controller
++{
++    public function queues(Request $request, string $entity): JsonResponse
++    {
++        [$tokenEntity, $preset, $queueIds] = $this->context($request);
++
++        if ($tokenEntity->slug !== $entity) {
++            return $this->forbidden();
++        }
++
++        $appearance = is_array($preset->appearance) ? $preset->appearance : [];
++
++        $queues = Queue::query()
++            ->where('entity_id', $tokenEntity->id)
++            ->whereIn('id', $queueIds)
++            ->where('is_active', true)
++            ->orderBy('name')
++            ->get()
++            ->values()
++            ->map(fn (Queue $queue, int $index): array => TotemPresentation::queue($queue, $index + 1, $appearance))
++            ->all();
++
++        return response()->json([
++            'entity' => [
++                'slug' => $tokenEntity->slug,
++                'name' => $tokenEntity->name,
++            ],
++            'queues' => $queues,
++        ]);
++    }
++
++    public function priorities(Request $request, string $entity, string $queue): JsonResponse
++    {
++        [$tokenEntity, , $queueIds] = $this->context($request);
++
++        if ($tokenEntity->slug !== $entity) {
++            return $this->forbidden();
++        }
++
++        $resolved = $this->resolveQueue($tokenEntity, $queue, $queueIds);
++
++        if ($resolved instanceof JsonResponse) {
++            return $resolved;
++        }
++
++        if (! $resolved->is_active) {
++            return response()->json(['code' => 'inactive_queue'], 422);
++        }
++
++        return response()->json([
++            'entity' => ['slug' => $tokenEntity->slug],
++            'queue' => [
++                'slug' => $resolved->slug,
++                'label' => $resolved->name,
++            ],
++            'priorities' => TicketPriority::options(),
++        ]);
++    }
++
++    public function ticket(Request $request, string $entity, string $queue): JsonResponse
++    {
++        [$tokenEntity, , $queueIds] = $this->context($request);
++
++        if ($tokenEntity->slug !== $entity) {
++            return $this->forbidden();
++        }
++
++        $resolved = $this->resolveQueue($tokenEntity, $queue, $queueIds);
++
++        if ($resolved instanceof JsonResponse) {
++            return $resolved;
++        }
++
++        if (! $resolved->is_active) {
++            return response()->json(['code' => 'inactive_queue'], 422);
++        }
++
++        $priority = TicketPriority::fromRequest($request->input('priority'));
++
++        if ($priority === null) {
++            return response()->json(['code' => 'invalid_priority'], 422);
++        }
++
++        try {
++            $ticket = (new IssueTicket)($resolved, $priority->value, TicketChannel::Totem);
++        } catch (InactiveQueueException) {
++            return response()->json(['code' => 'inactive_queue'], 422);
++        }
++
++        return response()->json([
++            'slug' => $ticket->code,
++            'queue' => [
++                'slug' => $resolved->slug,
++                'label' => $resolved->name,
++            ],
++            'priority' => [
++                'value' => $priority->value,
++                'label' => $priority->label(),
++            ],
++            'issued_at' => $ticket->issued_at->toIso8601ZuluString(),
++        ], 201);
++    }
++
++    /**
++     * @return array{0: Entity, 1: TotemPreset, 2: list<int>}
++     */
++    private function context(Request $request): array
++    {
++        /** @var Entity $entity */
++        $entity = $request->attributes->get('totem_entity');
++
++        /** @var TotemPreset $preset */
++        $preset = $request->attributes->get('totem_preset');
++
++        /** @var list<int> $queueIds */
++        $queueIds = $request->attributes->get('totem_queue_ids', []);
++
++        return [$entity, $preset, $queueIds];
++    }
++
++    /**
++     * Resolve a queue slug inside the token entity only. Another entity's
++     * queue is indistinguishable from a missing queue.
++     *
++     * @param  list<int>  $queueIds
++     */
++    private function resolveQueue(Entity $entity, string $slug, array $queueIds): Queue|JsonResponse
++    {
++        $queue = Queue::query()
++            ->where('entity_id', $entity->id)
++            ->where('slug', $slug)
++            ->first();
++
++        if ($queue === null) {
++            return response()->json(['code' => 'queue_not_found'], 404);
++        }
++
++        if (! in_array($queue->id, $queueIds, true)) {
++            return $this->forbidden();
++        }
++
++        return $queue;
++    }
++
++    private function forbidden(): JsonResponse
++    {
++        return response()->json(['code' => 'forbidden'], 403);
++    }
++}
+diff --git a/app/Http/Middleware/AuthenticateTotem.php b/app/Http/Middleware/AuthenticateTotem.php
+new file mode 100644
+index 0000000..3ba5061
+--- /dev/null
++++ b/app/Http/Middleware/AuthenticateTotem.php
+@@ -0,0 +1,104 @@
++<?php
++
++namespace App\Http\Middleware;
++
++use App\Models\Entity;
++use App\Models\Totem;
++use App\Models\TotemPreset;
++use App\Support\TotemJwt;
++use Closure;
++use Illuminate\Http\Request;
++use Symfony\Component\HttpFoundation\Response;
++use Throwable;
++
++/**
++ * Authenticates totem API calls and resolves the effective queue scope.
++ *
++ * The queue scope is the intersection of the token's queues claim and the
++ * preset's current join, so removing a queue from a preset takes effect
++ * immediately for tokens that are still valid.
++ */
++class AuthenticateTotem
++{
++    public function __construct(private readonly TotemJwt $jwt) {}
++
++    public function handle(Request $request, Closure $next): Response
++    {
++        $token = $request->bearerToken();
++
++        if ($token === null || $token === '') {
++            return $this->invalidToken();
++        }
++
++        try {
++            $claims = $this->jwt->decode($token);
++        } catch (Throwable) {
++            return $this->invalidToken();
++        }
++
++        $totemId = $this->integerClaim($claims['totem_id'] ?? null);
++        $entityId = $this->integerClaim($claims['entity_id'] ?? null);
++        $presetId = $this->integerClaim($claims['preset_id'] ?? null);
++        $claimedQueues = $claims['queues'] ?? null;
++
++        if ($totemId === null || $entityId === null || $presetId === null
++            || ! is_array($claimedQueues) || ! isset($claims['jti'])) {
++            return $this->invalidToken();
++        }
++
++        $totem = Totem::query()->find($totemId);
++        $preset = TotemPreset::query()->find($presetId);
++        $entity = Entity::query()->find($entityId);
++
++        if ($totem === null || $preset === null || $entity === null) {
++            return $this->invalidToken();
++        }
++
++        // The token, device, and preset must all agree on the entity.
++        if ((int) $totem->entity_id !== $entityId
++            || (int) $preset->entity_id !== $entityId
++            || ! $totem->is_active
++            || ! $preset->is_active) {
++            return $this->invalidToken();
++        }
++
++        $claimedQueueIds = array_values(array_unique(array_filter(
++            array_map(fn (mixed $id): ?int => $this->integerClaim($id), $claimedQueues),
++            fn (?int $id): bool => $id !== null,
++        )));
++
++        $presetQueueIds = $preset->queues()
++            ->pluck('queues.id')
++            ->map(fn (mixed $id): int => (int) $id)
++            ->all();
++
++        $effectiveQueueIds = array_values(array_intersect($claimedQueueIds, $presetQueueIds));
++
++        $totem->forceFill(['last_seen_at' => now()])->saveQuietly();
++
++        $request->attributes->set('totem', $totem);
++        $request->attributes->set('totem_preset', $preset);
++        $request->attributes->set('totem_entity', $entity);
++        $request->attributes->set('totem_queue_ids', $effectiveQueueIds);
++
++        return $next($request);
++    }
++
++    private function invalidToken(): Response
++    {
++        return response()->json(['code' => 'invalid_token'], 401);
++    }
++
++    private function integerClaim(mixed $value): ?int
++    {
++        if (is_int($value)) {
++            return $value;
++        }
++
++        if (is_string($value) && preg_match('/^\d+$/D', $value) === 1) {
++            return (int) $value;
++        }
++
++        return null;
++    }
++}
+diff --git a/app/Http/Middleware/TotemCors.php b/app/Http/Middleware/TotemCors.php
+new file mode 100644
+index 0000000..f2dacbd
+--- /dev/null
++++ b/app/Http/Middleware/TotemCors.php
+@@ -0,0 +1,64 @@
++<?php
++
++namespace App\Http\Middleware;
++
++use Closure;
++use Illuminate\Http\Request;
++use Symfony\Component\HttpFoundation\Response;
++
++/**
++ * CORS for the totem web build and any allowed local development origin.
++ *
++ * Only localhost/127.0.0.1 on any port and the optional TOTEM_WEB_ORIGIN are
++ * allowed. Disallowed origins receive no Access-Control-Allow-Origin header.
++ * Credentials are never enabled.
++ */
++class TotemCors
++{
++    public function handle(Request $request, Closure $next): Response
++    {
++        if (! $request->is('api/*')) {
++            return $next($request);
++        }
++
++        $response = $request->getMethod() === 'OPTIONS'
++            ? response('', 204)
++            : $next($request);
++
++        return self::apply($request, $response);
++    }
++
++    /**
++     * Add the strict totem CORS headers to a response (used for both normal
++     * responses and rendered exceptions such as throttling).
++     */
++    public static function apply(Request $request, Response $response): Response
++    {
++        $origin = $request->headers->get('Origin');
++        $allowedOrigin = is_string($origin) && self::isAllowedOrigin($origin) ? $origin : null;
++
++        if ($allowedOrigin !== null) {
++            $response->headers->set('Access-Control-Allow-Origin', $allowedOrigin);
++            $response->headers->set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
++            $response->headers->set('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept');
++            $response->headers->set('Access-Control-Max-Age', '86400');
++        }
++
++        if ($origin !== null) {
++            $response->headers->set('Vary', 'Origin', false);
++        }
++
++        return $response;
++    }
++
++    private static function isAllowedOrigin(string $origin): bool
++    {
++        if (preg_match('#^https?://(localhost|127\.0\.0\.1)(:\d+)?$#i', $origin) === 1) {
++            return true;
++        }
++
++        $configured = (string) config('services.totem.web_origin', '');
++
++        return $configured !== '' && strcasecmp(rtrim($configured, '/'), rtrim($origin, '/')) === 0;
++    }
++}
+diff --git a/app/Models/Entity.php b/app/Models/Entity.php
+index 54cf230..3946e96 100644
+--- a/app/Models/Entity.php
++++ b/app/Models/Entity.php
+@@ -48,6 +48,16 @@ public function queues(): HasMany
+         return $this->hasMany(Queue::class);
+     }
+ 
++    public function totems(): HasMany
++    {
++        return $this->hasMany(Totem::class);
++    }
++
++    public function totemPresets(): HasMany
++    {
++        return $this->hasMany(TotemPreset::class);
++    }
++
+     /**
+      * Every user that belongs to this entity (pivot = entity_memberships).
+      */
+diff --git a/app/Models/Queue.php b/app/Models/Queue.php
+index c4c5272..b4d7ceb 100644
+--- a/app/Models/Queue.php
++++ b/app/Models/Queue.php
+@@ -7,6 +7,7 @@
+ use Illuminate\Database\Eloquent\Factories\HasFactory;
+ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Database\Eloquent\Relations\BelongsTo;
++use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+ use Illuminate\Database\Eloquent\Relations\HasMany;
+ 
+ #[Fillable(['entity_id', 'name', 'slug', 'is_active', 'labels_i18n'])]
+@@ -41,4 +42,13 @@ public function tickets(): HasMany
+     {
+         return $this->hasMany(Ticket::class);
+     }
++
++    /**
++     * @return BelongsToMany<TotemPreset, $this>
++     */
++    public function totemPresets(): BelongsToMany
++    {
++        return $this->belongsToMany(TotemPreset::class, 'totem_preset_queue', 'queue_id', 'preset_id')
++            ->withTimestamps();
++    }
+ }
+diff --git a/app/Models/Totem.php b/app/Models/Totem.php
+new file mode 100644
+index 0000000..eb57eef
+--- /dev/null
++++ b/app/Models/Totem.php
+@@ -0,0 +1,35 @@
++<?php
++
++namespace App\Models;
++
++use Database\Factories\TotemFactory;
++use Illuminate\Database\Eloquent\Attributes\Fillable;
++use Illuminate\Database\Eloquent\Factories\HasFactory;
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++
++#[Fillable(['entity_id', 'name', 'is_active', 'last_seen_at'])]
++class Totem extends Model
++{
++    /** @use HasFactory<TotemFactory> */
++    use HasFactory;
++
++    /**
++     * @return array<string, string>
++     */
++    protected function casts(): array
++    {
++        return [
++            'is_active' => 'boolean',
++            'last_seen_at' => 'datetime',
++        ];
++    }
++
++    /**
++     * @return BelongsTo<Entity, $this>
++     */
++    public function entity(): BelongsTo
++    {
++        return $this->belongsTo(Entity::class);
++    }
++}
+diff --git a/app/Models/TotemPreset.php b/app/Models/TotemPreset.php
+new file mode 100644
+index 0000000..3fbf2d8
+--- /dev/null
++++ b/app/Models/TotemPreset.php
+@@ -0,0 +1,57 @@
++<?php
++
++namespace App\Models;
++
++use Database\Factories\TotemPresetFactory;
++use Illuminate\Database\Eloquent\Attributes\Fillable;
++use Illuminate\Database\Eloquent\Factories\HasFactory;
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsTo;
++use Illuminate\Database\Eloquent\Relations\BelongsToMany;
++
++#[Fillable([
++    'entity_id',
++    'name',
++    'login_code',
++    'login_code_expires_at',
++    'login_code_consumed_at',
++    'appearance',
++    'is_active',
++])]
++class TotemPreset extends Model
++{
++    /** @use HasFactory<TotemPresetFactory> */
++    use HasFactory;
++
++    /**
++     * @return array<string, string>
++     */
++    protected function casts(): array
++    {
++        return [
++            'login_code_expires_at' => 'datetime',
++            'login_code_consumed_at' => 'datetime',
++            'appearance' => 'array',
++            'is_active' => 'boolean',
++        ];
++    }
++
++    /**
++     * @return BelongsTo<Entity, $this>
++     */
++    public function entity(): BelongsTo
++    {
++        return $this->belongsTo(Entity::class);
++    }
++
++    /**
++     * Queues this preset may see and issue from.
++     *
++     * @return BelongsToMany<Queue, $this>
++     */
++    public function queues(): BelongsToMany
++    {
++        return $this->belongsToMany(Queue::class, 'totem_preset_queue', 'preset_id', 'queue_id')
++            ->withTimestamps();
++    }
++}
+diff --git a/app/Support/TotemJwt.php b/app/Support/TotemJwt.php
+new file mode 100644
+index 0000000..652e65b
+--- /dev/null
++++ b/app/Support/TotemJwt.php
+@@ -0,0 +1,127 @@
++<?php
++
++namespace App\Support;
++
++use Illuminate\Support\Str;
++use RuntimeException;
++
++/**
++ * Minimal, dependency-free HS256 JWT implementation for the totem API.
++ */
++final class TotemJwt
++{
++    /**
++     * Issue a short-lived token. iat/exp/jti are always set by the issuer.
++     *
++     * @param  array<string, mixed>  $claims
++     */
++    public function issue(array $claims): string
++    {
++        $now = time();
++        $ttl = $this->ttl();
++
++        return $this->encode(array_merge($claims, [
++            'iat' => $now,
++            'exp' => $now + $ttl,
++            'jti' => (string) Str::uuid(),
++        ]));
++    }
++
++    public function ttl(): int
++    {
++        return max(0, (int) config('services.totem.jwt_ttl', 3600));
++    }
++
++    /**
++     * Validate signature/expiry and return the claims.
++     *
++     * @return array<string, mixed>
++     */
++    public function decode(string $token): array
++    {
++        $parts = explode('.', $token);
++
++        if (count($parts) !== 3) {
++            throw new RuntimeException('Malformed token.');
++        }
++
++        [$encodedHeader, $encodedPayload, $encodedSignature] = $parts;
++
++        $header = json_decode($this->base64UrlDecode($encodedHeader), true);
++
++        if (! is_array($header) || ($header['alg'] ?? null) !== 'HS256') {
++            throw new RuntimeException('Unsupported token algorithm.');
++        }
++
++        $expected = $this->sign($encodedHeader.'.'.$encodedPayload);
++
++        if (! hash_equals($expected, $encodedSignature)) {
++            throw new RuntimeException('Invalid token signature.');
++        }
++
++        $payload = json_decode($this->base64UrlDecode($encodedPayload), true);
++
++        if (! is_array($payload)) {
++            throw new RuntimeException('Malformed token payload.');
++        }
++
++        if (! isset($payload['exp']) || ! is_numeric($payload['exp']) || (int) $payload['exp'] <= time()) {
++            throw new RuntimeException('Token expired.');
++        }
++
++        if (! isset($payload['iat']) || ! is_numeric($payload['iat'])) {
++            throw new RuntimeException('Token missing issued-at claim.');
++        }
++
++        return $payload;
++    }
++
++    /**
++     * @param  array<string, mixed>  $payload
++     */
++    private function encode(array $payload): string
++    {
++        $header = $this->base64UrlEncode(json_encode([
++            'typ' => 'JWT',
++            'alg' => 'HS256',
++        ], JSON_THROW_ON_ERROR));
++
++        $body = $this->base64UrlEncode(json_encode($payload, JSON_THROW_ON_ERROR));
++        $signature = $this->sign($header.'.'.$body);
++
++        return $header.'.'.$body.'.'.$signature;
++    }
++
++    private function sign(string $value): string
++    {
++        $secret = (string) config('services.totem.jwt_secret');
++
++        if ($secret === '') {
++            throw new RuntimeException('Totem JWT secret is not configured.');
++        }
++
++        return $this->base64UrlEncode(hash_hmac('sha256', $value, $secret, true));
++    }
++
++    private function base64UrlEncode(string $value): string
++    {
++        return rtrim(strtr(base64_encode($value), '+/', '-_'), '=');
++    }
++
++    private function base64UrlDecode(string $value): string
++    {
++        $remainder = strlen($value) % 4;
++
++        if ($remainder !== 0) {
++            $value .= str_repeat('=', 4 - $remainder);
++        }
++
++        $decoded = base64_decode(strtr($value, '-_', '+/'), true);
++
++        if ($decoded === false) {
++            throw new RuntimeException('Malformed token encoding.');
++        }
++
++        return $decoded;
++    }
++}
+diff --git a/app/Support/TotemPresentation.php b/app/Support/TotemPresentation.php
+new file mode 100644
+index 0000000..e635086
+--- /dev/null
++++ b/app/Support/TotemPresentation.php
+@@ -0,0 +1,47 @@
++<?php
++
++namespace App\Support;
++
++use App\Models\Queue;
++
++/**
++ * Presentation helpers for the totem API. Visual data is always resolved by
++ * the backend, with optional per-preset overrides in totem_presets.appearance.
++ */
++final class TotemPresentation
++{
++    /** @var list<string> */
++    private const QUEUE_COLORS = [
++        '#0055FF',
++        '#00897B',
++        '#EF6C00',
++        '#6A1B9A',
++        '#455A64',
++        '#AD1457',
++    ];
++
++    /**
++     * @param  array<string, mixed>  $appearance
++     * @return array{slug: string, label: string, description: string, visual: array{color: string, icon: string, order: int}, is_active: true}
++     */
++    public static function queue(Queue $queue, int $order, array $appearance = []): array
++    {
++        $override = $appearance['queues'][$queue->slug] ?? [];
++        $override = is_array($override) ? $override : [];
++        $visual = is_array($override['visual'] ?? null) ? $override['visual'] : [];
++
++        return [
++            'slug' => $queue->slug,
++            'label' => $queue->name,
++            'description' => is_string($override['description'] ?? null) ? $override['description'] : '',
++            'visual' => [
++                'color' => is_string($visual['color'] ?? null)
++                    ? $visual['color']
++                    : self::QUEUE_COLORS[($order - 1) % count(self::QUEUE_COLORS)],
++                'icon' => is_string($visual['icon'] ?? null) ? $visual['icon'] : 'ticket',
++                'order' => $order,
++            ],
++            'is_active' => true,
++        ];
++    }
++}
+diff --git a/bootstrap/app.php b/bootstrap/app.php
+index 4ebc2be..c67dd9b 100644
+--- a/bootstrap/app.php
++++ b/bootstrap/app.php
+@@ -1,26 +1,66 @@
+ <?php
+ 
++use App\Http\Middleware\AuthenticateTotem;
+ use App\Http\Middleware\CurrentEntity;
+ use App\Http\Middleware\SetLocaleFromBrowser;
++use App\Http\Middleware\TotemCors;
+ use Illuminate\Foundation\Application;
+ use Illuminate\Foundation\Configuration\Exceptions;
+ use Illuminate\Foundation\Configuration\Middleware;
++use Illuminate\Http\Exceptions\ThrottleRequestsException;
++use Illuminate\Http\Middleware\HandleCors;
+ use Illuminate\Http\Request;
++use Illuminate\Support\Facades\Log;
++use Symfony\Component\HttpFoundation\Response;
+ 
+ return Application::configure(basePath: dirname(__DIR__))
+     ->withRouting(
+         web: __DIR__.'/../routes/web.php',
++        api: __DIR__.'/../routes/api.php',
+         commands: __DIR__.'/../routes/console.php',
+         health: '/up',
+     )
+     ->withMiddleware(function (Middleware $middleware): void {
+         // Honor X-Forwarded-* from the edge reverse proxy (Caddy on the VPS).
+         $middleware->trustProxies(at: '*');
+-        $middleware->alias(['current_entity' => CurrentEntity::class]);
++        $middleware->alias([
++            'current_entity' => CurrentEntity::class,
++            'totem.auth' => AuthenticateTotem::class,
++        ]);
+         $middleware->prependToGroup('web', SetLocaleFromBrowser::class);
++        // The totem API uses its own strict origin allow-list instead of the
++        // framework's permissive default CORS handler.
++        $middleware->remove(HandleCors::class);
++        // Global so OPTIONS preflights are answered before route matching.
++        $middleware->prepend(TotemCors::class);
+     })
+     ->withExceptions(function (Exceptions $exceptions): void {
+         $exceptions->shouldRenderJsonWhen(
+             fn (Request $request) => $request->is('api/*'),
+         );
++
++        $exceptions->respond(function (Response $response, Throwable $e, Request $request) {
++            if ($request->is('api/*')) {
++                return TotemCors::apply($request, $response);
++            }
++
++            return $response;
++        });
++
++        $exceptions->render(function (ThrottleRequestsException $e, Request $request) {
++            if ($request->is('api/*')) {
++                if ($request->is('api/totem/auth')) {
++                    Log::channel('audit')?->warning('totem.pairing.failed', [
++                        'reason' => 'rate_limited',
++                        'ip' => $request->ip(),
++                    ]);
++                }
++
++                return response()->json(
++                    ['code' => 'rate_limited'],
++                    429,
++                    $e->getHeaders(),
++                );
++            }
++        });
+     })->create();
+diff --git a/config/services.php b/config/services.php
+index d7c9d4f..667e014 100644
+--- a/config/services.php
++++ b/config/services.php
+@@ -40,4 +40,10 @@
+         'mention_id' => env('DISCORD_MENTION_ID'),
+     ],
+ 
++    'totem' => [
++        'jwt_secret' => env('TOTEM_JWT_SECRET'),
++        'jwt_ttl' => (int) env('TOTEM_JWT_TTL', 3600),
++        'web_origin' => env('TOTEM_WEB_ORIGIN'),
++    ],
++
+ ];
+diff --git a/database/factories/TotemFactory.php b/database/factories/TotemFactory.php
+new file mode 100644
+index 0000000..ac63d97
+--- /dev/null
++++ b/database/factories/TotemFactory.php
+@@ -0,0 +1,28 @@
++<?php
++
++namespace Database\Factories;
++
++use App\Models\Entity;
++use App\Models\Totem;
++use Illuminate\Database\Eloquent\Factories\Factory;
++
++/**
++ * @extends Factory<Totem>
++ */
++class TotemFactory extends Factory
++{
++    /**
++     * Define the model's default state.
++     *
++     * @return array<string, mixed>
++     */
++    public function definition(): array
++    {
++        return [
++            'entity_id' => Entity::factory(),
++            'name' => fake()->words(2, true),
++            'is_active' => true,
++            'last_seen_at' => now(),
++        ];
++    }
++}
+diff --git a/database/factories/TotemPresetFactory.php b/database/factories/TotemPresetFactory.php
+new file mode 100644
+index 0000000..096265a
+--- /dev/null
++++ b/database/factories/TotemPresetFactory.php
+@@ -0,0 +1,31 @@
++<?php
++
++namespace Database\Factories;
++
++use App\Models\Entity;
++use App\Models\TotemPreset;
++use Illuminate\Database\Eloquent\Factories\Factory;
++
++/**
++ * @extends Factory<TotemPreset>
++ */
++class TotemPresetFactory extends Factory
++{
++    /**
++     * Define the model's default state.
++     *
++     * @return array<string, mixed>
++     */
++    public function definition(): array
++    {
++        return [
++            'entity_id' => Entity::factory(),
++            'name' => fake()->words(2, true),
++            'login_code' => fake()->unique()->numerify('######'),
++            'login_code_expires_at' => now()->addMinutes(10),
++            'login_code_consumed_at' => null,
++            'appearance' => null,
++            'is_active' => true,
++        ];
++    }
++}
+diff --git a/database/migrations/2026_10_29_000000_create_totems_table.php b/database/migrations/2026_10_29_000000_create_totems_table.php
+new file mode 100644
+index 0000000..9df6740
+--- /dev/null
++++ b/database/migrations/2026_10_29_000000_create_totems_table.php
+@@ -0,0 +1,31 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    /**
++     * Run the migrations.
++     */
++    public function up(): void
++    {
++        Schema::create('totems', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('entity_id')->constrained()->cascadeOnDelete();
++            $table->string('name');
++            $table->boolean('is_active')->default(true);
++            $table->timestamp('last_seen_at')->nullable();
++            $table->timestamps();
++        });
++    }
++
++    /**
++     * Reverse the migrations.
++     */
++    public function down(): void
++    {
++        Schema::dropIfExists('totems');
++    }
++};
+diff --git a/database/migrations/2026_10_29_000001_create_totem_presets_table.php b/database/migrations/2026_10_29_000001_create_totem_presets_table.php
+new file mode 100644
+index 0000000..2b9996b
+--- /dev/null
++++ b/database/migrations/2026_10_29_000001_create_totem_presets_table.php
+@@ -0,0 +1,34 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    /**
++     * Run the migrations.
++     */
++    public function up(): void
++    {
++        Schema::create('totem_presets', function (Blueprint $table) {
++            $table->id();
++            $table->foreignId('entity_id')->constrained()->cascadeOnDelete();
++            $table->string('name');
++            $table->string('login_code', 6)->nullable()->unique();
++            $table->timestamp('login_code_expires_at')->nullable();
++            $table->timestamp('login_code_consumed_at')->nullable();
++            $table->json('appearance')->nullable();
++            $table->boolean('is_active')->default(true);
++            $table->timestamps();
++        });
++    }
++
++    /**
++     * Reverse the migrations.
++     */
++    public function down(): void
++    {
++        Schema::dropIfExists('totem_presets');
++    }
++};
+diff --git a/database/migrations/2026_10_29_000002_create_totem_preset_queue_table.php b/database/migrations/2026_10_29_000002_create_totem_preset_queue_table.php
+new file mode 100644
+index 0000000..bbbfb04
+--- /dev/null
++++ b/database/migrations/2026_10_29_000002_create_totem_preset_queue_table.php
+@@ -0,0 +1,30 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    /**
++     * Run the migrations.
++     */
++    public function up(): void
++    {
++        Schema::create('totem_preset_queue', function (Blueprint $table) {
++            $table->foreignId('preset_id')->constrained('totem_presets')->cascadeOnDelete();
++            $table->foreignId('queue_id')->constrained('queues')->cascadeOnDelete();
++            $table->timestamps();
++
++            $table->primary(['preset_id', 'queue_id']);
++        });
++    }
++
++    /**
++     * Reverse the migrations.
++     */
++    public function down(): void
++    {
++        Schema::dropIfExists('totem_preset_queue');
++    }
++};
+diff --git a/docs/api/totem.md b/docs/api/totem.md
+index 07faf7c..89e3c6f 100644
+--- a/docs/api/totem.md
++++ b/docs/api/totem.md
+@@ -2,27 +2,28 @@ # Totem API — PegaFilaWeb ↔ pegafila_totem
+ 
+ Contract between **PegaFilaWeb** (Laravel backend, BFF) and the
+ **pegafila_totem** Flutter client. PegaFilaWeb owns queue state and business
+-decisions; pegafila_totem is client-only: renders UI, selects queues,
++decisions; pegafila_totem is client-only: it renders UI, selects queues and
+ prints via ESC/POS.
+ 
+ Related: [`../architecture.md`](../architecture.md) (boundaries),
+ [`../business-rules.md`](../business-rules.md) (domain),
+ [`../database-schema.md`](../database-schema.md) (`totems`, `tickets`).
+ 
+-> Status: proposal. No `routes/api.php` implementation in this repo yet.
+-> Endpoint paths and field names below are the proposed contract.
++> Status: **implemented**. Routes live in `routes/api.php` under the `/api`
++> prefix (`bootstrap/app.php`). Business rules for issuance are reused from
++> `App\Actions\IssueTicket` with channel `totem`; the API does not duplicate
++> them.
+ 
+ ## Scope
+ 
+-Totem API exposes application-level operations, never DB internals. The
+-totem surface is exactly four calls: pairing login + two reads + one write.
++The totem surface is exactly four calls: pairing login + two reads + one write.
+ 
+-| Method | Path | Purpose |
+-| ------ | ---- | ------- |
+-| `POST` | `api/totem/auth` | Login via pairing code, returns JWT |
+-| `GET` | `api/{entity}/queues` | List queues available for issuance, with visual specs |
+-| `GET` | `api/{entity}/{queue}/priorities` | List priority levels for a queue, with visual specs |
+-| `POST` | `api/{entity}/{queue}/ticket` | Issue ticket with a chosen priority, returns ticket slug |
++| Method | Path | Purpose | Throttle |
++| ------ | ---- | ------- | -------- |
++| `POST` | `api/totem/auth` | Login via pairing code, returns JWT | 10/min |
++| `GET` | `api/{entity}/queues` | List queues available for issuance, with visual specs | — |
++| `GET` | `api/{entity}/{queue}/priorities` | List priority levels for a queue, with visual specs | — |
++| `POST` | `api/{entity}/{queue}/ticket` | Issue ticket with a chosen priority, returns ticket slug | 30/min |
+ 
+ `{entity}` and `{queue}` are slugs. The JWT scope always wins: path values
+ are validated against the token's `totem_id` / `entity_id` / preset, never
+@@ -37,9 +38,10 @@ ## Actors
+ | **pegafila_totem** | Sends pairing code only, stores JWT in local memory, calls the three data endpoints |
+ | **Preset** | Limited, server-side totem configuration. Resolved from pairing code, never from client input. See [Preset](#preset) below. |
+ 
+-Device identity persists in `totems` (`entity_id`, `name`, `api_token_hash`,
+-`is_active`, `last_seen_at`). JWT is the runtime credential for that row;
+-revocation = `is_active = false` (+ token expiry).
++Device identity persists in `totems` (`entity_id`, `name`, `is_active`,
++`last_seen_at`). JWT is the runtime credential for that row; revocation =
++`is_active = false` (+ token expiry). A successful pairing creates a new
++`totems` row for the preset's entity.
+ 
+ ## Preset
+ 
+@@ -47,33 +49,39 @@ ## Preset
+ paired totem may see and how it looks. One preset has its **own login code**;
+ codes are never shared across presets.
+ 
+-Proposed `totem_presets` table (no migration yet — must be created via
+-`php artisan make:migration`):
++Implemented `totem_presets` table:
+ 
+ | Column | Type | Notes |
+ | ------ | ---- | ----- |
+ | `id` | bigint PK | — |
+-| `entity_id` | bigint FK → `entities` | Preset belongs to one entity |
+-| `name` | string | Operator label, e.g. "Entrada principal" |
+-| `login_code` | string(6) | Random 6 digits, own code per preset, single-use |
+-| `login_code_expires_at` | datetime | Code expiry = **10 min** after generation |
+-| `appearance` | json | Theme, logo, colors, locale, print template |
+-| `is_active` | bool | Inactive preset cannot pair or issue |
++| `entity_id` | bigint FK → `entities` | Cascade on delete; preset belongs to one entity |
++| `name` | string | Operator label, e.g. "Entrada principal"; also used as the created totem's name |
++| `login_code` | string(6), nullable, unique | Random 6 digits, own code per preset, single-use |
++| `login_code_expires_at` | datetime, nullable | Code expiry = **10 min** after generation |
++| `login_code_consumed_at` | datetime, nullable | Set atomically on successful pairing |
++| `appearance` | json, nullable | Optional presentation overrides (see [Queues](#read-queues)) |
++| `is_active` | bool | Default `true`; inactive preset cannot pair or issue |
+ | `created_at` / `updated_at` | datetimes | — |
+ 
+-Queue visibility is a join (`totem_preset_queue`: `preset_id` + `queue_id`):
+-each preset chooses **which queues it can see**. The `GET queues` and
+-`POST ticket` endpoints only ever return/accept queues in that join.
++Queue visibility is the `totem_preset_queue` join (`preset_id`, `queue_id`,
++timestamps, composite primary key). Each preset chooses **which queues it can
++see**. The `GET queues` and `POST ticket` endpoints only ever return/accept
++queues in that join.
+ 
+-Per preset, the operator configures:
++Per preset, the operator configures queues, appearance, and its own login code.
++Regenerating a code replaces the previous one; the old code stops working
++immediately.
+ 
+-- **Queues** — which queues this preset can see and issue from.
+-- **Appearance** — visual specs served by the `GET` endpoints (`label`,
+-  `description`, `visual{color,icon,order}`, locale); totem renders them
+-  without hardcoding styles.
+-- **Own login code** — 6-digit code in `login_code`, expiring in 10 min
+-  (`login_code_expires_at`). Regenerating a code replaces the previous one;
+-  the old code stops working immediately.
++### Opening the pairing window
++
++```bash
++php artisan totem:pairing-code {preset}
++```
++
++The argument is the preset id. The command generates a cryptographically
++random, zero-padded 6-digit code, sets `login_code_expires_at = now + 10 min`,
++clears `login_code_consumed_at`, prints the code, and writes an audit entry.
++An unknown preset id prints an error and exits with a failure code.
+ 
+ ## Login via pairing code
+ 
+@@ -85,32 +93,14 @@ ### Sequence
+     participant PegaFilaWeb
+     participant pegafila_totem as PFTotem
+ 
+-    PegaFilaWeb->>PegaFilaWeb: Opens pairing window (Generates 6-digit code)
+-    pegafila_totem->>PegaFilaWeb: Sends code and requests login
+-    PegaFilaWeb->>PegaFilaWeb: Finds preset and generates JWT
+-    PegaFilaWeb->>pegafila_totem: Returns JWT
++    PegaFilaWeb->>PegaFilaWeb: Opens pairing window (totem:pairing-code)
++    pegafila_totem->>PegaFilaWeb: POST api/totem/auth {code}
++    PegaFilaWeb->>PegaFilaWeb: Lock preset, consume code, create totems row
++    PegaFilaWeb->>PegaFilaWeb: Sign JWT (totem/entity/preset/queues)
++    PegaFilaWeb->>pegafila_totem: 200 {token, entity}
+     pegafila_totem->>pegafila_totem: Stores JWT in local memory
+ ```
+ 
+-### Steps
+-
+-1. **PegaFilaWeb opens pairing window.** Operator starts pairing for a
+-   preset. Server generates the preset's own 6-digit `login_code`,
+-   single-use, expiring in **10 min** (`login_code_expires_at`). Code is
+-   displayed, never returned by any public API. Regenerating replaces the
+-   previous code.
+-2. **pegafila_totem sends code only.** Backend does the rest — no
+-   `device_name`, `entity_id`, or queue hints from the client.
+-3. **PegaFilaWeb resolves preset and issues JWT.** Server validates code
+-   (exists, unexpired, unused), loads the preset + its queue join
+-   server-side, creates/updates the `totems` row, marks code consumed,
+-   signs a JWT scoped to (`totem_id`, `entity_id`, `preset_id`, allowed
+-   queues). Updates `last_seen_at`.
+-4. **PegaFilaWeb returns JWT.** Client stores it and uses it as
+-   `Authorization: Bearer <jwt>` on every later call.
+-5. **pegafila_totem stores JWT in local memory.** Secure device storage,
+-   never logged.
+-
+ ### Contract
+ 
+ ```http
+@@ -128,39 +118,78 @@ ### Contract
+ {
+   "token": "<jwt>",
+   "token_type": "Bearer",
+-  "expires_in": 3600
++  "expires_in": 3600,
++  "entity": {
++    "slug": "loja-centro",
++    "name": "Loja Centro"
++  }
+ }
+ ```
+ 
+-No entity/queues/locale in the login response — the client discovers them
+-through the `GET` endpoints below using the JWT.
++The entity pair is part of the implemented contract: the totem needs the slug
++to call the later endpoints. The code is consumed and the totem row is created
++atomically in a transaction with the preset row locked.
+ 
+ Failures (explicit, no stack traces):
+ 
+ | Status | `code` | When |
+ | ------ | ------ | ---- |
+-| 400 | `invalid_code_format` | Code not 6 digits |
+-| 401 | `invalid_pairing_code` | Unknown, mismatched, expired, or already consumed — same response to avoid oracle |
+-| 403 | `entity_suspended` | Subscription inactive — blocks login (and all issuance) |
+-| 429 | `rate_limited` | Rate-limited pairing attempts |
++| 400 | `invalid_code_format` | Code is not exactly 6 digits (including empty) |
++| 401 | `invalid_pairing_code` | Unknown, expired, already consumed, or inactive preset — same response to avoid an oracle |
++| 429 | `rate_limited` | More than 10 pairing requests per minute |
++
++`403 entity_suspended` is **reserved** for the future billing/subscription
++check. Billing does not exist in this backend yet, so it is never sent.
+ 
+ ### Rules
+ 
+-- Pairing code: the preset's own cryptographically random 6 digits
+-  (`totem_presets.login_code`), single-use, TTL **10 min**
+-  (`login_code_expires_at`), consumed atomically on success. Failed attempts
+-  rate-limited per code + per IP.
+-- JWT: short TTL (`expires_in: 3600`, 1h placeholder pending [open question](#open-questions))
+-  with rotation/refresh defined at implementation;
+-  claims carry `totem_id` + `entity_id` + `preset_id` + queue scope. Every later endpoint
+-  re-validates totem `is_active` + preset `is_active` + entity subscription server-side.
+-- Discord ≠ log sink: audit pairing success/failure via app logs per
+-  [`../ops/logging.md`](../ops/logging.md); alert on abuse spikes only.
++- Pairing code: the preset's own cryptographically random 6 digits, single-use,
++  TTL **10 min**, consumed atomically on success.
++- Pairing success and failure are written to the audit log. The full code is
++  never logged.
++- Failed attempts are rate-limited per client (10/min). Throttle exceptions on
++  `api/*` render as `429 {"code":"rate_limited"}`.
++
++## JWT
++
++- Algorithm: **HS256**, using a small in-repo implementation
++  (`App\Support\TotemJwt`).
++- Secret: `config('services.totem.jwt_secret')` ← `TOTEM_JWT_SECRET`
++  (32+ characters in production).
++- TTL: `config('services.totem.jwt_ttl')` ← `TOTEM_JWT_TTL` (default `3600`).
++- Claims: `totem_id`, `entity_id`, `preset_id`, `queues` (allowed queue ids at
++  pairing time), `iat`, `exp`, `jti`.
++- `expires_in` in the login response is the configured TTL in seconds.
++- There are no refresh tokens or per-token revocation lists. Revoke a device by
++  setting `totems.is_active = false`; expire access by changing the secret.
++
++## Authentication middleware
++
++Every authenticated endpoint requires `Authorization: Bearer <jwt>`. The
++`totem.auth` middleware validates:
++
++- signature, algorithm, `iat` and `exp`;
++- required claims (`totem_id`, `entity_id`, `preset_id`, `queues`, `jti`);
++- totem exists and `is_active = true`;
++- preset exists and `is_active = true`;
++- claims, totem and preset all agree on the same entity.
++
++Any failure returns `401 {"code":"invalid_token"}`. The middleware quietly
++updates `totems.last_seen_at`.
++
++The **effective queue scope** is the intersection of the JWT `queues` claim
++with the preset's **current** `totem_preset_queue` rows. Removing a queue from
++the preset therefore takes effect immediately for tokens that are still valid.
++
++For all three endpoints, `{entity}` must equal the token's entity, otherwise
++`403 {"code":"forbidden"}`. `{queue}` is resolved **within that entity only**:
++not found (including another entity's slug) → `404 {"code":"queue_not_found"}`;
++found but outside the effective scope → `403 {"code":"forbidden"}`.
+ 
+ ## Read: queues
+ 
+-Lists queues available for issuance for the token's entity, with visual
+-specs so pegafila_totem can render each without hardcoding styles.
++Lists active queues in the token entity's effective scope, ordered by name,
++with visual specs so pegafila_totem can render each without hardcoding styles.
+ 
+ ```http
+ GET api/{entity}/queues
+@@ -186,15 +215,21 @@ ## Read: queues
+ 
+ Rules:
+ 
+-- `{entity}` must match the JWT's entity; mismatch → `403`.
+-- Only queues in the preset and active for issuance are returned, ordered
+-  for display (`visual.order`).
++- Only active queues in the preset scope of the token entity are returned.
++- The list is ordered by queue name; `visual.order` is the 1-based display
++  position in that list.
++- `label` is the queue name. `description`, `visual.color` and `visual.icon`
++  come from `totem_presets.appearance.queues.{slug}` when provided; otherwise
++  the backend supplies a deterministic default (`description` empty, a palette
++  colour, icon `ticket`).
+ - `visual` is presentation-only; ordering/calling always uses server-side
+   `tickets.priority` + `issued_at` + fairness rule.
+ 
+ ## Read: priorities
+ 
+ Lists priority levels allowed for a specific queue, with visual specs.
++Priorities are backend-owned: the same `App\Enums\TicketPriority` is used by
++this endpoint and by ticket issuance validation.
+ 
+ ```http
+ GET api/{entity}/{queue}/priorities
+@@ -217,6 +252,11 @@ ## Read: priorities
+       "value": 10,
+       "label": "Prioritário",
+       "visual": { "color": "#C62828", "icon": "priority", "order": 2 }
++    },
++    {
++      "value": 20,
++      "label": "Prioridade 80+",
++      "visual": { "color": "#6A1B9A", "icon": "elderly", "order": 3 }
+     }
+   ]
+ }
+@@ -224,15 +264,18 @@ ## Read: priorities
+ 
+ Rules:
+ 
+-- `{queue}` must belong to `{entity}` and to the JWT scope; otherwise
+-  `403`/`404` without leaking other entities' queues.
++- `{queue}` must belong to `{entity}` and to the effective JWT scope;
++  otherwise `403`/`404` without leaking other entities' queues.
++- An inactive queue returns `422 {"code":"inactive_queue"}`.
+ - `value` is the numeric priority stored on the ticket (higher = more
+-  prioritized); `label`/`visual` are display-only presets per entity.
++  prioritized); `label`/`visual` are display-only.
+ 
+ ## Write: issue ticket
+ 
+ Issues a ticket in a queue with a chosen priority. Server picks the
+-displayable slug/code; client only sends the priority value.
++displayable slug/code; the client only sends the priority value. The ticket is
++created through `App\Actions\IssueTicket` with channel `totem`, so inactive
++queue checks, code allocation and write-once rules stay in one place.
+ 
+ ```http
+ POST api/{entity}/{queue}/ticket
+@@ -256,24 +299,47 @@ ## Write: issue ticket
+ ```
+ 
+ `slug` is the code shown to the user on pegafila_totem (maps to
+-`tickets.code`). The client renders/prints it; it defines no ordering.
+-Codes are sequential per queue issuance window (`tickets (queue_id, code)`
+-unique per window, scope/format per queue/entity) — not globally
+-unpredictable.
++`tickets.code`). The client renders/prints it; it defines no ordering. Codes
++are sequential per queue (`A001`, `A002`, …).
+ 
+ Rules:
+ 
+-- Validate JWT → totem active → entity subscription allows operation →
+-  queue belongs to entity and preset → priority value allowed for queue.
+-- Ticket is single-use, write-once (except `called_at`/`called_by`);
+-  created transactionally with server-selected code.
+-- Failures use explicit codes: `403` scope/subscription, `404` unknown
+-  queue, `422` invalid priority, `429` rate-limited issuance.
++- Validate JWT → totem active → entity/preset/queue scope → priority value.
++- `priority` must be one of the backend values (`0`, `10`, `20`), otherwise
++  `422 {"code":"invalid_priority"}` and no ticket is created.
++- An inactive queue returns `422 {"code":"inactive_queue"}`.
++- Issuance is throttled at 30 requests/minute per client; over the limit returns
++  `429 {"code":"rate_limited"}`.
++- Ticket is single-use, write-once (except `called_at`/`called_by_user_id`);
++  created transactionally with the server-selected code.
++
++## CORS
++
++CORS applies to `api/*`:
++
++- allowed origins: `http(s)://localhost[:port]`, `http(s)://127.0.0.1[:port]`,
++  plus the optional `TOTEM_WEB_ORIGIN` env value;
++- any other origin receives **no** `Access-Control-Allow-Origin`;
++- credentials are not enabled;
++- allowed methods are `GET`, `POST`, `OPTIONS`, with `Authorization` and
++  `Content-Type` allowed headers.
++
++A preflight `OPTIONS /api/totem/auth` from `http://localhost:8081` returns
++`204` with `Access-Control-Allow-Origin: http://localhost:8081`.
++
++## Configuration
++
++| Env | Purpose | Default |
++| --- | ------- | ------- |
++| `TOTEM_JWT_SECRET` | HS256 signing secret (use 32+ random chars) | _(empty)_ |
++| `TOTEM_JWT_TTL` | JWT lifetime / `expires_in`, seconds | `3600` |
++| `TOTEM_WEB_ORIGIN` | Extra allowed CORS origin for the totem web build | _(empty)_ |
++
++`phpunit.xml` pins a test secret and TTL `3600`, so the suite does not need a
++local `.env` secret.
+ 
+-## Open questions
++## Out of scope
+ 
+-- [ ] JWT TTL/refresh strategy.
+-- [ ] Exact `appearance` / `visual` schema per queue/priority (color/icon/order set).
+-- [ ] `totems.api_token_hash` vs JWT `jti` — store hash for revocation lookup.
+-- [ ] `totem_presets` + `totem_preset_queue` migration (`php artisan make:migration`) + `database-schema.md` follow-up.
+-- [ ] Is the number of presets per entity limited by plan (`max_queues`-style)?
++Operator UI for presets/pairing, billing/subscription checks, refresh tokens,
++per-token revocation lists, printing payloads, and per-entity custom
++priorities.
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 19717be..f0cc45e 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -50,14 +50,33 @@ ### Queue and ticket domain
+ 
+ ### Totem API
+ 
+-The totem API is a stable boundary for the Flutter client. It should expose
++The totem API is a stable boundary for the Flutter client. It exposes
+ application-level operations rather than database implementation details.
+-Responses should be explicit about validation, authorization and business
+-failures, and must remain compatible with the multiplatform Flutter client.
+-
+-Device authentication is represented by the `totems` model in the proposed
+-schema. The API must never trust a client-provided entity, queue ownership,
+-price, ticket priority, or payment state without server-side validation.
++Responses are explicit about validation, authorization and business failures,
++and remain compatible with the multiplatform Flutter client. The implemented
++contract is [`api/totem.md`](api/totem.md).
++
++Routes are registered in `routes/api.php` under `/api`. There are exactly four
++calls: pairing login, queue listing, priority listing and ticket issuance.
++Ticket issuance delegates to `App\Actions\IssueTicket` with channel `totem`, so
++code allocation, inactive-queue checks and write-once rules are not duplicated
++in the API layer.
++
++Device authentication is represented by the `totems` model. An operator opens
++a 10-minute pairing window with `php artisan totem:pairing-code {preset}`; the
++preset's own single-use code is exchanged at `POST /api/totem/auth` for a
++stateless HS256 JWT. The token carries `totem_id`, `entity_id`, `preset_id` and
++the queue ids allowed at pairing time. The `totem.auth` middleware re-checks
++the totem/preset state on every call and intersects the token's queue claim
++with the preset's **current** queue join, so preset changes take effect
++immediately for existing tokens. The API never trusts a client-provided
++entity, queue ownership, price, ticket priority, or payment state without
++server-side validation; priorities are backend-owned values.
++
++Billing does not exist yet. The `entity_suspended` error is reserved and is
++never emitted. Pairing (10/min) and issuance (30/min) are rate-limited, and
++`api/*` answers CORS only for localhost/127.0.0.1 origins plus the optional
++`TOTEM_WEB_ORIGIN`.
+ 
+ ### Billing
+ 
+@@ -74,6 +93,30 @@ ### Observability
+ 
+ ## Request flows
+ 
++### Pair a totem
++
++```text
++Operator
++   |
++   v
++php artisan totem:pairing-code {preset}
++   |
++   v
++Generate preset-owned 6-digit code (10 min, single-use, audit log)
++   |
++   v
++Totem POST /api/totem/auth {code}
++   |
++   v
++Lock preset row + validate code (format/unknown/expired/consumed/inactive)
++   |
++   v
++Consume code + create totems row + sign HS256 JWT
++   |
++   v
++Return token, expiry and entity slug/name
++```
++
+ ### Issue a ticket
+ 
+ ```text
+@@ -86,7 +129,7 @@ ### Issue a ticket
+ Authenticate + authorize
+         |
+         v
+-Validate entity / queue / subscription limits
++Validate entity / queue / preset scope (billing check reserved)
+         |
+         v
+ Create ticket with server-selected code and priority
+diff --git a/docs/database-schema.md b/docs/database-schema.md
+index acaf3b6..523284f 100644
+--- a/docs/database-schema.md
++++ b/docs/database-schema.md
+@@ -2,7 +2,7 @@ # Database Schema — PegaFila
+ 
+ Relational model derived from [`business-rules.md`](business-rules.md).
+ 
+-**Core tables migrated:** `entities`, `entity_memberships`, `queues`, `tickets`, and `queue_access` have reversible Laravel migrations and Eloquent models. Billing (`plans`, `billing_accounts`, `subscriptions`, `payments`, `payment_options`) and `totems` remain schema proposals only — not yet migrated.
++**Core tables migrated:** `entities`, `entity_memberships`, `queues`, `tickets`, `queue_access`, `totems`, `totem_presets`, and `totem_preset_queue` have reversible Laravel migrations and Eloquent models. Billing (`plans`, `billing_accounts`, `subscriptions`, `payments`, `payment_options`) remains a schema proposal — not yet migrated.
+ 
+ ## ER Diagram
+ 
+@@ -21,6 +21,9 @@ ## ER Diagram
+     queues ||--o{ queue_access : "accessible via"
+     users ||--o{ tickets : "calls"
+     entities ||--o{ totems : "registers"
++    entities ||--o{ totem_presets : "configures"
++    totem_presets ||--o{ totem_preset_queue : "scopes"
++    queues ||--o{ totem_preset_queue : "visible via"
+ 
+     plans {
+         bigint id PK
+@@ -120,9 +123,28 @@ ## ER Diagram
+         bigint id PK
+         bigint entity_id FK
+         string name
+-        string api_token_hash
+         bool is_active
+         datetime last_seen_at
++        datetime created_at
++        datetime updated_at
++    }
++    totem_presets {
++        bigint id PK
++        bigint entity_id FK
++        string name
++        string login_code UK
++        datetime login_code_expires_at
++        datetime login_code_consumed_at
++        json appearance
++        bool is_active
++        datetime created_at
++        datetime updated_at
++    }
++    totem_preset_queue {
++        bigint preset_id PK,FK
++        bigint queue_id PK,FK
++        datetime created_at
++        datetime updated_at
+     }
+ ```
+ 
+@@ -141,16 +163,20 @@ ## Main Relationships
+ | `queue_access` | join 1:N/1:N | Employee: granular permissions per queue (`permissions` JSON, MVP vocabulary `call` only); UK `(entity_membership_id, queue_id)`; both FKs `cascadeOnDelete` |
+ | `queues` → `tickets` | 1 : N | Ticket belongs to **one** queue; ordering by `priority` (desc) + `issued_at` (asc) |
+ | `users` → `tickets` | 1 : N | `called_by_user_id`: attendant who called the ticket |
+-| `totems` | per entity | Device registration for API auth; **no** ticket relationship |
++| `entities` → `totems` | 1 : N | Each row is one paired device; JWT identifies it at runtime |
++| `entities` → `totem_presets` | 1 : N | Server-side totem settings bundle; owns its single-use login code |
++| `totem_presets` ↔ `queues` | N : N | `totem_preset_queue` (`preset_id`, `queue_id`) defines visible/issuable queues; composite PK, both FKs `cascadeOnDelete` |
+ 
+ ## Modeling Notes
+ 
+ - **Account vs member:** `users` is the login account (Laravel Auth); `entity_memberships` is the user's link to the entity with role.
+ - **User↔entity cardinality:** `entity_memberships` is N:N by design (allows future multi-entity). In MVP, "one user per entity" rule is enforced in application; no global UK on `user_id`.
+ - **Owner invariant:** `entities` has no `owner_membership_id` FK. The single-owner constraint lives on `entity_memberships` via `entities.owner_seq` (generated `CASE WHEN role='owner' THEN 1 ELSE NULL END`) and a unique `(entity_id, owner_seq)` index — portable across SQLite + MySQL. Bootstrapping creates the entity then its owner row in one transaction; ownership transfer demotes the old owner to `admin` and promotes the target `admin` to `owner` in the same transaction. The generated column goes NULL during both steps, so the transient no-owner state is allowed (only a 2nd `role='owner'` row for the same entity collides).
+-- **Numeric priority:** `tickets.priority` is an integer — **higher value, more prioritized**. Named levels (normal/priority/80+) are configurable presets per entity mapping to values; sorting uses the number.
++- **Numeric priority:** `tickets.priority` is an integer — **higher value, more prioritized**. The totem API exposes the backend-owned levels `0` Normal, `10` Prioritário and `20` Prioridade 80+ (`App\Enums\TicketPriority`); issuance validation and the priorities endpoint share that single source. Sorting still uses the number.
+ - **Ticket write-once:** ticket is **single-use** and receives **one single call**. All fields are immutable after issuance, **except** `called_at` and `called_by_user_id`, filled at call time. No call history table.
+ - **Ticket ↔ totem:** ticket knows only its **queue** (`queue_id`). `channel` records origin type; no FK to `totems`.
++- **Totem auth:** `totems` stores no password/token hash. Pairing issues a stateless HS256 JWT whose claims carry `totem_id`, `entity_id`, `preset_id` and the queue ids allowed at pairing time. Runtime authorization intersects that claim with the preset's current `totem_preset_queue` rows; deactivating the totem or preset invalidates access on the next call. `last_seen_at` is refreshed by the auth middleware.
++- **Preset pairing code:** `totem_presets.login_code` is unique, nullable, single-use, 6 digits, with a 10-minute expiry. `login_code_consumed_at` is set atomically on successful pairing; regenerating replaces the code and clears the consumed timestamp.
+ - **Ticket `code`:** displayable password (e.g., `A012`) shown on totem/TV; scope and format per queue/entity.
+ - **Fairness:** 3-ticket priority fairness rule calculated in domain (queue state), no extra table.
+ - **Separated finance:** `billing_accounts` (1:0..1 with entity) + `subscriptions` + `plans` isolate financial model. Entity without billing can be created and tested without payment configuration. `payment_options` defines cycle (MONTHLY/ANNUAL), method (PIX/CARD/BOLETO), discount and refund window. `payments` tracks individual charges with `due_date`, `paid_at`, `refund_deadline`. Asaas webhooks update `status` idempotently. `asaas_customer_id` in `billing_accounts`; `asaas_subscription_id` in `subscriptions`; `asaas_payment_id` in `payments`.
+@@ -159,5 +185,5 @@ ## Modeling Notes
+ - **Payments:** `payments` tracks each charge generated by subscription; status synced with Asaas (PENDING, RECEIVED, REFUNDED, CANCELED, OVERDUE).
+ - **Billing account:** `cpf_cnpj` stores fiscal data for invoice generation.
+ - **Enums:** `role` (`admin`, `owner`, `employee`); `tickets.channel` (`totem`, `virtual`, `printed`); `tickets.status` (`waiting`, `called`); `subscriptions.status` — remaining values in business rules.
+-- **Unique constraints:** `billing_accounts (entity_id)`; `entity_memberships (entity_id, user_id)`; `queues (entity_id, slug)`; `queue_access (entity_membership_id, queue_id)`; `tickets (queue_id, code)` per issuance window; `payments (asaas_payment_id)`; `subscriptions (billing_account_id)` (1:1).
++- **Unique constraints:** `billing_accounts (entity_id)`; `entity_memberships (entity_id, user_id)`; `queues (entity_id, slug)`; `queue_access (entity_membership_id, queue_id)`; `tickets (queue_id, code)` per issuance window; `payments (asaas_payment_id)`; `subscriptions (billing_account_id)` (1:1); `totem_presets (login_code)`; `totem_preset_queue (preset_id, queue_id)` composite PK.
+ - **Suggested indexes:** `(queue_id, status, priority, issued_at)` on `tickets`.
+\ No newline at end of file
+diff --git a/phpunit.xml b/phpunit.xml
+index 232329c..8a6a998 100644
+--- a/phpunit.xml
++++ b/phpunit.xml
+@@ -42,5 +42,8 @@
+         <server name="TELESCOPE_ENABLED" value="false" force="true"/>
+         <server name="NIGHTWATCH_ENABLED" value="false" force="true"/>
+         <server name="LOG_STACK" value="daily"/>
++        <server name="TOTEM_JWT_SECRET" value="testing-totem-secret-at-least-32-characters-long" force="true"/>
++        <server name="TOTEM_JWT_TTL" value="3600" force="true"/>
++        <server name="TOTEM_WEB_ORIGIN" value="" force="true"/>
+     </php>
+ </phpunit>
+diff --git a/routes/api.php b/routes/api.php
+new file mode 100644
+index 0000000..7033b13
+--- /dev/null
++++ b/routes/api.php
+@@ -0,0 +1,21 @@
++<?php
++
++use App\Http\Controllers\Api\TotemAuthController;
++use App\Http\Controllers\Api\TotemQueueController;
++use Illuminate\Support\Facades\Route;
++
++Route::post('/totem/auth', [TotemAuthController::class, 'login'])
++    ->middleware('throttle:10,1')
++    ->name('totem.auth');
++
++Route::middleware('totem.auth')->group(function () {
++    Route::get('/{entity}/queues', [TotemQueueController::class, 'queues'])
++        ->name('totem.queues');
++
++    Route::get('/{entity}/{queue}/priorities', [TotemQueueController::class, 'priorities'])
++        ->name('totem.priorities');
++
++    Route::post('/{entity}/{queue}/ticket', [TotemQueueController::class, 'ticket'])
++        ->middleware('throttle:30,1')
++        ->name('totem.ticket');
++});
+diff --git a/tests/Feature/Totem/TotemApiTest.php b/tests/Feature/Totem/TotemApiTest.php
+new file mode 100644
+index 0000000..6c98a45
+--- /dev/null
++++ b/tests/Feature/Totem/TotemApiTest.php
+@@ -0,0 +1,345 @@
++<?php
++
++use App\Enums\TicketChannel;
++use App\Models\Entity;
++use App\Models\Queue;
++use App\Models\Ticket;
++use App\Models\Totem;
++use App\Models\TotemPreset;
++use App\Support\TotemJwt;
++use Illuminate\Foundation\Testing\RefreshDatabase;
++
++uses(RefreshDatabase::class);
++
++function totemFeatureTokenForPreset(TotemPreset $preset, array $queueIds = []): string
++{
++    $totem = Totem::factory()->for($preset->entity)->create();
++
++    return app(TotemJwt::class)->issue([
++        'totem_id' => $totem->id,
++        'entity_id' => $preset->entity_id,
++        'preset_id' => $preset->id,
++        'queues' => $queueIds,
++    ]);
++}
++
++it('rejects malformed pairing codes', function (mixed $code) {
++
++    $this->postJson('/api/totem/auth', ['code' => $code])
++        ->assertStatus(400)
++        ->assertExactJson(['code' => 'invalid_code_format']);
++})->with([
++    'empty' => '',
++    'short' => '12345',
++    'long' => '1234567',
++    'letters' => '12a456',
++    'missing' => null,
++]);
++
++it('pairs a preset and returns the token plus entity', function () {
++    $preset = TotemPreset::factory()->create();
++    $queue = Queue::factory()->for($preset->entity)->create();
++    $preset->queues()->attach($queue);
++
++    $response = $this->postJson('/api/totem/auth', ['code' => $preset->login_code]);
++
++    $response->assertOk()
++        ->assertJsonPath('token_type', 'Bearer')
++        ->assertJsonPath('expires_in', 3600)
++        ->assertJsonPath('entity.slug', $preset->entity->slug)
++        ->assertJsonPath('entity.name', $preset->entity->name);
++
++    $claims = app(TotemJwt::class)->decode($response->json('token'));
++
++    expect($claims)
++        ->toHaveKeys(['totem_id', 'entity_id', 'preset_id', 'queues', 'iat', 'exp', 'jti'])
++        ->entity_id->toBe($preset->entity_id)
++        ->preset_id->toBe($preset->id)
++        ->queues->toBe([$queue->id]);
++
++    $totem = Totem::query()->findOrFail($claims['totem_id']);
++    expect($totem)
++        ->entity_id->toBe($preset->entity_id)
++        ->is_active->toBeTrue()
++        ->last_seen_at->not->toBeNull();
++
++    expect($preset->fresh()->login_code_consumed_at)->not->toBeNull();
++});
++
++it('rejects unknown, expired, consumed and inactive presets identically', function (string $state) {
++    $preset = TotemPreset::factory()->create();
++
++    if ($state === 'expired') {
++        $preset->update(['login_code_expires_at' => now()->subMinute()]);
++    }
++
++    if ($state === 'consumed') {
++        $preset->update(['login_code_consumed_at' => now()]);
++    }
++
++    if ($state === 'inactive') {
++        $preset->update(['is_active' => false]);
++    }
++
++    $code = $state === 'unknown' ? '999999' : $preset->login_code;
++
++    $this->postJson('/api/totem/auth', ['code' => $code])
++        ->assertStatus(401)
++        ->assertExactJson(['code' => 'invalid_pairing_code']);
++
++    expect(Totem::query()->count())->toBe(0);
++})->with(['unknown', 'expired', 'consumed', 'inactive']);
++
++it('throttles pairing attempts', function () {
++    $preset = TotemPreset::factory()->create();
++
++    for ($i = 0; $i < 10; $i++) {
++        $this->postJson('/api/totem/auth', ['code' => '000000'])->assertStatus(401);
++    }
++
++    $this->postJson('/api/totem/auth', ['code' => '000000'])
++        ->assertStatus(429)
++        ->assertExactJson(['code' => 'rate_limited']);
++});
++
++it('rejects missing invalid expired and inconsistent tokens', function (string $kind) {
++    $preset = TotemPreset::factory()->create();
++    $totem = Totem::factory()->for($preset->entity)->create();
++    $jwt = app(TotemJwt::class);
++
++    $claims = [
++        'totem_id' => $totem->id,
++        'entity_id' => $preset->entity_id,
++        'preset_id' => $preset->id,
++        'queues' => [],
++    ];
++
++    $token = match ($kind) {
++        'missing' => null,
++        'invalid' => 'not-a-token',
++        'expired' => (function () use ($jwt, $claims) {
++            config(['services.totem.jwt_ttl' => -3600]);
++
++            return $jwt->issue($claims);
++        })(),
++        'inactive_totem' => (function () use ($totem, $jwt, $claims) {
++            $totem->update(['is_active' => false]);
++
++            return $jwt->issue($claims);
++        })(),
++        'inactive_preset' => (function () use ($preset, $jwt, $claims) {
++            $preset->update(['is_active' => false]);
++
++            return $jwt->issue($claims);
++        })(),
++        'entity_mismatch' => $jwt->issue(array_merge($claims, [
++            'entity_id' => Entity::factory()->create()->id,
++        ])),
++    };
++
++    $headers = $token === null ? [] : ['Authorization' => "Bearer {$token}"];
++
++    $this->getJson("/api/{$preset->entity->slug}/queues", $headers)
++        ->assertStatus(401)
++        ->assertExactJson(['code' => 'invalid_token']);
++})->with(['missing', 'invalid', 'expired', 'inactive_totem', 'inactive_preset', 'entity_mismatch']);
++
++it('lists only active scoped queues ordered by name with display order', function () {
++    $preset = TotemPreset::factory()->create();
++    $entity = $preset->entity;
++
++    $second = Queue::factory()->for($entity)->create(['name' => 'Zebra', 'slug' => 'zebra']);
++    $first = Queue::factory()->for($entity)->create(['name' => 'Alpha', 'slug' => 'alpha']);
++    $inactive = Queue::factory()->for($entity)->create(['name' => 'Beta', 'slug' => 'beta', 'is_active' => false]);
++    $outside = Queue::factory()->for($entity)->create(['name' => 'Outside', 'slug' => 'outside']);
++
++    $preset->queues()->attach([$second->id, $first->id, $inactive->id]);
++    $token = totemFeatureTokenForPreset($preset, [$second->id, $first->id, $inactive->id, $outside->id]);
++
++    $this->getJson("/api/{$entity->slug}/queues", ['Authorization' => "Bearer {$token}"])
++        ->assertOk()
++        ->assertJsonPath('entity.slug', $entity->slug)
++        ->assertJsonCount(2, 'queues')
++        ->assertJsonPath('queues.0.slug', 'alpha')
++        ->assertJsonPath('queues.0.label', 'Alpha')
++        ->assertJsonPath('queues.0.visual.order', 1)
++        ->assertJsonPath('queues.1.slug', 'zebra')
++        ->assertJsonPath('queues.1.visual.order', 2)
++        ->assertJsonPath('queues.0.is_active', true)
++        ->assertJsonStructure(['queues' => [['slug', 'label', 'description', 'visual' => ['color', 'icon', 'order']]]]);
++});
++
++it('intersects the token scope with the preset current queues', function () {
++    $preset = TotemPreset::factory()->create();
++    $entity = $preset->entity;
++    $kept = Queue::factory()->for($entity)->create(['slug' => 'kept']);
++    $removed = Queue::factory()->for($entity)->create(['slug' => 'removed']);
++
++    $preset->queues()->attach([$kept->id, $removed->id]);
++    $token = totemFeatureTokenForPreset($preset, [$kept->id, $removed->id]);
++    $preset->queues()->detach($removed);
++
++    $this->getJson("/api/{$entity->slug}/queues", ['Authorization' => "Bearer {$token}"])
++        ->assertOk()
++        ->assertJsonCount(1, 'queues')
++        ->assertJsonPath('queues.0.slug', 'kept');
++
++    $this->getJson("/api/{$entity->slug}/removed/priorities", ['Authorization' => "Bearer {$token}"])
++        ->assertStatus(403)
++        ->assertExactJson(['code' => 'forbidden']);
++});
++
++it('returns the backend-owned priorities', function () {
++    $preset = TotemPreset::factory()->create();
++    $queue = Queue::factory()->for($preset->entity)->create(['slug' => 'geral']);
++    $preset->queues()->attach($queue);
++    $token = totemFeatureTokenForPreset($preset, [$queue->id]);
++
++    $this->getJson("/api/{$preset->entity->slug}/geral/priorities", ['Authorization' => "Bearer {$token}"])
++        ->assertOk()
++        ->assertJsonPath('entity.slug', $preset->entity->slug)
++        ->assertJsonPath('queue.slug', 'geral')
++        ->assertJsonPath('queue.label', $queue->name)
++        ->assertJsonPath('priorities.0.value', 0)
++        ->assertJsonPath('priorities.0.label', 'Normal')
++        ->assertJsonPath('priorities.1.value', 10)
++        ->assertJsonPath('priorities.1.label', 'Prioritário')
++        ->assertJsonPath('priorities.2.value', 20)
++        ->assertJsonPath('priorities.2.label', 'Prioridade 80+')
++        ->assertJsonCount(3, 'priorities');
++});
++
++it('returns inactive_queue for priorities of an inactive queue', function () {
++    $preset = TotemPreset::factory()->create();
++    $queue = Queue::factory()->for($preset->entity)->create(['slug' => 'old', 'is_active' => false]);
++    $preset->queues()->attach($queue);
++    $token = totemFeatureTokenForPreset($preset, [$queue->id]);
++
++    $this->getJson("/api/{$preset->entity->slug}/old/priorities", ['Authorization' => "Bearer {$token}"])
++        ->assertStatus(422)
++        ->assertExactJson(['code' => 'inactive_queue']);
++});
++
++it('issues sequential totem tickets with a valid priority', function () {
++    $preset = TotemPreset::factory()->create();
++    $queue = Queue::factory()->for($preset->entity)->create(['slug' => 'geral']);
++    $preset->queues()->attach($queue);
++    $token = totemFeatureTokenForPreset($preset, [$queue->id]);
++    $headers = ['Authorization' => "Bearer {$token}"];
++
++    $this->postJson("/api/{$preset->entity->slug}/geral/ticket", ['priority' => 10], $headers)
++        ->assertCreated()
++        ->assertJsonPath('slug', 'A001')
++        ->assertJsonPath('queue.slug', 'geral')
++        ->assertJsonPath('priority.value', 10)
++        ->assertJsonPath('priority.label', 'Prioritário')
++        ->assertJsonStructure(['slug', 'queue' => ['slug', 'label'], 'priority' => ['value', 'label'], 'issued_at']);
++
++    $this->postJson("/api/{$preset->entity->slug}/geral/ticket", ['priority' => 0], $headers)
++        ->assertCreated()
++        ->assertJsonPath('slug', 'A002')
++        ->assertJsonPath('priority.label', 'Normal');
++
++    $ticket = Ticket::query()->firstOrFail();
++
++    expect($ticket->channel)->toBe(TicketChannel::Totem)
++        ->and($ticket->priority)->toBe(10);
++});
++
++it('rejects invalid priorities without creating a ticket', function (mixed $priority) {
++    $preset = TotemPreset::factory()->create();
++    $queue = Queue::factory()->for($preset->entity)->create(['slug' => 'geral']);
++    $preset->queues()->attach($queue);
++    $token = totemFeatureTokenForPreset($preset, [$queue->id]);
++
++    $this->postJson(
++        "/api/{$preset->entity->slug}/geral/ticket",
++        ['priority' => $priority],
++        ['Authorization' => "Bearer {$token}"],
++    )->assertStatus(422)->assertExactJson(['code' => 'invalid_priority']);
++
++    expect(Ticket::query()->count())->toBe(0);
++})->with([5, -10, 100, 'abc', null, true]);
++
++it('rejects tickets into inactive queues', function () {
++    $preset = TotemPreset::factory()->create();
++    $queue = Queue::factory()->for($preset->entity)->create(['slug' => 'old', 'is_active' => false]);
++    $preset->queues()->attach($queue);
++    $token = totemFeatureTokenForPreset($preset, [$queue->id]);
++
++    $this->postJson(
++        "/api/{$preset->entity->slug}/old/ticket",
++        ['priority' => 0],
++        ['Authorization' => "Bearer {$token}"],
++    )->assertStatus(422)->assertExactJson(['code' => 'inactive_queue']);
++
++    expect(Ticket::query()->count())->toBe(0);
++});
++
++it('does not leak another entity queue or entity', function () {
++    $preset = TotemPreset::factory()->create();
++    $otherEntity = Entity::factory()->create();
++    $otherQueue = Queue::factory()->for($otherEntity)->create(['slug' => 'other']);
++    $token = totemFeatureTokenForPreset($preset, [$otherQueue->id]);
++
++    $this->getJson(
++        "/api/{$preset->entity->slug}/other/priorities",
++        ['Authorization' => "Bearer {$token}"],
++    )->assertStatus(404)->assertExactJson(['code' => 'queue_not_found']);
++
++    $this->getJson(
++        "/api/{$otherEntity->slug}/queues",
++        ['Authorization' => "Bearer {$token}"],
++    )->assertStatus(403)->assertExactJson(['code' => 'forbidden']);
++});
++
++it('answers cors only for allowed local origins', function () {
++    $this->call('OPTIONS', '/api/totem/auth', [], [], [], [
++        'HTTP_ORIGIN' => 'http://localhost:8081',
++        'HTTP_ACCESS_CONTROL_REQUEST_METHOD' => 'POST',
++    ])->assertStatus(204)
++        ->assertHeader('Access-Control-Allow-Origin', 'http://localhost:8081');
++
++    $this->getJson('/api/totem/auth', [
++        'Origin' => 'https://127.0.0.1:9000',
++    ])->assertHeader('Access-Control-Allow-Origin', 'https://127.0.0.1:9000');
++
++    $evil = $this->getJson('/api/totem/auth', [
++        'Origin' => 'https://evil.example',
++    ]);
++    $evil->assertHeaderMissing('Access-Control-Allow-Origin');
++});
++
++it('generates pairing codes through the artisan command', function () {
++    $preset = TotemPreset::factory()->create([
++        'login_code' => '000000',
++        'login_code_consumed_at' => now(),
++    ]);
++
++    $this->artisan('totem:pairing-code', ['preset' => $preset->id])
++        ->assertSuccessful()
++        ->expectsOutputToContain('Pairing code');
++
++    $fresh = $preset->fresh();
++
++    expect($fresh->login_code)->toMatch('/^\d{6}$/')
++        ->and($fresh->login_code_expires_at)->not->toBeNull()
++        ->and($fresh->login_code_consumed_at)->toBeNull();
++});
++
++it('fails the pairing command for an unknown preset', function () {
++    $this->artisan('totem:pairing-code', ['preset' => 999999])
++        ->assertFailed()
++        ->expectsOutputToContain('Unknown totem preset');
++});
++
++it('exposes the preset queue relation usable with attach and detach', function () {
++    $preset = TotemPreset::factory()->create();
++    $queue = Queue::factory()->for($preset->entity)->create();
++
++    $preset->queues()->attach($queue);
++    expect($preset->fresh()->queues)->toHaveCount(1);
++
++    $preset->queues()->detach($queue);
++    expect($preset->fresh()->queues)->toHaveCount(0);
++});
