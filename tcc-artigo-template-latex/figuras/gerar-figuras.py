@@ -8,7 +8,11 @@ Fontes de dados (somente leitura):
   - benchmark/runs/report.csv                  pass@1, turnos e tokens por run
   - benchmark/quality (pacote Python)           seleção dos runs, par de juízes atribuído,
                                                 revisões, static.jsonl e conventions.jsonl
-  - benchmark/runs/quality/report-full.md       valores de Δ e p da tabela de efeitos (F6)
+  - benchmark/runs/quality/self-family/         revisão do juiz da mesma família (juizes.py)
+
+As notas dos juízes (F5, F6, F8) usam a média de TODOS os juízes de cada execução, incluindo o
+da mesma família do autor, como no artigo (ver calcular-tabelas.py); report-full.md usa só os
+dois juízes de fora da família.
 
 Os agregados usados em cada figura são impressos no terminal para conferência com
 runs/reduced-1-report.md e runs/quality/report-full.md.
@@ -34,8 +38,10 @@ BENCH = ROOT / "benchmark"
 OUT = HERE / "04-desenvolvimento"
 OUT.mkdir(exist_ok=True)
 sys.path.insert(0, str(BENCH))
+sys.path.insert(0, str(HERE))
 
 from quality import analysis, selection  # noqa: E402
+import juizes  # noqa: E402
 
 # --- paleta (dataviz: categórica em ordem fixa; status; sequencial azul) -----------------------
 CAT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
@@ -146,14 +152,12 @@ def fig_mosaico(rows):
 
 
 # --- F5: nota geral dos juízes e casos de teste por modelo x nível -----------------------------
-def fig_qualidade_modelo(runs):
-    data = analysis.load(list(runs.values()))
-    fns = analysis.metric_fns()
+def fig_qualidade_modelo(data):
     static = static_by_run()
     nota = collections.defaultdict(list); testes = collections.defaultdict(list)
     for rid, d in data.items():
         m, lv = d["run"].model, d["run"].level
-        v = fns["juízes: nota geral"](d)
+        v = juizes.judge_mean(d, "overall")
         if v is not None: nota[(m, lv)].append(v)
         t = static.get(rid, {}).get("test_cases_added")
         if t is not None: testes[(m, lv)].append(t)
@@ -177,20 +181,11 @@ def fig_qualidade_modelo(runs):
     save(fig, "fig-qualidade-modelo.pdf")
 
 
-# --- F6: Δ por dimensão dos juízes vs none (valores de report-full.md) -------------------------
-EFEITOS = {  # dimensão: {nível: (Δ, p)}  -- runs/quality/report-full.md, seção "Efeito de cada nível"
-    "Nota geral":   {"agents": (0.31, 0.001), "skills": (0.34, 0.001), "full": (0.33, 0.000)},
-    "Requisitos":   {"agents": (0.02, 0.313), "skills": (-0.04, 0.732), "full": (0.01, 0.815)},
-    "Convenções":   {"agents": (0.44, 0.000), "skills": (0.51, 0.000), "full": (0.46, 0.000)},
-    "Segurança":    {"agents": (0.08, 0.230), "skills": (0.12, 0.056), "full": (0.07, 0.171)},
-    "Testes":       {"agents": (0.67, 0.000), "skills": (0.82, 0.000), "full": (0.56, 0.000)},
-    "Simplicidade": {"agents": (0.13, 0.057), "skills": (0.04, 0.557), "full": (0.09, 0.101)},
-    "Legibilidade": {"agents": (0.13, 0.020), "skills": (0.06, 0.195), "full": (0.11, 0.042)},
-    "Escopo":       {"agents": (0.01, 0.659), "skills": (-0.01, 0.638), "full": (0.03, 0.559)},
-}
-
-
-def fig_efeito_dimensoes():
+# --- F6: Δ por dimensão dos juízes vs none (Wilcoxon exato, 70 pares; média de todos os juízes) --
+def fig_efeito_dimensoes(data):
+    ef = juizes.efeitos(data)
+    EFEITOS = {juizes.PT[dim]: {lv: ef[(dim, lv)][:2] for lv in ("agents", "skills", "full")}
+               for dim in ["overall"] + juizes.DIMS}
     dims = list(EFEITOS)
     fig, ax = plt.subplots(figsize=(6.3, 3.0))
     offs = {"agents": -0.22, "skills": 0.0, "full": 0.22}
@@ -212,7 +207,8 @@ def fig_efeito_dimensoes():
     handles += [Line2D([], [], marker="o", color=INK2, ms=6, lw=0, label="p < 0,05"),
                 Line2D([], [], marker="o", color=INK2, markerfacecolor="white", ms=6, lw=0, label="p ≥ 0,05")]
     ax.legend(handles=handles, loc="lower right", ncol=2)
-    print("F6: valores transcritos de report-full.md")
+    for dim in dims:
+        print(f"F6 {dim:13s}", {lv: (round(d, 2), round(p, 3)) for lv, (d, p) in EFEITOS[dim].items()})
     save(fig, "fig-efeito-dimensoes.pdf")
 
 
@@ -244,8 +240,7 @@ def fig_custo(rows):
 
 
 # --- F8: concordância entre juízes (nota geral) -----------------------------------------------
-def fig_concordancia(runs):
-    data = analysis.load(list(runs.values()))
+def fig_concordancia(data):
     pairs = [("opus", "muse"), ("opus", "deepseek"), ("muse", "deepseek")]
     names = {"opus": "Opus 5.5", "muse": "Muse Spark 1.3", "deepseek": "DeepSeek v4.1 flash"}
     fig, axes = plt.subplots(1, 3, figsize=(6.3, 2.5), gridspec_kw={"wspace": 0.3})
@@ -274,8 +269,10 @@ def fig_concordancia(runs):
 if __name__ == "__main__":
     rows, runs = round_rows()
     print("runs da rodada:", len(rows))
+    data = juizes.load_all_judges(list(runs.values()))
+    print("revisões de juízes:", sum(len(d["reviews"]) for d in data.values()))
     fig_mosaico(rows)
-    fig_qualidade_modelo(runs)
-    fig_efeito_dimensoes()
+    fig_qualidade_modelo(data)
+    fig_efeito_dimensoes(data)
     fig_custo(rows)
-    fig_concordancia(runs)
+    fig_concordancia(data)
