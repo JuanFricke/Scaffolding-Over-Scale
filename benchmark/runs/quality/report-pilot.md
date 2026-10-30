@@ -217,6 +217,18 @@ Viés de cada juiz (média da nota geral que dá − média das duas notas do me
 | juízes: nota geral | Larastan: erros novos | -0.53 | 45 |
 | convenções (escore) | hidden_ok | 0.25 | 46 |
 
+## Autopreferência: juiz da mesma família vs os dois de fora
+
+Revisões extras, fora das médias acima: Opus nos diffs de Sonnet/Haiku, Muse nos do Muse e DeepSeek nos do DeepSeek. Δ = nota do juiz da família − média dos dois juízes de outras famílias no mesmo run (Wilcoxon exato pareado).
+
+| juiz | autores | n | Δ geral | p | leniência fora da família | autopreferência | Δ requirements | Δ conventions | Δ security | Δ tests | Δ simplicity | Δ readability | Δ scope |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| opus | Haiku 5.5, Sonnet 5.5 | 16 | -0.06 | 0.766 | -0.20 | +0.14 | -0.12 | -0.19 | -0.06 | +0.03 | -0.34 | -0.31 | +0.00 |
+| muse | Muse Spark 1.3 | 8 | -0.06 | 1.000 | +0.26 | -0.32 | +0.00 | +0.94 | +0.00 | +0.06 | +0.56 | +0.50 | +0.19 |
+| deepseek | DeepSeek v4.1 flash | 8 | +0.25 | 0.312 | -0.08 | +0.33 | -0.19 | -0.19 | -0.06 | -0.06 | +0.06 | -0.12 | +0.00 |
+
+Leniência fora da família: média de (nota do juiz − nota do outro juiz) nos runs de outras famílias, ou seja, o quanto ele já é mais generoso em geral. Autopreferência = Δ geral − leniência. Os Δ por dimensão não descontam a leniência.
+
 ## Convenções: quantas vezes cada regra se aplicou e foi cumprida
 
 | regra | descrição | aplica | cumpre |

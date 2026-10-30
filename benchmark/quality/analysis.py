@@ -254,7 +254,7 @@ def build(runs, name: str = "pilot") -> str:
         lenient = mean([d["reviews"][j]["overall"] - next(x["overall"] for k, x in d["reviews"].items() if k != j)
                         for d in data.values() if j in d["reviews"] and len(d["reviews"]) == 2])
         out(f"| {j} | {', '.join(authors)} | {len(rows)} | {statistics.mean(diffs):+.2f} | {p:.3f} | "
-            f"{fmt(lenient, 2)} | {statistics.mean(diffs) - (lenient or 0):+.2f} | "
+            f"{"–" if lenient is None else f"{lenient:+.2f}"} | {statistics.mean(diffs) - (lenient or 0):+.2f} | "
             + " | ".join(f"{x:+.2f}" for x in dims) + " |")
     out("")
     out("Leniência fora da família: média de (nota do juiz − nota do outro juiz) nos runs de outras "
