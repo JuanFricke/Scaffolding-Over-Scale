@@ -98,9 +98,17 @@ def kappa_quadratic(xs, ys, k: int = 5):
 
 # --- data --------------------------------------------------------------------------------------
 
-def load(runs) -> dict[str, dict]:
+def load(runs, all_judges: bool = False) -> dict[str, dict]:
+    """Per run: layers 1-2 and the judge reviews.
+
+    d["cross"] always holds the two judges of other families (the assigned pair); d["reviews"] is
+    what the metrics average over: the same pair, or, with all_judges, the pair plus the same-family
+    judge's review from runs/quality/self-family/ when it exists (the article's rule, Juan's decision,
+    2026-10-30; gpt-oss and Beam have no same-family judge).
+    """
     out = {}
     reviews_dir = judge.paths(None)["reviews"]
+    self_dir = judge.paths(None, self_family=True)["reviews"]
     # only the pair assigned on this run set: the pilot's gpt-oss/Beam rotation differs from the full one
     assigned = judge.assign(runs)
     for r in runs:
@@ -112,6 +120,13 @@ def load(runs) -> dict[str, dict]:
         for f in reviews_dir.glob(f"{r.run_id}__*.json"):
             rv = json.loads(f.read_text())
             if rv["judge"] in assigned[r.run_id]:
+                d["reviews"][rv["judge"]] = rv["review"]
+        d["cross"] = dict(d["reviews"])
+        d["self_judge"] = judge.self_judge(r)
+        if all_judges and d["self_judge"]:
+            f = self_dir / f"{r.run_id}__{d['self_judge']}.json"
+            if f.exists():
+                rv = json.loads(f.read_text())
                 d["reviews"][rv["judge"]] = rv["review"]
         out[r.run_id] = d
     return out
@@ -142,8 +157,8 @@ def fmt(x, nd=2):
     return "–" if x is None else f"{x:.{nd}f}"
 
 
-def build(runs, name: str = "pilot") -> str:
-    data = load(runs)
+def build(runs, name: str = "pilot", all_judges: bool = False) -> str:
+    data = load(runs, all_judges)
     fns = metric_fns()
     by = defaultdict(dict)
     for d in data.values():
@@ -152,10 +167,19 @@ def build(runs, name: str = "pilot") -> str:
     L = []
     out = L.append
     n_rev = sum(len(d["reviews"]) for d in data.values())
-    out(f"# Qualidade de código ({name})\n")
+    out(f"# Qualidade de código ({name}{', todos os juízes' if all_judges else ''})\n")
+    n3 = sum(1 for d in data.values() if len(d["reviews"]) >= 3)
     out(f"{len(data)} runs; {sum(1 for d in data.values() if d['conventions'])} com convenções, "
         f"{sum(1 for d in data.values() if d['static'] and 'error' not in d['static'])} com métricas estáticas, "
-        f"{n_rev} revisões de juízes ({sum(1 for d in data.values() if len(d['reviews']) >= 2)} runs com as 2).\n")
+        f"{n_rev} revisões de juízes ({sum(1 for d in data.values() if len(d['reviews']) >= 2)} runs com 2 ou mais"
+        + (f", {n3} com 3" if all_judges else "") + ").\n")
+    if all_judges:
+        out("Notas dos juízes: média de TODOS os juízes de cada run, isto é, os dois de famílias distintas da do "
+            "autor mais o juiz da mesma família (`runs/quality/self-family/`), quando ele existe. É a regra usada "
+            "no artigo do TCC; `report-<name>.md` sem este sufixo usa só os dois de fora.\n")
+    else:
+        out("Notas dos juízes: média dos dois juízes de famílias distintas da do autor; o juiz da mesma família "
+            "fica fora das médias e só entra na seção de autopreferência.\n")
 
     out("## Médias por modelo × nível\n")
     for metric, fn in fns.items():
@@ -204,7 +228,7 @@ def build(runs, name: str = "pilot") -> str:
                                    [r[b]["scores"][dim]["score"] for r in both]) for dim in DIMS])
         out(f"| {a} × {b} | {len(both)} | {fmt(ka)} | {fmt(sp)} | {fmt(kd)} |")
     out("")
-    out("Viés de cada juiz (média da nota geral que dá − média das duas notas do mesmo run):\n")
+    out("Viés de cada juiz (média da nota geral que dá − média das notas de todos os juízes do mesmo run):\n")
     for j in judge.JUDGES:
         diffs = [d["reviews"][j]["overall"] - mean([x["overall"] for x in d["reviews"].values()])
                  for d in data.values() if j in d["reviews"] and len(d["reviews"]) >= 2]
@@ -228,6 +252,39 @@ def build(runs, name: str = "pilot") -> str:
         out(f"| {an} | {bn} | {fmt(spearman(xs, ys))} | {n} |")
     out("")
 
+    out("## Autopreferência: juiz da mesma família vs os dois de fora\n")
+    out(("Revisões incluídas nas médias acima" if all_judges else "Revisões extras, fora das médias acima")
+        + ": Opus nos diffs de Sonnet/Haiku, Muse nos do Muse e DeepSeek nos do DeepSeek. Δ = nota do juiz "
+        "da família − média dos dois juízes de outras famílias no mesmo run (Wilcoxon exato pareado).\n")
+    self_dir = judge.paths(None, self_family=True)["reviews"]
+    out("| juiz | autores | n | Δ geral | p | leniência fora da família | autopreferência | "
+        + " | ".join(f"Δ {d}" for d in DIMS) + " |")
+    out("|---|---|---|---|---|---|---|" + "---|" * len(DIMS))
+    for j in judge.JUDGES:
+        rows = []
+        for d in data.values():
+            f = self_dir / f"{d['run'].run_id}__{j}.json"
+            if f.exists() and len(d["cross"]) >= 2:
+                rows.append((json.loads(f.read_text())["review"], list(d["cross"].values())))
+        if not rows:
+            continue
+        authors = sorted({SHORT.get(d["run"].model, d["run"].model) for d in data.values()
+                          if judge.self_judge(d["run"]) == j})
+        diffs = [s["overall"] - mean([x["overall"] for x in o]) for s, o in rows]
+        _, p = wilcoxon_exact(diffs)
+        dims = [statistics.mean(s["scores"][dim]["score"] - mean([x["scores"][dim]["score"] for x in o])
+                                for s, o in rows) for dim in DIMS]
+        # how much more generous j is than the other judge on runs of other families
+        lenient = mean([d["cross"][j]["overall"] - next(x["overall"] for k, x in d["cross"].items() if k != j)
+                        for d in data.values() if j in d["cross"] and len(d["cross"]) == 2])
+        out(f"| {j} | {', '.join(authors)} | {len(rows)} | {statistics.mean(diffs):+.2f} | {p:.3f} | "
+            f"{"–" if lenient is None else f"{lenient:+.2f}"} | {statistics.mean(diffs) - (lenient or 0):+.2f} | "
+            + " | ".join(f"{x:+.2f}" for x in dims) + " |")
+    out("")
+    out("Leniência fora da família: média de (nota do juiz − nota do outro juiz) nos runs de outras "
+        "famílias, ou seja, o quanto ele já é mais generoso em geral. Autopreferência = Δ geral − "
+        "leniência. Os Δ por dimensão não descontam a leniência.\n")
+
     out("## Convenções: quantas vezes cada regra se aplicou e foi cumprida\n")
     out("| regra | descrição | aplica | cumpre |")
     out("|---|---|---|---|")
@@ -236,7 +293,7 @@ def build(runs, name: str = "pilot") -> str:
                if x["rule"] == rule and x["applies"]]
         out(f"| {rule} | {desc} | {len(app)} | {sum(1 for x in app if x['ok'])} |")
     text = "\n".join(L) + "\n"
-    path = selection.QUALITY_DIR / f"report-{name}.md"
+    path = selection.QUALITY_DIR / f"report-{name}{'-all-judges' if all_judges else ''}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     return f"written {path.relative_to(selection.BENCH_DIR)}"

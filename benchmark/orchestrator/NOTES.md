@@ -306,6 +306,30 @@ Rodada completa (`runs/quality/report-full.md`; 309 runs, 615 revisões, ~4,5 h)
   - Sonnet e Haiku ganham pouco, porque já partem de ~4;
   - gpt-oss e Beam não ganham nada (testes ≈ 1 em todos os níveis).
 
+Juiz da mesma família (`python -m quality judge --self-family`):
+- **O que é:** controle de autopreferência. Cada juiz revisa os diffs da própria família,
+  fora das médias:
+  - Opus revisa Sonnet e Haiku (112);
+  - Muse revisa Muse (56);
+  - DeepSeek revisa DeepSeek (56).
+- **Execução:** 221/224 revisões, 3 `judge_error` do DeepSeek, ~1h15.
+- **Onde ficam os dados:** `runs/quality/self-family/`.
+- **Resultado** (Δ = juiz da família − média dos dois de fora):
+  - **Opus:** Δ −0,17 (p 0,003), mas ele já é 0,33 mais severo que o outro juiz fora da
+    família, então a autopreferência líquida é +0,17;
+  - **Muse:** Δ +0,04 (p 0,51), e ele já é 0,44 mais generoso, então a líquida é −0,40;
+  - **DeepSeek:** Δ −0,17 (p 0,039), e ele já é 0,18 mais severo, então a líquida é ≈ 0.
+- **Leitura:**
+  - não há autopreferência consistente: o Δ bruto é quase todo o viés geral de cada juiz;
+  - a exclusão da família é uma precaução, não a correção de um viés medido;
+  - **cautela:** a leniência é medida em diffs de outros autores.
+- **Decisão (2026-10-30, artigo do TCC):** como não há autopreferência líquida e o par Muse+DeepSeek
+  (o de Sonnet/Haiku) é o mais leniente dos três, o artigo usa a **média de todos os juízes** de cada
+  run (par de fora + juiz da família; 836 revisões, 218 runs com 3). `python -m quality analyze
+  --name full --all-judges` gera `runs/quality/report-full-all-judges.md` com essa regra;
+  `report-full.md` continua com os dois de fora. Efeito nas médias: Sonnet 4,10→4,08, Haiku
+  4,28→4,19, Muse 3,02→3,03, DeepSeek 3,83→3,77 (nota geral, runs com 3 revisões).
+
 ## Estado em 2026-10-28 (fim da sessão)
 
 **Pronto e validado**

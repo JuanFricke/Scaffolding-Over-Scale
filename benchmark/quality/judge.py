@@ -4,6 +4,10 @@ Each change gets exactly two judges out of Opus 5.5, Muse Spark 1.3 and DeepSeek
 never the model that wrote it and never one of its family (Juan's decision, 2026-10-29). The
 judge sees only a workspace with the task statement, the change (harness paths removed), the
 project conventions and the skill; nothing names the model, level, run or test result.
+
+`--self-family` runs the complementary set, kept apart from the main data: each change reviewed by
+the one judge of its own family (Opus on Sonnet/Haiku, Muse on Muse, DeepSeek on DeepSeek), to
+measure self-preference against the two cross-family reviews (Juan's request, 2026-10-29).
 """
 from __future__ import annotations
 
@@ -64,6 +68,11 @@ def assign(runs: list[selection.Run]) -> dict[str, list[str]]:
         offset = int(hashlib.sha256(f"{SEED}:{r.model}:{r.level}".encode()).hexdigest(), 16) % 3
         out[r.run_id] = list(pairs[(i + offset) % 3])
     return out
+
+
+def self_judge(run: selection.Run) -> str | None:
+    """The judge of the author's own family, if any (gpt-oss and Beam have none)."""
+    return next((j for j, f in JUDGE_FAMILY.items() if f == family(run.model)), None)
 
 
 # --- blind workspace ---------------------------------------------------------------------------
@@ -210,8 +219,10 @@ class JudgeOpenCode(adapters.OpenCodeAdapter):
 RUNNERS = {"claude-code": JudgeClaude, "opencode": JudgeOpenCode}
 
 
-def paths(tag: str | None) -> dict[str, Path]:
+def paths(tag: str | None, self_family: bool = False) -> dict[str, Path]:
     base = selection.QUALITY_DIR if not tag else matrix.BENCH_DIR / "runs" / "_tagged" / f"quality-{tag}"
+    if self_family:
+        base = base / "self-family"
     return {"manifest": base / "judge-manifest.jsonl", "reviews": base / "reviews",
             "workspaces": selection.QUALITY_DIR / "workspaces", "logs": selection.QUALITY_DIR / "workspaces" / "_logs"}
 
@@ -286,12 +297,19 @@ async def review_one(run, judge: str, pools: dict, man: mf.Manifest, p: dict, hi
         return
 
 
-def plan(runs, only: list[str] | None, tag: str | None) -> list[tuple[selection.Run, str]]:
-    man = mf.Manifest(paths(tag)["manifest"])
+def wanted(runs, self_family: bool = False) -> dict[str, list[str]]:
+    if self_family:
+        return {r.run_id: [j] for r in runs if (j := self_judge(r))}
+    return assign(runs)
+
+
+def plan(runs, only: list[str] | None, tag: str | None, self_family: bool = False) -> list[tuple[selection.Run, str]]:
+    man = mf.Manifest(paths(tag, self_family)["manifest"])
     latest = man.latest()
+    want = wanted(runs, self_family)
     todo = []
     for run in runs:
-        for judge in assign(runs)[run.run_id]:
+        for judge in want.get(run.run_id, []):
             if only and judge not in only:
                 continue
             if latest.get(f"{run.run_id}__{judge}", {}).get("state") in ("done", "judge_error"):
@@ -300,8 +318,8 @@ def plan(runs, only: list[str] | None, tag: str | None) -> list[tuple[selection.
     return todo
 
 
-async def run_all(todo, concurrency: int, tag: str | None) -> None:
-    p = paths(tag)
+async def run_all(todo, concurrency: int, tag: str | None, self_family: bool = False) -> None:
+    p = paths(tag, self_family)
     man = mf.Manifest(p["manifest"])
     p["manifest"].parent.mkdir(parents=True, exist_ok=True)
     pools = {name: Pool(f"judge-{name}", concurrency) for name in {m.pool for m in JUDGES.values()}}
@@ -310,7 +328,7 @@ async def run_all(todo, concurrency: int, tag: str | None) -> None:
 
 def main(args, runs) -> None:
     only = [j.strip() for j in args.judges.split(",")] if args.judges else None
-    todo = plan(runs, only, args.tag)
+    todo = plan(runs, only, args.tag, args.self_family)
     if args.max_reviews:
         todo = todo[: args.max_reviews]
     by = {}
@@ -321,14 +339,14 @@ def main(args, runs) -> None:
         for run, j in todo:
             print(f"  {j:9} {run.run_id}")
         return
-    asyncio.run(run_all(todo, args.concurrency, args.tag))
+    asyncio.run(run_all(todo, args.concurrency, args.tag, args.self_family))
 
 
-def status(runs) -> str:
-    latest = mf.Manifest(paths(None)["manifest"]).latest()
-    want = [(r.run_id, j) for r in runs for j in assign(runs)[r.run_id]]
+def status(runs, self_family: bool = False) -> str:
+    latest = mf.Manifest(paths(None, self_family)["manifest"]).latest()
+    want = [(rid, j) for rid, js in wanted(runs, self_family).items() for j in js]
     states: dict[str, int] = {}
     for rid, j in want:
         s = latest.get(f"{rid}__{j}", {}).get("state", "pending")
         states[s] = states.get(s, 0) + 1
-    return f"judge: {len(want)} reviews " + ", ".join(f"{k}={v}" for k, v in sorted(states.items()))
+    return f"judge{' (self-family)' if self_family else ''}: {len(want)} reviews " + ", ".join(f"{k}={v}" for k, v in sorted(states.items()))
