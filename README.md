@@ -6,8 +6,8 @@ TCC — Juan Paulo Fricke
 
 O repositório tem duas partes:
 
-- `tcc-artigo-template-latex/` — cópia do template LaTeX de artigo TCC da UNIJUÍ (origem: https://github.com/dornelles/tcc-artigo-template-latex, Prof. Eldair F. Dornelles). É onde o artigo será escrito (`main.tex`, `capitulos/`, `referencias.bib`).
-- `benchmark/` — o benchmark de ablação de *harness* usado no experimento: tarefas (`tasks/`), scripts de preparação e avaliação (`bin/`), um snapshot redigido do harness estudado (`harness/v1/`) e os resultados (`runs/results.jsonl`). Veja [`benchmark/README.md`](benchmark/README.md) para o protocolo e [`benchmark/REDACTIONS.md`](benchmark/REDACTIONS.md) para o que foi removido da cópia pública.
+- `tcc-artigo-template-latex/` — o artigo do TCC, escrito sobre o template LaTeX de artigo TCC da UNIJUÍ (origem do template: https://github.com/dornelles/tcc-artigo-template-latex, Prof. Eldair F. Dornelles). Os fontes são `main.tex`, `capitulos/`, `apendices/`, `declaracoes/`, `figuras/` e `referencias.bib`; `main.pdf` é a versão compilada. Para compilar, use `./build-latex.sh` dentro da pasta (exige pdflatex e bibtex).
+- `benchmark/` — o benchmark de ablação de *harness* usado no experimento: tarefas (`tasks/`), scripts de preparação e avaliação (`bin/`), o orquestrador (`orchestrator/`), a análise de qualidade de código (`quality/`), um snapshot redigido do harness estudado (`harness/v1/`) e os resultados (`runs/`). Veja [`benchmark/README.md`](benchmark/README.md) para o protocolo e [`benchmark/REDACTIONS.md`](benchmark/REDACTIONS.md) para o que foi removido da cópia pública.
 
 ## Executar o benchmark
 
